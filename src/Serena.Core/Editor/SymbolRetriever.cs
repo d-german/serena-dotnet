@@ -5,6 +5,7 @@
 using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
+using Serena.Lsp.Caching;
 using Serena.Lsp.Client;
 using Serena.Lsp.Protocol.Types;
 using LspRange = Serena.Lsp.Protocol.Types.Range;
@@ -199,6 +200,24 @@ public interface ISymbolRetriever
     /// </summary>
     Task<Dictionary<string, List<Dictionary<string, object?>>>> GetSymbolOverviewAsync(
         string relativePath, int depth = 0, CancellationToken ct = default);
+
+    /// <summary>
+    /// Gets a high-level overview of symbols for all source files in a directory, grouped by file then kind.
+    /// </summary>
+    Task<Dictionary<string, Dictionary<string, List<Dictionary<string, object?>>>>> GetDirectoryOverviewAsync(
+        string relativeDirPath, int depth = 0, CancellationToken ct = default);
+
+    /// <summary>
+    /// Requests hover info for a batch of symbols, grouped by file to minimize I/O.
+    /// </summary>
+    Task<Dictionary<LanguageServerSymbol, string?>> RequestInfoForSymbolBatchAsync(
+        IReadOnlyList<LanguageServerSymbol> symbols, CancellationToken ct = default);
+
+    /// <summary>
+    /// Finds the deepest symbol whose body range contains the given position.
+    /// </summary>
+    Task<LanguageServerSymbol?> FindContainingSymbolAsync(
+        string relativePath, int line, int character, CancellationToken ct = default);
 }
 
 /// <summary>
@@ -219,15 +238,32 @@ public sealed record ReferenceResult
 /// </summary>
 public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
 {
+    private static readonly string[] s_sourceExtensions =
+        [".cs", ".ts", ".tsx", ".js", ".jsx", ".py", ".java", ".go",
+         ".rs", ".cpp", ".c", ".h", ".hpp", ".rb", ".swift", ".kt"];
+
     private readonly LspClient _lsp;
     private readonly string _projectRoot;
     private readonly ILogger _logger;
+    private readonly SymbolCache<UnifiedSymbolInformation[]>? _symbolCache;
 
-    public LanguageServerSymbolRetriever(LspClient lsp, string projectRoot, ILogger logger)
+    /// <summary>
+    /// Returns true if the file has an extension recognized as analyzable source code.
+    /// </summary>
+    public static bool CanAnalyzeFile(string filePath)
+    {
+        string ext = Path.GetExtension(filePath);
+        return s_sourceExtensions.Any(e => string.Equals(ext, e, StringComparison.OrdinalIgnoreCase));
+    }
+
+    public LanguageServerSymbolRetriever(
+        LspClient lsp, string projectRoot, ILogger logger,
+        SymbolCache<UnifiedSymbolInformation[]>? symbolCache = null)
     {
         _lsp = lsp;
         _projectRoot = Path.GetFullPath(projectRoot);
         _logger = logger;
+        _symbolCache = symbolCache;
     }
 
     public async Task<IReadOnlyList<LanguageServerSymbol>> GetSymbolsAsync(
@@ -235,10 +271,30 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
     {
         string absolutePath = Path.GetFullPath(Path.Combine(_projectRoot, relativePath));
 
+        // Check cache first
+        if (_symbolCache is not null)
+        {
+            string fingerprint = CacheFingerprint.ForFile(absolutePath);
+            var cached = _symbolCache.TryGet(absolutePath, fingerprint);
+            if (cached is not null)
+            {
+                return cached
+                    .Select(s => LanguageServerSymbol.FromUnified(s, relativePath))
+                    .ToList();
+            }
+        }
+
         // Ensure file is open in LS
         await _lsp.OpenFileAsync(absolutePath);
 
         var symbols = await _lsp.RequestDocumentSymbolsAsync(absolutePath, ct);
+
+        // Populate cache
+        if (_symbolCache is not null)
+        {
+            string fingerprint = CacheFingerprint.ForFile(absolutePath);
+            _symbolCache.Set(absolutePath, fingerprint, [.. symbols]);
+        }
 
         return symbols
             .Select(s => LanguageServerSymbol.FromUnified(s, relativePath))
@@ -317,6 +373,9 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
         await _lsp.OpenFileAsync(absolutePath);
         var locations = await _lsp.RequestReferencesAsync(absolutePath, line, character, ct: ct);
 
+        // Cache document symbols per file to avoid redundant GetSymbolsAsync calls
+        var symbolsByFile = new Dictionary<string, IReadOnlyList<LanguageServerSymbol>>();
+
         var results = new List<ReferenceResult>();
         foreach (var loc in locations)
         {
@@ -338,16 +397,66 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
                 // Skip if file can't be read
             }
 
+            // Look up the containing symbol for this reference location
+            string? containingName = null;
+            try
+            {
+                if (!symbolsByFile.TryGetValue(refRelPath, out var fileSymbols))
+                {
+                    fileSymbols = await GetSymbolsAsync(refRelPath, ct);
+                    symbolsByFile[refRelPath] = fileSymbols;
+                }
+
+                var containing = FindDeepestContainingSymbol(
+                    fileSymbols, loc.Range.Start.Line, loc.Range.Start.Character);
+                containingName = containing?.NamePath;
+            }
+            catch
+            {
+                // Skip if symbols can't be resolved
+            }
+
             results.Add(new ReferenceResult
             {
                 RelativePath = refRelPath,
                 Line = loc.Range.Start.Line,
                 Character = loc.Range.Start.Character,
                 ContextSnippet = snippet,
+                ContainingSymbolName = containingName,
             });
         }
 
         return results;
+    }
+
+    /// <inheritdoc />
+    public async Task<LanguageServerSymbol?> FindContainingSymbolAsync(
+        string relativePath, int line, int character, CancellationToken ct = default)
+    {
+        var symbols = await GetSymbolsAsync(relativePath, ct);
+        return FindDeepestContainingSymbol(symbols, line, character);
+    }
+
+    private static LanguageServerSymbol? FindDeepestContainingSymbol(
+        IReadOnlyList<LanguageServerSymbol> symbols, int line, int character)
+    {
+        LanguageServerSymbol? result = null;
+        foreach (var symbol in symbols)
+        {
+            if (symbol.BodyLocation is { } loc &&
+                (line > loc.StartLine || (line == loc.StartLine && character >= loc.StartColumn)) &&
+                (line < loc.EndLine || (line == loc.EndLine && character <= loc.EndColumn)))
+            {
+                result = symbol;
+                var child = FindDeepestContainingSymbol(symbol.Children, line, character);
+                if (child is not null)
+                {
+                    result = child;
+                }
+            }
+        }
+
+        return result;
     }
 
     public async Task<Dictionary<string, List<Dictionary<string, object?>>>> GetSymbolOverviewAsync(
@@ -367,6 +476,37 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
         }
 
         return grouped;
+    }
+
+    public async Task<Dictionary<string, Dictionary<string, List<Dictionary<string, object?>>>>> GetDirectoryOverviewAsync(
+        string relativeDirPath, int depth = 0, CancellationToken ct = default)
+    {
+        string absDir = Path.GetFullPath(Path.Combine(_projectRoot, relativeDirPath));
+        var result = new Dictionary<string, Dictionary<string, List<Dictionary<string, object?>>>>();
+
+        foreach (string filePath in EnumerateSourceFiles(absDir))
+        {
+            if (ct.IsCancellationRequested)
+            {
+                break;
+            }
+
+            string relPath = Path.GetRelativePath(_projectRoot, filePath).Replace('\\', '/');
+            try
+            {
+                var overview = await GetSymbolOverviewAsync(relPath, depth, ct);
+                if (overview.Count > 0)
+                {
+                    result[relPath] = overview;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to get symbol overview for {Path}", relPath);
+            }
+        }
+
+        return result;
     }
 
     private async Task<IReadOnlyList<LanguageServerSymbol>> SearchDirectoryAsync(
@@ -413,17 +553,77 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
         return results;
     }
 
+    /// <inheritdoc />
+    public async Task<Dictionary<LanguageServerSymbol, string?>> RequestInfoForSymbolBatchAsync(
+        IReadOnlyList<LanguageServerSymbol> symbols, CancellationToken ct = default)
+    {
+        var result = new Dictionary<LanguageServerSymbol, string?>();
+
+        // Group by file to minimize OpenFile calls
+        var byFile = symbols
+            .Where(s => s.BodyLocation is not null || s.Raw.SelectionRange is not null)
+            .GroupBy(s => s.RelativePath);
+
+        foreach (var group in byFile)
+        {
+            string absolutePath = Path.GetFullPath(Path.Combine(_projectRoot, group.Key));
+            await _lsp.OpenFileAsync(absolutePath);
+
+            foreach (var symbol in group)
+            {
+                int line = symbol.Raw.SelectionRange?.Start.Line ?? symbol.BodyLocation!.StartLine;
+                int character = symbol.Raw.SelectionRange?.Start.Character ?? symbol.BodyLocation!.StartColumn;
+
+                try
+                {
+                    var hover = await _lsp.RequestHoverAsync(absolutePath, line, character, ct);
+                    result[symbol] = ExtractHoverText(hover);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Hover request failed for {Symbol}", symbol.NamePath);
+                    result[symbol] = null;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private static string? ExtractHoverText(Hover? hover)
+    {
+        if (hover?.Contents is null)
+        {
+            return null;
+        }
+
+        // MarkupContent (most common from modern servers)
+        if (hover.Contents is System.Text.Json.JsonElement element)
+        {
+            if (element.ValueKind == System.Text.Json.JsonValueKind.Object
+                && element.TryGetProperty("value", out var valueProp))
+            {
+                return valueProp.GetString();
+            }
+
+            if (element.ValueKind == System.Text.Json.JsonValueKind.String)
+            {
+                return element.GetString();
+            }
+        }
+
+        if (hover.Contents is MarkupContent markup)
+        {
+            return markup.Value;
+        }
+
+        return hover.Contents.ToString();
+    }
+
     private IEnumerable<string> EnumerateSourceFiles(string directory)
     {
-        string[] extensions = [".cs", ".ts", ".tsx", ".js", ".jsx", ".py", ".java", ".go",
-                              ".rs", ".cpp", ".c", ".h", ".hpp", ".rb", ".swift", ".kt"];
-
         return Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories)
-            .Where(f =>
-            {
-                string ext = Path.GetExtension(f);
-                return extensions.Any(e => string.Equals(ext, e, StringComparison.OrdinalIgnoreCase));
-            })
+            .Where(CanAnalyzeFile)
             .Where(f =>
             {
                 string rel = Path.GetRelativePath(_projectRoot, f);
