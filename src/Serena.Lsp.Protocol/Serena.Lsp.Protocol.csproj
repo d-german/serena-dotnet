@@ -1,0 +1,8 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Serena.Lsp.Protocol</RootNamespace>
+    <Description>LSP protocol types, constants, and request definitions for Serena</Description>
+  </PropertyGroup>
+
+</Project>

@@ -1,0 +1,14 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Serena.Cli/Serena.Cli.csproj" />
+    <Project Path="src/Serena.Core/Serena.Core.csproj" />
+    <Project Path="src/Serena.Lsp.Protocol/Serena.Lsp.Protocol.csproj" />
+    <Project Path="src/Serena.Lsp/Serena.Lsp.csproj" />
+    <Project Path="src/Serena.Mcp/Serena.Mcp.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Serena.Core.Tests/Serena.Core.Tests.csproj" />
+    <Project Path="tests/Serena.Lsp.Tests/Serena.Lsp.Tests.csproj" />
+    <Project Path="tests/Serena.Mcp.Tests/Serena.Mcp.Tests.csproj" />
+  </Folder>
+</Solution>

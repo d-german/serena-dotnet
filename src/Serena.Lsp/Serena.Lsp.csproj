@@ -1,0 +1,19 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Serena.Lsp</RootNamespace>
+    <Description>Core LSP client, language server process management, and language server implementations for Serena</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Serena.Lsp.Protocol\Serena.Lsp.Protocol.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="StreamJsonRpc" Version="2.*" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0-preview.*" />
+    <PackageReference Include="Microsoft.Extensions.FileSystemGlobbing" Version="10.0.0-preview.*" />
+    <PackageReference Include="CSharpFunctionalExtensions" Version="3.*" />
+  </ItemGroup>
+
+</Project>
