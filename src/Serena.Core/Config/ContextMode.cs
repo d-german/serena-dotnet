@@ -64,9 +64,28 @@ public sealed record SerenaAgentMode : ToolInclusionDefinition
     public string Description { get; init; } = string.Empty;
 
     /// <summary>
+    /// Additional system prompt text injected when this mode is active.
+    /// </summary>
+    [YamlMember(Alias = "system_prompt_addition")]
+    public string SystemPromptAddition { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Tool names that are explicitly allowed when this mode is active.
+    /// An empty list means no inclusion filtering is applied by this mode.
+    /// </summary>
+    [YamlMember(Alias = "tool_inclusions")]
+    public IReadOnlyList<string> ToolInclusions { get; init; } = [];
+
+    /// <summary>
+    /// Tool names that are explicitly disallowed when this mode is active.
+    /// </summary>
+    [YamlMember(Alias = "tool_exclusions")]
+    public IReadOnlyList<string> ToolExclusions { get; init; } = [];
+
+    /// <summary>
     /// Whether this mode defines a prompt.
     /// </summary>
-    public bool HasPrompt => !string.IsNullOrWhiteSpace(Prompt);
+    public bool HasPrompt => !string.IsNullOrWhiteSpace(Prompt) || !string.IsNullOrWhiteSpace(SystemPromptAddition);
 
     private static readonly IDeserializer Deserializer = new DeserializerBuilder()
         .WithNamingConvention(UnderscoredNamingConvention.Instance)
@@ -80,6 +99,24 @@ public sealed record SerenaAgentMode : ToolInclusionDefinition
     {
         string content = File.ReadAllText(yamlPath);
         var mode = Deserializer.Deserialize<SerenaAgentMode>(content);
+        if (string.IsNullOrEmpty(mode.Name))
+        {
+            return mode with { Name = Path.GetFileNameWithoutExtension(yamlPath) };
+        }
+        return mode;
+    }
+
+    /// <summary>
+    /// Load a mode from a YAML file using <see cref="YamlConfigLoader"/>.
+    /// Returns null if the file does not exist or is empty.
+    /// </summary>
+    public static SerenaAgentMode? LoadFromYaml(string yamlPath)
+    {
+        var mode = YamlConfigLoader.TryLoad<SerenaAgentMode>(yamlPath);
+        if (mode is null)
+        {
+            return null;
+        }
         if (string.IsNullOrEmpty(mode.Name))
         {
             return mode with { Name = Path.GetFileNameWithoutExtension(yamlPath) };
@@ -105,6 +142,84 @@ public sealed record SerenaAgentMode : ToolInclusionDefinition
 }
 
 /// <summary>
+/// Maintains a set of currently active modes and provides combined tool filtering
+/// and system prompt aggregation across all active modes.
+/// </summary>
+public sealed class ActiveModes
+{
+    private readonly Dictionary<string, SerenaAgentMode> _modes = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Adds a mode to the active set. Replaces any existing mode with the same name.
+    /// </summary>
+    public void AddMode(SerenaAgentMode mode)
+    {
+        _modes[mode.Name] = mode;
+    }
+
+    /// <summary>
+    /// Removes a mode from the active set by name. No-op if not found.
+    /// </summary>
+    public void RemoveMode(string name)
+    {
+        _modes.Remove(name);
+    }
+
+    /// <summary>
+    /// Returns all currently active modes.
+    /// </summary>
+    public IReadOnlyList<SerenaAgentMode> GetActiveModes() => _modes.Values.ToList();
+
+    /// <summary>
+    /// Determines whether a tool is allowed by all active modes.
+    /// A tool is disallowed if any active mode lists it in its exclusions,
+    /// or if any active mode defines inclusions and the tool is not in any of them.
+    /// </summary>
+    public bool IsToolAllowed(string toolName)
+    {
+        if (_modes.Count == 0)
+        {
+            return true;
+        }
+
+        // If any mode explicitly excludes the tool, it is disallowed
+        foreach (var mode in _modes.Values)
+        {
+            if (mode.ToolExclusions.Contains(toolName, StringComparer.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
+
+        // If any mode defines inclusions, the tool must appear in at least one
+        var modesWithInclusions = _modes.Values
+            .Where(m => m.ToolInclusions.Count > 0)
+            .ToList();
+
+        if (modesWithInclusions.Count > 0)
+        {
+            return modesWithInclusions.Any(m =>
+                m.ToolInclusions.Contains(toolName, StringComparer.OrdinalIgnoreCase));
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Concatenates the system prompt additions from all active modes, separated by newlines.
+    /// </summary>
+    public string GetCombinedSystemPromptAdditions()
+    {
+        var additions = _modes.Values
+            .Select(m => m.SystemPromptAddition)
+            .Where(s => !string.IsNullOrWhiteSpace(s))
+            .ToList();
+
+        return additions.Count == 0 ? string.Empty : string.Join("\n\n", additions);
+    }
+}
+
+/// <summary>
 /// Represents a context where the agent is operating (an IDE, a chat, etc.).
 /// An agent can only be in a single context at a time.
 /// Ported from context_mode.py SerenaAgentContext.
@@ -119,6 +234,24 @@ public sealed record SerenaAgentContext : ToolInclusionDefinition
 
     [YamlMember(Alias = "description")]
     public string Description { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Mode names to activate by default in this context.
+    /// </summary>
+    [YamlMember(Alias = "default_modes")]
+    public IReadOnlyList<string> DefaultModes { get; init; } = [];
+
+    /// <summary>
+    /// Base mode names that are always active in this context.
+    /// </summary>
+    [YamlMember(Alias = "base_modes")]
+    public IReadOnlyList<string> BaseModes { get; init; } = [];
+
+    /// <summary>
+    /// Startup behavior instruction (e.g., "onboarding", "activate_default_project").
+    /// </summary>
+    [YamlMember(Alias = "startup_behavior")]
+    public string StartupBehavior { get; init; } = string.Empty;
 
     /// <summary>
     /// Whether to assume single-project mode.
@@ -145,6 +278,23 @@ public sealed record SerenaAgentContext : ToolInclusionDefinition
     {
         string content = File.ReadAllText(yamlPath);
         var context = Deserializer.Deserialize<SerenaAgentContext>(content);
+        if (string.IsNullOrEmpty(context.Name))
+        {
+            return context with { Name = Path.GetFileNameWithoutExtension(yamlPath) };
+        }
+        return context;
+    }
+
+    /// <summary>
+    /// Load a context from a YAML file using <see cref="YamlConfigLoader"/>.
+    /// </summary>
+    public static SerenaAgentContext? LoadFromYaml(string yamlPath)
+    {
+        var context = YamlConfigLoader.TryLoad<SerenaAgentContext>(yamlPath);
+        if (context is null)
+        {
+            return null;
+        }
         if (string.IsNullOrEmpty(context.Name))
         {
             return context with { Name = Path.GetFileNameWithoutExtension(yamlPath) };

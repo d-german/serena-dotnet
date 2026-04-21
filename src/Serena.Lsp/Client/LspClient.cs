@@ -282,6 +282,19 @@ public sealed class LspClient : IAsyncDisposable
             }, ct);
     }
 
+    public async Task<SignatureHelp?> RequestSignatureHelpAsync(
+        string absolutePath, int line, int character, CancellationToken ct = default)
+    {
+        string uri = PathToUri(absolutePath);
+
+        return await _requests.SignatureHelpAsync(
+            new SignatureHelpParams
+            {
+                TextDocument = new TextDocumentIdentifier(uri),
+                Position = new Position(line, character),
+            }, ct);
+    }
+
     /// <summary>
     /// Requests a workspace-wide rename of the symbol at a given position.
     /// </summary>

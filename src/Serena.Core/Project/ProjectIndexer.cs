@@ -5,6 +5,7 @@ using CSharpFunctionalExtensions;
 using Microsoft.Extensions.Logging;
 using Serena.Core.Config;
 using Serena.Lsp;
+using Serena.Lsp.Caching;
 using Serena.Lsp.Client;
 using Serena.Lsp.LanguageServers;
 
@@ -92,13 +93,15 @@ public sealed class ProjectIndexer
 
                 filesPerLanguage[language] = 0;
 
+                var cache = lsManager.GetSymbolCache(language);
+
                 foreach (string file in files)
                 {
                     ct.ThrowIfCancellationRequested();
                     fileIndex++;
                     string absolutePath = Path.Combine(projectRoot, file);
 
-                    var result = await IndexSingleFileSafe(client, absolutePath, timeout);
+                    var result = await IndexSingleFileSafe(client, absolutePath, timeout, cache);
                     bool success = result.IsSuccess;
 
                     if (success)
@@ -145,10 +148,26 @@ public sealed class ProjectIndexer
         try
         {
             var client = await lsManager.GetOrStartAsync(language.Value, ct: ct);
+            var cache = lsManager.GetSymbolCache(language.Value);
+            var fingerprint = CacheFingerprint.ForFile(absolutePath);
+
+            if (cache is not null && fingerprint.Length > 0)
+            {
+                var cached = cache.TryGet(absolutePath, fingerprint);
+                if (cached is not null)
+                {
+                    return Result.Success<IReadOnlyList<UnifiedSymbolInformation>>(cached);
+                }
+            }
+
             await client.OpenFileAsync(absolutePath);
             try
             {
                 var symbols = await client.RequestDocumentSymbolsAsync(absolutePath, ct);
+                if (cache is not null && fingerprint.Length > 0)
+                {
+                    cache.Set(absolutePath, fingerprint, symbols.ToArray());
+                }
                 return Result.Success<IReadOnlyList<UnifiedSymbolInformation>>(symbols);
             }
             finally
@@ -217,15 +236,30 @@ public sealed class ProjectIndexer
     }
 
     private static async Task<Result> IndexSingleFileSafe(
-        LspClient client, string absolutePath, TimeSpan timeout)
+        LspClient client, string absolutePath, TimeSpan timeout,
+        SymbolCache<UnifiedSymbolInformation[]>? cache = null)
     {
         try
         {
+            var fingerprint = CacheFingerprint.ForFile(absolutePath);
+            if (cache is not null && fingerprint.Length > 0)
+            {
+                var cached = cache.TryGet(absolutePath, fingerprint);
+                if (cached is not null)
+                {
+                    return Result.Success();
+                }
+            }
+
             using var cts = new CancellationTokenSource(timeout);
             await client.OpenFileAsync(absolutePath);
             try
             {
-                await client.RequestDocumentSymbolsAsync(absolutePath, cts.Token);
+                var symbols = await client.RequestDocumentSymbolsAsync(absolutePath, cts.Token);
+                if (cache is not null && fingerprint.Length > 0)
+                {
+                    cache.Set(absolutePath, fingerprint, symbols.ToArray());
+                }
             }
             finally
             {

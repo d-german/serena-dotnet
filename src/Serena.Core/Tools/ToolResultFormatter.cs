@@ -126,6 +126,47 @@ public static class ToolResultFormatter
     }
 
     /// <summary>
+    /// Formats a directory-level symbol overview (per-file, then per-kind) with progressive truncation.
+    /// </summary>
+    public static string FormatDirectoryOverview(
+        Dictionary<string, Dictionary<string, List<Dictionary<string, object?>>>> directoryOverview,
+        int maxChars = -1)
+    {
+        if (maxChars < 0)
+        {
+            maxChars = DefaultMaxChars;
+        }
+
+        string full = JsonSerializer.Serialize(directoryOverview, s_jsonOptions);
+        if (full.Length <= maxChars)
+        {
+            return full;
+        }
+
+        // Try compact format: file -> kind -> names
+        var compact = new Dictionary<string, Dictionary<string, List<string>>>();
+        foreach (var (file, overview) in directoryOverview)
+        {
+            var fileCompact = new Dictionary<string, List<string>>();
+            foreach (var (kind, symbols) in overview)
+            {
+                fileCompact[kind] = symbols
+                    .Select(s => s.TryGetValue("name_path", out var np) ? np?.ToString() ?? "?" : "?")
+                    .ToList();
+            }
+            compact[file] = fileCompact;
+        }
+
+        string compactResult = JsonSerializer.Serialize(compact, s_jsonOptions);
+        if (compactResult.Length <= maxChars)
+        {
+            return compactResult;
+        }
+
+        return TruncateWithMessage(compactResult, maxChars);
+    }
+
+    /// <summary>
     /// Formats a list of symbols with progressive truncation.
     /// </summary>
     public static string FormatSymbols(
@@ -163,6 +204,29 @@ public static class ToolResultFormatter
     /// <summary>
     /// Formats reference results with truncation.
     /// </summary>
+
+    /// <summary>
+    /// Formats a grouped symbol dictionary (produced by <see cref="Editor.SymbolDictGrouper"/>)
+    /// with progressive truncation.
+    /// </summary>
+    public static string FormatGroupedSymbols(
+        Dictionary<string, object?> grouped,
+        int maxChars = -1)
+    {
+        if (maxChars < 0)
+        {
+            maxChars = DefaultMaxChars;
+        }
+
+        string full = JsonSerializer.Serialize(grouped, s_jsonOptions);
+        if (full.Length <= maxChars)
+        {
+            return full;
+        }
+
+        return TruncateWithMessage(full, maxChars);
+    }
+
     public static string FormatReferences(
         IReadOnlyList<Dictionary<string, object?>> references,
         int maxChars = -1)
@@ -181,6 +245,39 @@ public static class ToolResultFormatter
         }
 
         return TruncateWithMessage(text, maxChars);
+    }
+
+    /// <summary>
+    /// Tries a chain of progressively shorter factory functions to fit within maxChars.
+    /// If no factory result fits, the last factory's output is truncated.
+    /// When no factories are supplied, falls back to simple truncation.
+    /// </summary>
+    public static string LimitWithFactories(string fullResult, int maxChars, params Func<string>[] shortenedFactories)
+    {
+        if (maxChars <= 0 || fullResult.Length <= maxChars)
+        {
+            return fullResult;
+        }
+
+        if (shortenedFactories.Length == 0)
+        {
+            return TruncateWithMessage(fullResult, maxChars);
+        }
+
+        string note = $"[Note: Result was shortened to fit within {maxChars} characters]\n";
+        int budget = maxChars - note.Length;
+
+        string lastResult = fullResult;
+        foreach (var factory in shortenedFactories)
+        {
+            lastResult = factory();
+            if (budget > 0 && lastResult.Length <= budget)
+            {
+                return note + lastResult;
+            }
+        }
+
+        return TruncateWithMessage(note + lastResult, maxChars);
     }
 
     private static string TruncateWithMessage(string text, int maxChars)

@@ -51,6 +51,9 @@ public sealed class LspRequestClient
     public Task<Hover?> HoverAsync(HoverParams @params, CancellationToken ct = default)
         => _process.SendRequestAsync<Hover?>(LspMethods.TextDocumentHover, @params, ct);
 
+    public Task<SignatureHelp?> SignatureHelpAsync(SignatureHelpParams @params, CancellationToken ct = default)
+        => _process.SendRequestAsync<SignatureHelp?>(LspMethods.TextDocumentSignatureHelp, @params, ct);
+
     public Task<JToken?> CompletionAsync(CompletionParams @params, CancellationToken ct = default)
         => _process.SendRequestAsync<JToken?>(LspMethods.TextDocumentCompletion, @params, ct);
 

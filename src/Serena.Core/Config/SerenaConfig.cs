@@ -132,6 +132,8 @@ public sealed class SerenaConfig
 {
     private readonly ILogger<SerenaConfig> _logger;
     private readonly Dictionary<string, RegisteredProject> _registeredProjects = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, SerenaAgentContext> _contexts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, SerenaAgentMode> _modes = new(StringComparer.OrdinalIgnoreCase);
 
     public SerenaConfig(ILogger<SerenaConfig> logger)
     {
@@ -139,6 +141,16 @@ public sealed class SerenaConfig
     }
 
     public IReadOnlyDictionary<string, RegisteredProject> RegisteredProjects => _registeredProjects;
+
+    /// <summary>
+    /// Loaded agent contexts, keyed by name.
+    /// </summary>
+    public IReadOnlyDictionary<string, SerenaAgentContext> Contexts => _contexts;
+
+    /// <summary>
+    /// Loaded agent modes, keyed by name.
+    /// </summary>
+    public IReadOnlyDictionary<string, SerenaAgentMode> Modes => _modes;
 
     /// <summary>
     /// The default project to activate on startup, or null.
@@ -184,6 +196,100 @@ public sealed class SerenaConfig
         if (_registeredProjects.Remove(name))
         {
             _logger.LogInformation("Unregistered project: {Name}", name);
+        }
+    }
+
+    /// <summary>
+    /// Removes a registered project by name, returning success or failure.
+    /// </summary>
+    public Result RemoveProject(string projectName)
+    {
+        if (string.IsNullOrWhiteSpace(projectName))
+        {
+            return Result.Failure("Project name must not be empty.");
+        }
+
+        if (!_registeredProjects.Remove(projectName))
+        {
+            return Result.Failure($"No project named '{projectName}' is registered.");
+        }
+
+        _logger.LogInformation("Removed project: {Name}", projectName);
+        return Result.Success();
+    }
+
+    /// <summary>
+    /// Scans the contexts directory for YAML files and loads each into a
+    /// <see cref="SerenaAgentContext"/> stored by name.
+    /// </summary>
+    public void LoadContexts(string? contextsDirectory = null)
+    {
+        contextsDirectory ??= SerenaPaths.Instance.UserContextsDir;
+
+        if (!Directory.Exists(contextsDirectory))
+        {
+            _logger.LogDebug("Contexts directory does not exist: {Dir}", contextsDirectory);
+            return;
+        }
+
+        foreach (string filePath in Directory.GetFiles(contextsDirectory, "*.yml"))
+        {
+            try
+            {
+                var context = SerenaAgentContext.LoadFromYaml(filePath);
+                if (context is null)
+                {
+                    _logger.LogWarning("Context file was empty or unreadable: {Path}", filePath);
+                    continue;
+                }
+
+                _contexts[context.Name] = context;
+                _logger.LogInformation("Loaded context: {Name} from {Path}", context.Name, filePath);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to load context from {Path}", filePath);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Scans a modes directory for YAML mode definitions and loads them.
+    /// </summary>
+    public void LoadModes(string? modesDirectory = null)
+    {
+        modesDirectory ??= SerenaPaths.Instance.UserModesDir;
+
+        if (!Directory.Exists(modesDirectory))
+        {
+            _logger.LogDebug("Modes directory does not exist: {Dir}", modesDirectory);
+            return;
+        }
+
+        foreach (string filePath in Directory.GetFiles(modesDirectory, "*.yml"))
+        {
+            string fileName = Path.GetFileNameWithoutExtension(filePath);
+            if (fileName == "mode.template")
+            {
+                continue;
+            }
+
+            try
+            {
+                var mode = SerenaAgentMode.LoadFromYaml(filePath);
+                if (mode is null)
+                {
+                    _logger.LogWarning("Mode file was empty or unreadable: {Path}", filePath);
+                    continue;
+                }
+
+                _modes[mode.Name] = mode;
+                _logger.LogInformation("Loaded mode: {Name} from {Path}", mode.Name, filePath);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to load mode from {Path}", filePath);
+            }
         }
     }
 

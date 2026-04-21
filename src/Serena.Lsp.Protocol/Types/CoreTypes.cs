@@ -208,6 +208,42 @@ public sealed record Hover
     public Range? Range { get; init; }
 }
 
+public sealed record SignatureHelp
+{
+    [JsonPropertyName("signatures")]
+    public required IReadOnlyList<SignatureInformation> Signatures { get; init; }
+
+    [JsonPropertyName("activeSignature")]
+    public int? ActiveSignature { get; init; }
+
+    [JsonPropertyName("activeParameter")]
+    public int? ActiveParameter { get; init; }
+}
+
+public sealed record SignatureInformation
+{
+    [JsonPropertyName("label")]
+    public required string Label { get; init; }
+
+    [JsonPropertyName("documentation")]
+    public object? Documentation { get; init; }
+
+    [JsonPropertyName("parameters")]
+    public IReadOnlyList<ParameterInformation>? Parameters { get; init; }
+
+    [JsonPropertyName("activeParameter")]
+    public int? ActiveParameter { get; init; }
+}
+
+public sealed record ParameterInformation
+{
+    [JsonPropertyName("label")]
+    public required object Label { get; init; }
+
+    [JsonPropertyName("documentation")]
+    public object? Documentation { get; init; }
+}
+
 /// <summary>
 /// A workspace edit represents changes to many resources managed in the workspace.
 /// </summary>

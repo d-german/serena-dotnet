@@ -8,6 +8,7 @@ using CSharpFunctionalExtensions;
 using Microsoft.Extensions.Logging;
 using Serena.Core.Agent;
 using Serena.Core.Editor;
+using Serena.Core.Hooks;
 using Serena.Core.Project;
 
 namespace Serena.Core.Tools;
@@ -101,8 +102,23 @@ public abstract class ToolBase : ITool
 
     public async Task<string> ExecuteAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct = default)
     {
+        // Run pre-tool-use hooks before execution.
+        var (hookResult, hookMessage) = await Context.Agent.RunPreToolHooksAsync(Name, arguments, ct);
+
+        if (hookResult == HookResult.Deny)
+        {
+            return $"Error: {hookMessage}";
+        }
+
         var result = await ExecuteSafeAsync(arguments, ct);
-        return result.IsSuccess ? result.Value : $"Error: {result.Error}";
+        string output = result.IsSuccess ? result.Value : $"Error: {result.Error}";
+
+        if (hookResult == HookResult.AllowWithMessage && !string.IsNullOrEmpty(hookMessage))
+        {
+            output = hookMessage + "\n\n" + output;
+        }
+
+        return output;
     }
 
     /// <summary>
@@ -167,6 +183,29 @@ public abstract class ToolBase : ITool
     }
 
     /// <summary>
+    /// Helper to get an optional list argument. Returns null when the parameter is absent.
+    /// Handles conversion from <c>List&lt;object?&gt;</c> (produced by MCP JSON deserialization)
+    /// to the requested element type.
+    /// </summary>
+    protected static List<T>? GetOptionalList<T>(IReadOnlyDictionary<string, object?> args, string name)
+        where T : struct
+    {
+        if (!args.TryGetValue(name, out var value) || value is null)
+        {
+            return null;
+        }
+        if (value is List<T> typed)
+        {
+            return typed;
+        }
+        if (value is IEnumerable<object?> objects)
+        {
+            return objects.Select(o => (T)Convert.ChangeType(o!, typeof(T))).ToList();
+        }
+        return null;
+    }
+
+    /// <summary>
     /// Gets the active project root, throwing if no project is active.
     /// </summary>
     protected string RequireProjectRoot() =>
@@ -198,6 +237,15 @@ public abstract class ToolBase : ITool
             return text;
         }
         return text[..maxChars] + $"\n... (truncated at {maxChars} of {text.Length} chars)";
+    }
+
+    /// <summary>
+    /// Limits a result string using a chain of progressively shorter factory functions.
+    /// Delegates to <see cref="ToolResultFormatter.LimitWithFactories"/>.
+    /// </summary>
+    protected static string LimitLength(string result, int maxAnswerChars, params Func<string>[] shortenedFactories)
+    {
+        return ToolResultFormatter.LimitWithFactories(result, maxAnswerChars, shortenedFactories);
     }
 
     /// <summary>
@@ -253,7 +301,8 @@ public abstract class ToolBase : ITool
                 $"No language server available for '{relativePath}'. Ensure a language server is configured.");
 
         var logger = Context.LoggerFactory.CreateLogger<LanguageServerSymbolRetriever>();
-        return new LanguageServerSymbolRetriever(lsp, root, logger);
+        var cache = Context.Agent.GetSymbolCacheForLanguage(lsp.Language);
+        return new LanguageServerSymbolRetriever(lsp, root, logger, cache);
     }
 
     /// <summary>
@@ -270,8 +319,9 @@ public abstract class ToolBase : ITool
                 $"No language server available for '{relativePath}'. Ensure a language server is configured.");
 
         var logger = Context.LoggerFactory.CreateLogger<LanguageServerCodeEditor>();
+        var cache = Context.Agent.GetSymbolCacheForLanguage(lsp.Language);
         var retriever = new LanguageServerSymbolRetriever(lsp, root,
-            Context.LoggerFactory.CreateLogger<LanguageServerSymbolRetriever>());
+            Context.LoggerFactory.CreateLogger<LanguageServerSymbolRetriever>(), cache);
         return new LanguageServerCodeEditor(retriever, lsp, root, logger);
     }
 
@@ -308,8 +358,9 @@ public abstract class ToolBase : ITool
             var prop = new Dictionary<string, object>
             {
                 ["description"] = param.Description,
-                ["type"] = MapClrTypeToJsonSchemaType(param.Type),
             };
+
+            ApplyTypeSchema(prop, param.Type);
 
             if (param.DefaultValue is not null)
             {
@@ -337,6 +388,26 @@ public abstract class ToolBase : ITool
 
         string json = JsonSerializer.Serialize(schema, s_jsonOptions);
         return JsonDocument.Parse(json);
+    }
+
+    /// <summary>
+    /// Sets "type" (and "items" for arrays) on a JSON Schema property dictionary.
+    /// </summary>
+    private static void ApplyTypeSchema(Dictionary<string, object> prop, Type type)
+    {
+        type = Nullable.GetUnderlyingType(type) ?? type;
+        if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(List<>))
+        {
+            prop["type"] = "array";
+            prop["items"] = new Dictionary<string, object>
+            {
+                ["type"] = MapClrTypeToJsonSchemaType(type.GetGenericArguments()[0]),
+            };
+        }
+        else
+        {
+            prop["type"] = MapClrTypeToJsonSchemaType(type);
+        }
     }
 
     private static string MapClrTypeToJsonSchemaType(Type type)

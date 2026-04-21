@@ -88,6 +88,8 @@ internal sealed class SerenaMcpServerTool : McpServerTool
             JsonValueKind.True => true,
             JsonValueKind.False => false,
             JsonValueKind.Null or JsonValueKind.Undefined => null,
+            JsonValueKind.Array => element.EnumerateArray()
+                .Select(e => UnwrapJsonElement(e)).ToList<object?>(),
             _ => element.GetRawText(),
         };
     }

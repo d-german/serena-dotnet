@@ -2,7 +2,9 @@
 // Tools for: read_memory, write_memory, list_memories, execute_shell_command, etc.
 
 using System.Diagnostics;
+using System.Reflection;
 using System.Text;
+using System.Text.Json;
 using Serena.Core.Project;
 
 namespace Serena.Core.Tools;
@@ -312,9 +314,71 @@ public sealed class ActivateProjectTool : ToolBase
         }
 
         var active = Context.ActiveProject;
-        return active is not null
-            ? $"Activated project '{active.Name}' at {active.Root}"
-            : $"Activated project at {project}";
+        if (active is null)
+        {
+            return $"Activated project at {project}";
+        }
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"Activated project '{active.Name}' at {active.Root}");
+
+        // Onboarding & memories
+        var mm = CreateMemoriesManager();
+        var projectMemories = mm.ListProjectMemories();
+        var allMemories = mm.ListMemories();
+
+        if (projectMemories.Count == 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("Onboarding: NOT performed. No project memories found.");
+            sb.AppendLine("Consider calling the 'onboarding' tool to learn about this project.");
+        }
+        else
+        {
+            sb.AppendLine();
+            sb.AppendLine($"Onboarding: performed ({projectMemories.Count} project memories).");
+        }
+
+        if (allMemories.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("Available memories:");
+            foreach (string memory in allMemories)
+            {
+                sb.AppendLine($"  - {memory}");
+            }
+        }
+
+        // Active language servers
+        var activeServers = Context.Agent.ActiveLanguageServers;
+        if (activeServers.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("Active language servers:");
+            foreach (string lang in activeServers)
+            {
+                sb.AppendLine($"  - {lang}");
+            }
+        }
+
+        // Mode-specific info
+        var mode = Context.Agent.ActiveMode;
+        if (mode is not null)
+        {
+            sb.AppendLine();
+            sb.AppendLine($"Active mode: {mode.Name}");
+            if (!string.IsNullOrWhiteSpace(mode.Description))
+            {
+                sb.AppendLine($"  {mode.Description}");
+            }
+        }
+
+        // Reminder about manual
+        sb.AppendLine();
+        sb.AppendLine("Reminder: If you have not yet read the Serena Instructions Manual, " +
+                       "call the 'initial_instructions' tool for essential guidance.");
+
+        return sb.ToString().TrimEnd();
     }
 }
 
@@ -373,6 +437,143 @@ public sealed class GetCurrentConfigTool : ToolBase
         }
 
         return Task.FromResult(sb.ToString().TrimEnd());
+    }
+}
+
+[NoActiveProjectRequired]
+public sealed class RemoveProjectTool : ToolBase
+{
+    public RemoveProjectTool(IToolContext context) : base(context) { }
+
+    public override string Description =>
+        "Removes a registered project by name.";
+
+    protected override IReadOnlyList<ToolParameter> ExtractParameters() =>
+    [
+        new("project", "The name of the project to remove.", typeof(string), Required: true),
+    ];
+
+    protected override Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
+    {
+        string project = GetRequired<string>(arguments, "project");
+
+        var result = Context.Agent.Config.RemoveProject(project);
+
+        return Task.FromResult(result.IsSuccess
+            ? $"Removed project '{project}'."
+            : $"Error: {result.Error}");
+    }
+}
+
+[OptionalTool]
+[NoActiveProjectRequired]
+public sealed class RestartLanguageServerTool : ToolBase
+{
+    public RestartLanguageServerTool(IToolContext context) : base(context) { }
+
+    public override string Description =>
+        "Restart the language server. Use when LSP tools return errors.";
+
+    protected override IReadOnlyList<ToolParameter> ExtractParameters() => [];
+
+    protected override async Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
+    {
+        await Context.Agent.ResetLanguageServerManagerAsync();
+        return "Language server has been restarted successfully.";
+    }
+}
+
+[OptionalTool]
+[NoActiveProjectRequired]
+public sealed class ListQueryableProjectsTool : ToolBase
+{
+    public ListQueryableProjectsTool(IToolContext context) : base(context) { }
+
+    public override string Description =>
+        "Returns names of all registered projects EXCEPT the active one.";
+
+    protected override Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
+    {
+        var activeProject = Context.ActiveProject;
+        var projects = Context.Agent.RegisteredProjects
+            .Where(name => activeProject is null
+                || !string.Equals(name, activeProject.Name, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        return Task.FromResult(projects.Count > 0
+            ? string.Join("\n", projects)
+            : "No queryable projects registered.");
+    }
+}
+
+[OptionalTool]
+[NoActiveProjectRequired]
+public sealed class QueryProjectTool : ToolBase
+{
+    public QueryProjectTool(IToolContext context) : base(context) { }
+
+    public override string Description =>
+        "Temporarily activates another project, executes a read-only tool in it, and returns the result.";
+
+    protected override IReadOnlyList<ToolParameter> ExtractParameters() =>
+    [
+        new("project", "Name or path of the project to query.", typeof(string), Required: true),
+        new("tool_name", "Name of the tool to execute (must be read-only).", typeof(string), Required: true),
+        new("tool_params", "JSON object with tool parameters.", typeof(string), Required: true),
+    ];
+
+    protected override async Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
+    {
+        string project = GetRequired<string>(arguments, "project");
+        string toolName = GetRequired<string>(arguments, "tool_name");
+        string toolParamsJson = GetRequired<string>(arguments, "tool_params");
+
+        // Look up the tool in the current registry before switching projects.
+        ITool? tool = Context.Agent.Tools.Get(toolName);
+        if (tool is null)
+        {
+            return $"Error: Tool '{toolName}' not found.";
+        }
+
+        // Only allow read-only tools (no [CanEdit] or [SymbolicEdit] attributes).
+        if (tool is ToolBase tb && tb.CanEdit)
+        {
+            return $"Error: Tool '{toolName}' is not read-only and cannot be used with query_project.";
+        }
+
+        // Parse the tool parameters JSON.
+        Dictionary<string, object?>? parsedParams;
+        try
+        {
+            parsedParams = ParseToolParams(toolParamsJson);
+        }
+        catch (JsonException ex)
+        {
+            return $"Error: Invalid tool_params JSON: {ex.Message}";
+        }
+
+        // Temporarily activate the target project, run the tool, then restore.
+        await using var ctx = await Context.Agent.ActivateProjectTemporarilyAsync(project, ct);
+        return await tool.ExecuteAsync(parsedParams, ct);
+    }
+
+    private static Dictionary<string, object?> ParseToolParams(string json)
+    {
+        using var doc = JsonDocument.Parse(json);
+        var result = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        foreach (var prop in doc.RootElement.EnumerateObject())
+        {
+            result[prop.Name] = prop.Value.ValueKind switch
+            {
+                JsonValueKind.String => prop.Value.GetString(),
+                JsonValueKind.Number => prop.Value.TryGetInt64(out long l) ? l : prop.Value.GetDouble(),
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                JsonValueKind.Null => null,
+                _ => prop.Value.GetRawText(),
+            };
+        }
+        return result;
     }
 }
 

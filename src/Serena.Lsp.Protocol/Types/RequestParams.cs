@@ -225,6 +225,10 @@ public sealed record WorkspaceSymbolParams
 
 public sealed record HoverParams : TextDocumentPositionParams;
 
+// ---- Signature Help ----
+
+public sealed record SignatureHelpParams : TextDocumentPositionParams;
+
 // ---- Completion ----
 
 public sealed record CompletionParams : TextDocumentPositionParams

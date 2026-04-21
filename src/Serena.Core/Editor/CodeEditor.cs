@@ -297,7 +297,7 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
         var symbol = await FindUniqueSymbolAsync(namePath, relativePath, ct);
 
         // Check for references
-        var references = await _symbolRetriever.FindReferencesAsync(symbol, ct);
+        var references = await _symbolRetriever.FindReferencesAsync(symbol, ct: ct);
 
         if (references.Count > 0)
         {

@@ -193,7 +193,8 @@ public interface ISymbolRetriever
     /// Finds references to a symbol across the project.
     /// </summary>
     Task<IReadOnlyList<ReferenceResult>> FindReferencesAsync(
-        LanguageServerSymbol symbol, CancellationToken ct = default);
+        LanguageServerSymbol symbol, int contextLinesBefore = 1, int contextLinesAfter = 1,
+        CancellationToken ct = default);
 
     /// <summary>
     /// Gets a high-level overview of symbols in a file, grouped by kind.
@@ -230,6 +231,62 @@ public sealed record ReferenceResult
     public required int Character { get; init; }
     public string? ContextSnippet { get; init; }
     public string? ContainingSymbolName { get; init; }
+}
+
+/// <summary>
+/// Helpers for extracting multi-line context from source files.
+/// </summary>
+public static class SourceContext
+{
+    /// <summary>
+    /// Reads a window of lines around <paramref name="line"/> (0-based) and formats them
+    /// with line numbers. The reference line is prefixed with <c>&gt;</c>.
+    /// Returns <c>null</c> when the file cannot be read.
+    /// </summary>
+    public static string? RetrieveContentAroundLine(
+        string absolutePath, int line, int linesBefore = 1, int linesAfter = 1)
+    {
+        string[] fileLines;
+        try
+        {
+            fileLines = File.ReadAllLines(absolutePath);
+        }
+        catch
+        {
+            return null;
+        }
+
+        if (fileLines.Length == 0 || line < 0 || line >= fileLines.Length)
+        {
+            return null;
+        }
+
+        int start = Math.Max(0, line - linesBefore);
+        int end = Math.Min(fileLines.Length - 1, line + linesAfter);
+
+        var sb = new System.Text.StringBuilder();
+        for (int i = start; i <= end; i++)
+        {
+            string prefix = i == line ? "> " : "  ";
+            sb.Append(prefix);
+            // 1-based display numbers
+            sb.Append(i + 1);
+            sb.Append(": ");
+            sb.AppendLine(fileLines[i]);
+        }
+
+        // Remove trailing newline
+        if (sb.Length > 0 && sb[sb.Length - 1] == '\n')
+        {
+            sb.Length--;
+            if (sb.Length > 0 && sb[sb.Length - 1] == '\r')
+            {
+                sb.Length--;
+            }
+        }
+
+        return sb.ToString();
+    }
 }
 
 /// <summary>
@@ -357,7 +414,8 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
     }
 
     public async Task<IReadOnlyList<ReferenceResult>> FindReferencesAsync(
-        LanguageServerSymbol symbol, CancellationToken ct = default)
+        LanguageServerSymbol symbol, int contextLinesBefore = 1, int contextLinesAfter = 1,
+        CancellationToken ct = default)
     {
         if (symbol.BodyLocation is null)
         {
@@ -382,20 +440,9 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
             string refAbsPath = LspClient.UriToPath(loc.Uri);
             string refRelPath = Path.GetRelativePath(_projectRoot, refAbsPath).Replace('\\', '/');
 
-            string? snippet = null;
-            try
-            {
-                string[] fileLines = File.ReadAllLines(refAbsPath);
-                int refLine = loc.Range.Start.Line;
-                if (refLine >= 0 && refLine < fileLines.Length)
-                {
-                    snippet = fileLines[refLine].Trim();
-                }
-            }
-            catch
-            {
-                // Skip if file can't be read
-            }
+            int refLine = loc.Range.Start.Line;
+            string? snippet = SourceContext.RetrieveContentAroundLine(
+                refAbsPath, refLine, contextLinesBefore, contextLinesAfter);
 
             // Look up the containing symbol for this reference location
             string? containingName = null;
