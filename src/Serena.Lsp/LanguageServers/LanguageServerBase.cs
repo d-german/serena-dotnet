@@ -160,14 +160,37 @@ public abstract class LanguageServerDefinition
     }
 
     /// <summary>
-    /// Attempts to install npm packages globally.
+    /// Returns the local resources directory for a language server, creating it if needed.
+    /// Language servers are installed into ~/.serena-dotnet/language-servers/{serverName}/.
     /// </summary>
-    protected void TryNpmInstall(params string[] packages)
+    protected static string GetLanguageServerResourcesDir(string serverName)
+    {
+        string dir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".serena-dotnet", "language-servers", serverName);
+        Directory.CreateDirectory(dir);
+        return dir;
+    }
+
+    /// <summary>
+    /// Installs npm packages locally into the given resource directory.
+    /// Uses <c>npm install --prefix ./ {packages}</c> so binaries end up
+    /// in <c>{resourceDir}/node_modules/.bin/</c>.
+    /// </summary>
+    protected void TryLocalNpmInstall(string resourceDir, params string[] packages)
     {
         try
         {
-            string npm = PlatformUtils.IsWindows ? "npm.cmd" : "npm";
-            string args = "install -g " + string.Join(' ', packages);
+            string? npm = FindInPath("npm");
+            if (npm is null)
+            {
+                Logger.LogWarning(
+                    "npm not found in PATH. Install Node.js or run 'serena-dotnet doctor' to diagnose.");
+                return;
+            }
+
+            Directory.CreateDirectory(resourceDir);
+            string args = "install --prefix ./ " + string.Join(' ', packages);
             var psi = new ProcessStartInfo
             {
                 FileName = npm,
@@ -176,6 +199,7 @@ public abstract class LanguageServerDefinition
                 RedirectStandardError = true,
                 UseShellExecute = false,
                 CreateNoWindow = true,
+                WorkingDirectory = resourceDir,
             };
 
             using var process = System.Diagnostics.Process.Start(psi);
@@ -187,18 +211,63 @@ public abstract class LanguageServerDefinition
             process.WaitForExit(TimeSpan.FromSeconds(120));
             if (process.ExitCode == 0)
             {
-                Logger.LogInformation("Successfully installed npm packages: {Packages}", string.Join(", ", packages));
+                Logger.LogInformation("Successfully installed npm packages locally: {Packages}", string.Join(", ", packages));
             }
             else
             {
                 string stderr = process.StandardError.ReadToEnd();
-                Logger.LogWarning("Failed to install npm packages: {Error}", stderr);
+                string stdout = process.StandardOutput.ReadToEnd();
+                Logger.LogWarning(
+                    "Failed to install npm packages (exit code {ExitCode}): stderr={Error}, stdout={Output}",
+                    process.ExitCode, stderr, stdout);
             }
         }
         catch (Exception ex)
         {
-            Logger.LogWarning(ex, "npm install failed for: {Packages}", string.Join(", ", packages));
+            Logger.LogWarning(ex, "Local npm install failed for: {Packages}", string.Join(", ", packages));
         }
+    }
+
+    /// <summary>
+    /// Finds a locally installed npm binary by checking the node_modules/.bin directory.
+    /// Returns the full absolute path if found, null otherwise.
+    /// </summary>
+    protected static string? FindLocalNpmBinary(string resourceDir, string binaryName)
+    {
+        string binDir = Path.Combine(resourceDir, "node_modules", ".bin");
+        string[] extensions = PlatformUtils.IsWindows ? [".cmd", ".exe", ""] : [""];
+
+        foreach (string ext in extensions)
+        {
+            string candidate = Path.Combine(binDir, binaryName + ext);
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Finds a .NET global tool by checking the well-known tools directory directly,
+    /// avoiding any PATH manipulation.
+    /// </summary>
+    protected static string? FindDotnetToolPath(string toolName)
+    {
+        string toolsDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".dotnet", "tools");
+
+        string[] extensions = PlatformUtils.IsWindows ? [".exe", ".cmd", ""] : [""];
+        foreach (string ext in extensions)
+        {
+            string candidate = Path.Combine(toolsDir, toolName + ext);
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+        return null;
     }
 }
 

@@ -10,7 +10,7 @@ namespace Serena.Lsp.LanguageServers;
 
 /// <summary>
 /// C# language server using the official Roslyn Language Server from Microsoft.
-/// Auto-installs via `dotnet tool install -g roslyn-language-server --prerelease` if not found.
+/// Auto-installs via <c>dotnet tool install -g roslyn-language-server --prerelease</c> if not found.
 /// Falls back to csharp-ls if explicitly configured.
 /// </summary>
 public sealed class CSharpLanguageServer : LanguageServerDefinition
@@ -31,12 +31,13 @@ public sealed class CSharpLanguageServer : LanguageServerDefinition
             };
         }
 
-        string? roslynPath = FindInPath("roslyn-language-server");
+        // Check well-known dotnet tools location first, then PATH
+        string? roslynPath = FindDotnetToolPath("roslyn-language-server") ?? FindInPath("roslyn-language-server");
         if (roslynPath is null)
         {
             Logger.LogInformation("roslyn-language-server not found, attempting auto-install...");
             TryAutoInstall();
-            roslynPath = FindInPath("roslyn-language-server");
+            roslynPath = FindDotnetToolPath("roslyn-language-server") ?? FindInPath("roslyn-language-server");
         }
 
         if (roslynPath is not null)
@@ -104,7 +105,7 @@ public sealed class CSharpLanguageServer : LanguageServerDefinition
 
 /// <summary>
 /// Python language server via Pyright.
-/// Auto-installs via `npm install -g pyright` if not found.
+/// Auto-installs locally into ~/.serena-dotnet/language-servers/python/ if not found.
 /// </summary>
 public sealed class PythonLanguageServer : LanguageServerDefinition
 {
@@ -124,17 +125,29 @@ public sealed class PythonLanguageServer : LanguageServerDefinition
             };
         }
 
-        string? path = FindInPath("pyright-langserver");
+        string resourceDir = GetLanguageServerResourcesDir("python");
+        string? path = FindLocalNpmBinary(resourceDir, "pyright-langserver");
+
         if (path is null)
         {
-            Logger.LogInformation("pyright-langserver not found, attempting auto-install...");
-            TryNpmInstall("pyright");
-            path = FindInPath("pyright-langserver");
+            Logger.LogInformation("pyright-langserver not found locally, attempting auto-install...");
+            TryLocalNpmInstall(resourceDir, "pyright");
+            path = FindLocalNpmBinary(resourceDir, "pyright-langserver");
+        }
+
+        // Fallback: check global PATH
+        path ??= FindInPath("pyright-langserver");
+
+        if (path is null)
+        {
+            throw new InvalidOperationException(
+                "Pyright language server not found. Ensure Node.js/npm is installed, then restart the server to auto-install. "
+                + "Run 'serena-dotnet doctor' to diagnose.");
         }
 
         return new ProcessLaunchInfo
         {
-            Command = [path ?? "pyright-langserver", "--stdio"],
+            Command = [path, "--stdio"],
             WorkingDirectory = projectRoot,
         };
     }
@@ -146,7 +159,7 @@ public sealed class PythonLanguageServer : LanguageServerDefinition
 /// <summary>
 /// TypeScript/JavaScript language server via typescript-language-server.
 /// Handles both .ts/.tsx and .js/.jsx files.
-/// Auto-installs via `npm install -g typescript-language-server typescript` if not found.
+/// Auto-installs locally into ~/.serena-dotnet/language-servers/typescript/ if not found.
 /// </summary>
 public sealed class TypeScriptLanguageServer : LanguageServerDefinition
 {
@@ -166,17 +179,29 @@ public sealed class TypeScriptLanguageServer : LanguageServerDefinition
             };
         }
 
-        string? path = FindInPath("typescript-language-server");
+        string resourceDir = GetLanguageServerResourcesDir("typescript");
+        string? path = FindLocalNpmBinary(resourceDir, "typescript-language-server");
+
         if (path is null)
         {
-            Logger.LogInformation("typescript-language-server not found, attempting auto-install...");
-            TryNpmInstall("typescript-language-server", "typescript");
-            path = FindInPath("typescript-language-server");
+            Logger.LogInformation("typescript-language-server not found locally, attempting auto-install...");
+            TryLocalNpmInstall(resourceDir, "typescript-language-server", "typescript");
+            path = FindLocalNpmBinary(resourceDir, "typescript-language-server");
+        }
+
+        // Fallback: check global PATH
+        path ??= FindInPath("typescript-language-server");
+
+        if (path is null)
+        {
+            throw new InvalidOperationException(
+                "TypeScript language server not found. Ensure Node.js/npm is installed, then restart the server to auto-install. "
+                + "Run 'serena-dotnet doctor' to diagnose.");
         }
 
         return new ProcessLaunchInfo
         {
-            Command = [path ?? "typescript-language-server", "--stdio"],
+            Command = [path, "--stdio"],
             WorkingDirectory = projectRoot,
         };
     }

@@ -91,6 +91,13 @@ public static class Program
         registry.Register(new CheckOnboardingPerformedTool(context));
         registry.Register(new OnboardingTool(context));
         registry.Register(new InitialInstructionsTool(context));
+        registry.Register(new RemoveProjectTool(context));
+        registry.Register(new RestartLanguageServerTool(context));
+        registry.Register(new ListQueryableProjectsTool(context));
+        registry.Register(new QueryProjectTool(context));
+        registry.Register(new DeleteLinesTool(context));
+        registry.Register(new InsertAtLineTool(context));
+        registry.Register(new ReplaceLinesTool(context));
 
         return registry;
     }

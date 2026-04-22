@@ -53,6 +53,13 @@ public class ToolWiringIntegrationTests
         registry.Register(new CheckOnboardingPerformedTool(context));
         registry.Register(new OnboardingTool(context));
         registry.Register(new InitialInstructionsTool(context));
+        registry.Register(new RemoveProjectTool(context));
+        registry.Register(new RestartLanguageServerTool(context));
+        registry.Register(new ListQueryableProjectsTool(context));
+        registry.Register(new QueryProjectTool(context));
+        registry.Register(new DeleteLinesTool(context));
+        registry.Register(new InsertAtLineTool(context));
+        registry.Register(new ReplaceLinesTool(context));
 
         agent.SetToolRegistry(registry);
         return (agent, registry, context);
@@ -62,7 +69,7 @@ public class ToolWiringIntegrationTests
     public void FullStack_AllToolsRegistered()
     {
         var (_, registry, _) = CreateFullStack();
-        Assert.Equal(26, registry.All.Count);
+        Assert.Equal(33, registry.All.Count);
     }
 
     [Fact]
@@ -81,7 +88,7 @@ public class ToolWiringIntegrationTests
     {
         var (_, registry, _) = CreateFullStack();
         // Most tools have parameters; these are parameterless
-        string[] parameterlessTools = ["get_current_config", "check_onboarding_performed", "onboarding", "initial_instructions"];
+        string[] parameterlessTools = ["get_current_config", "check_onboarding_performed", "onboarding", "initial_instructions", "restart_language_server", "list_queryable_projects"];
         var parameterizedTools = registry.All.Where(t => !parameterlessTools.Contains(t.Name));
         foreach (var tool in parameterizedTools)
         {

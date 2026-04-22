@@ -133,7 +133,15 @@ public sealed class LanguageServerSymbol
             {
                 grouped[kind] = [];
             }
-            grouped[kind].Add(child.ToDict(childDepth: remainingDepth));
+
+            var childDict = child.ToDict(childDepth: remainingDepth);
+
+            // kind is redundant (already the grouping key) and relative_path
+            // is inherited from the parent — omit both to reduce output size.
+            childDict.Remove("kind");
+            childDict.Remove("relative_path");
+
+            grouped[kind].Add(childDict);
         }
         return grouped;
     }

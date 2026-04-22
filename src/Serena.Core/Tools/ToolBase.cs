@@ -296,7 +296,17 @@ public abstract class ToolBase : ITool
     {
         string root = RequireProjectRoot();
         string absPath = Path.GetFullPath(Path.Combine(root, relativePath));
-        var lsp = await Context.Agent.GetLanguageServerForFileAsync(absPath, ct)
+
+        // When the path is a directory, find a representative source file to determine the language
+        string lspLookupPath = absPath;
+        if (Directory.Exists(absPath))
+        {
+            lspLookupPath = Directory.EnumerateFiles(absPath, "*", SearchOption.AllDirectories)
+                .FirstOrDefault(LanguageServerSymbolRetriever.CanAnalyzeFile)
+                ?? absPath;
+        }
+
+        var lsp = await Context.Agent.GetLanguageServerForFileAsync(lspLookupPath, ct)
             ?? throw new InvalidOperationException(
                 $"No language server available for '{relativePath}'. Ensure a language server is configured.");
 
@@ -314,7 +324,17 @@ public abstract class ToolBase : ITool
     {
         string root = RequireProjectRoot();
         string absPath = Path.GetFullPath(Path.Combine(root, relativePath));
-        var lsp = await Context.Agent.GetLanguageServerForFileAsync(absPath, ct)
+
+        // When the path is a directory, find a representative source file to determine the language
+        string lspLookupPath = absPath;
+        if (Directory.Exists(absPath))
+        {
+            lspLookupPath = Directory.EnumerateFiles(absPath, "*", SearchOption.AllDirectories)
+                .FirstOrDefault(LanguageServerSymbolRetriever.CanAnalyzeFile)
+                ?? absPath;
+        }
+
+        var lsp = await Context.Agent.GetLanguageServerForFileAsync(lspLookupPath, ct)
             ?? throw new InvalidOperationException(
                 $"No language server available for '{relativePath}'. Ensure a language server is configured.");
 

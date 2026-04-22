@@ -3,6 +3,7 @@
 
 using System.Text;
 using System.Text.RegularExpressions;
+using Serena.Core.Editor;
 
 namespace Serena.Core.Tools;
 
@@ -186,6 +187,9 @@ public sealed class SearchForPatternTool : ToolBase
         new("context_lines_before", "Number of lines of context before each match.", typeof(int), Required: false, DefaultValue: 0),
         new("context_lines_after", "Number of lines of context after each match.", typeof(int), Required: false, DefaultValue: 0),
         new("max_answer_chars", "Max characters for the result. -1 for default.", typeof(int), Required: false, DefaultValue: -1),
+        new("paths_include_glob", "Only search files whose name matches this glob pattern (e.g. '*.cs').", typeof(string), Required: false, DefaultValue: ""),
+        new("paths_exclude_glob", "Exclude files whose name matches this glob pattern (e.g. '*.min.js').", typeof(string), Required: false, DefaultValue: ""),
+        new("restrict_search_to_code_files", "When true, only search files that the language server can analyze.", typeof(bool), Required: false, DefaultValue: false),
     ];
 
     protected override Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
@@ -195,6 +199,9 @@ public sealed class SearchForPatternTool : ToolBase
         int contextBefore = GetOptional(arguments, "context_lines_before", 0);
         int contextAfter = GetOptional(arguments, "context_lines_after", 0);
         int maxChars = GetOptional(arguments, "max_answer_chars", -1);
+        string includeGlob = GetOptional(arguments, "paths_include_glob", "");
+        string excludeGlob = GetOptional(arguments, "paths_exclude_glob", "");
+        bool codeFilesOnly = GetOptional(arguments, "restrict_search_to_code_files", false);
 
         string projectRoot = RequireProjectRoot();
         string searchRoot = string.IsNullOrEmpty(relativePath)
@@ -214,6 +221,21 @@ public sealed class SearchForPatternTool : ToolBase
             filesToSearch = Directory.EnumerateFiles(searchRoot, "*", SearchOption.AllDirectories)
                 .Where(f => !IsPathIgnored(
                     Path.GetRelativePath(projectRoot, f)));
+        }
+
+        if (!string.IsNullOrEmpty(includeGlob))
+        {
+            filesToSearch = filesToSearch.Where(f => FileSystemHelpers.MatchesGlob(Path.GetFileName(f), includeGlob));
+        }
+
+        if (!string.IsNullOrEmpty(excludeGlob))
+        {
+            filesToSearch = filesToSearch.Where(f => !FileSystemHelpers.MatchesGlob(Path.GetFileName(f), excludeGlob));
+        }
+
+        if (codeFilesOnly)
+        {
+            filesToSearch = filesToSearch.Where(LanguageServerSymbolRetriever.CanAnalyzeFile);
         }
 
         foreach (string filePath in filesToSearch)

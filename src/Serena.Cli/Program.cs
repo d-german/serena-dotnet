@@ -22,6 +22,7 @@ public static class Program
         rootCommand.Add(CreateRegisterCommand());
         rootCommand.Add(CreateListProjectsCommand());
         rootCommand.Add(CreateSetupCommand());
+        rootCommand.Add(CreateDoctorCommand());
         rootCommand.Add(CreateVersionCommand());
         rootCommand.Add(CreateProjectCommand());
 
@@ -219,6 +220,156 @@ public static class Program
         });
 
         return command;
+    }
+
+    private static Command CreateDoctorCommand()
+    {
+        var command = new Command("doctor") { Description = "Check language server prerequisites and availability" };
+
+        command.SetAction((ParseResult _) => RunDoctor());
+
+        return command;
+    }
+
+    private static void RunDoctor()
+    {
+        Console.WriteLine("Serena Doctor — checking language server prerequisites");
+        Console.WriteLine();
+
+        CheckPrerequisite("node", "--version", "Node.js", "https://nodejs.org");
+        CheckPrerequisite("npm", "--version", "npm", "Bundled with Node.js");
+        CheckPrerequisite("dotnet", "--version", ".NET SDK", "https://dot.net");
+        Console.WriteLine();
+
+        string lsBase = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".serena-dotnet", "language-servers");
+
+        string dotnetToolsDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".dotnet", "tools");
+
+        Console.WriteLine("Language Servers:");
+
+        // C# — installed as a dotnet global tool
+        CheckLanguageServer("C# (Roslyn)", "roslyn-language-server",
+            localDir: null, dotnetToolsDir: dotnetToolsDir);
+
+        // TypeScript — installed locally via npm
+        CheckLanguageServer("TypeScript", "typescript-language-server",
+            localDir: Path.Combine(lsBase, "typescript"), dotnetToolsDir: null);
+
+        // Python — installed locally via npm
+        CheckLanguageServer("Python (Pyright)", "pyright-langserver",
+            localDir: Path.Combine(lsBase, "python"), dotnetToolsDir: null);
+
+        // Rust — user-installed
+        CheckLanguageServer("Rust (rust-analyzer)", "rust-analyzer",
+            localDir: null, dotnetToolsDir: null);
+
+        // Go — user-installed
+        CheckLanguageServer("Go (gopls)", "gopls",
+            localDir: null, dotnetToolsDir: null);
+
+        Console.WriteLine();
+        Console.WriteLine("Language servers are auto-installed when the MCP server starts.");
+        Console.WriteLine("If any are missing, ensure prerequisites are installed and restart the server.");
+    }
+
+    private static void CheckLanguageServer(string displayName, string binaryName,
+        string? localDir, string? dotnetToolsDir)
+    {
+        // Check local npm install
+        if (localDir is not null)
+        {
+            string binDir = Path.Combine(localDir, "node_modules", ".bin");
+            string[] extensions = PlatformUtils.IsWindows ? [".cmd", ".exe", ""] : [""];
+            foreach (string ext in extensions)
+            {
+                string candidate = Path.Combine(binDir, binaryName + ext);
+                if (File.Exists(candidate))
+                {
+                    Console.WriteLine($"  ✓ {displayName,-25} {candidate} (local)");
+                    return;
+                }
+            }
+        }
+
+        // Check dotnet tools dir
+        if (dotnetToolsDir is not null)
+        {
+            string[] extensions = PlatformUtils.IsWindows ? [".exe", ".cmd", ""] : [""];
+            foreach (string ext in extensions)
+            {
+                string candidate = Path.Combine(dotnetToolsDir, binaryName + ext);
+                if (File.Exists(candidate))
+                {
+                    Console.WriteLine($"  ✓ {displayName,-25} {candidate} (dotnet tool)");
+                    return;
+                }
+            }
+        }
+
+        // Check global PATH
+        string? globalPath = FindExecutable(binaryName);
+        if (globalPath is not null)
+        {
+            Console.WriteLine($"  ✓ {displayName,-25} {globalPath} (global)");
+            return;
+        }
+
+        Console.WriteLine($"  ✗ {displayName,-25} not found");
+    }
+
+    private static bool CheckPrerequisite(string binary, string versionArg, string displayName, string installHint)
+    {
+        try
+        {
+            string fileName = PlatformUtils.IsWindows && binary == "npm" ? "npm.cmd" : binary;
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = fileName,
+                Arguments = versionArg,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            using var process = System.Diagnostics.Process.Start(psi);
+            if (process is null)
+            {
+                Console.WriteLine($"  ✗ {displayName,-25} not found — {installHint}");
+                return false;
+            }
+            string version = process.StandardOutput.ReadToEnd().Trim();
+            process.WaitForExit(TimeSpan.FromSeconds(10));
+            Console.WriteLine($"  ✓ {displayName,-25} {version}");
+            return true;
+        }
+        catch
+        {
+            Console.WriteLine($"  ✗ {displayName,-25} not found — {installHint}");
+            return false;
+        }
+    }
+
+    private static string? FindExecutable(string name)
+    {
+        string pathVar = Environment.GetEnvironmentVariable("PATH") ?? "";
+        string[] extensions = PlatformUtils.IsWindows ? [".exe", ".cmd", ".bat", ""] : [""];
+
+        foreach (string dir in pathVar.Split(Path.PathSeparator))
+        {
+            foreach (string ext in extensions)
+            {
+                string candidate = Path.Combine(dir, name + ext);
+                if (File.Exists(candidate))
+                {
+                    return candidate;
+                }
+            }
+        }
+        return null;
     }
 
     private static Command CreateVersionCommand()

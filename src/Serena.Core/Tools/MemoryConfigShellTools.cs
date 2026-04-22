@@ -55,12 +55,19 @@ public sealed class WriteMemoryTool : ToolBase
     [
         new("memory_name", "The name of the memory to write.", typeof(string), Required: true),
         new("content", "The markdown content to write.", typeof(string), Required: true),
+        new("max_chars", "Maximum characters to write. -1 for no limit.", typeof(int), Required: false, DefaultValue: -1),
     ];
 
     protected override Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
     {
         string memoryName = GetRequired<string>(arguments, "memory_name");
         string content = GetRequired<string>(arguments, "content");
+        int maxChars = GetOptional(arguments, "max_chars", -1);
+
+        if (maxChars > 0 && content.Length > maxChars)
+        {
+            content = content[..maxChars];
+        }
 
         var mm = CreateMemoriesManager();
         try
@@ -144,6 +151,7 @@ public sealed class ExecuteShellCommandTool : ToolBase
         new("cwd", "Working directory. If null, uses the project root.", typeof(string), Required: false),
         new("capture_stderr", "Whether to capture stderr output.", typeof(bool), Required: false, DefaultValue: true),
         new("max_answer_chars", "Max characters for the result. -1 for default.", typeof(int), Required: false, DefaultValue: -1),
+        new("timeout_seconds", "Timeout in seconds for the command. Default is 240.", typeof(int), Required: false, DefaultValue: DefaultTimeoutSeconds),
     ];
 
     protected override async Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
@@ -152,6 +160,7 @@ public sealed class ExecuteShellCommandTool : ToolBase
         string? cwd = GetOptional<string?>(arguments, "cwd", null);
         bool captureStderr = GetOptional(arguments, "capture_stderr", true);
         int maxChars = GetOptional(arguments, "max_answer_chars", -1);
+        int timeoutSeconds = GetOptional(arguments, "timeout_seconds", DefaultTimeoutSeconds);
 
         string projectRoot = RequireProjectRoot();
         string workingDir = cwd is not null ? ResolvePath(cwd) : projectRoot;
@@ -171,7 +180,7 @@ public sealed class ExecuteShellCommandTool : ToolBase
             ?? throw new InvalidOperationException("Failed to start process.");
 
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(TimeSpan.FromSeconds(DefaultTimeoutSeconds));
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
 
         try
         {
@@ -184,7 +193,7 @@ public sealed class ExecuteShellCommandTool : ToolBase
             string stderr = await stderrTask;
             await process.WaitForExitAsync(timeoutCts.Token);
 
-            var result = new ShellResult(stdout, captureStderr ? stderr : null, process.ExitCode);
+            var result = new ShellResult(stdout, captureStderr ? stderr : null, process.ExitCode, workingDir);
             return LimitLength(ToJson(result), maxChars);
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
@@ -197,11 +206,11 @@ public sealed class ExecuteShellCommandTool : ToolBase
             {
                 // Best-effort kill
             }
-            return ToJson(new { error = $"Command timed out after {DefaultTimeoutSeconds} seconds." });
+            return ToJson(new { error = $"Command timed out after {timeoutSeconds} seconds." });
         }
     }
 
-    private sealed record ShellResult(string Stdout, string? Stderr, int ExitCode);
+    private sealed record ShellResult(string Stdout, string? Stderr, int ReturnCode, string Cwd);
 }
 
 [CanEdit]

@@ -2,6 +2,7 @@
 // Tools for: check_onboarding_performed, onboarding, initial_instructions
 
 using System.Text;
+using Serena.Core.Templates;
 
 namespace Serena.Core.Tools;
 
@@ -44,7 +45,19 @@ public sealed class OnboardingTool : ToolBase
 
     protected override Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
     {
-        return Task.FromResult(OnboardingPrompt);
+        var sb = new StringBuilder();
+
+        // Add project context if available
+        var project = Context.ActiveProject;
+        if (project is not null)
+        {
+            sb.AppendLine($"## Active Project: {project.Name}");
+            sb.AppendLine($"- **Path**: {project.ProjectRoot}");
+            sb.AppendLine();
+        }
+
+        sb.Append(OnboardingPrompt);
+        return Task.FromResult(sb.ToString().TrimEnd());
     }
 
     private static readonly string OnboardingPrompt = """
@@ -94,7 +107,20 @@ public sealed class InitialInstructionsTool : ToolBase
 
     protected override Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
     {
-        return Task.FromResult(InstructionsManual);
+        var sb = new StringBuilder(InstructionsManual);
+
+        // Append dynamic runtime context
+        string dynamicContext = SystemPromptFactory.CreateSystemPrompt(Context.Agent);
+        if (!string.IsNullOrWhiteSpace(dynamicContext))
+        {
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine("## Current Runtime Context");
+            sb.AppendLine();
+            sb.Append(dynamicContext);
+        }
+
+        return Task.FromResult(sb.ToString().TrimEnd());
     }
 
     private static readonly string InstructionsManual = """
