@@ -214,6 +214,28 @@ public sealed class LanguageServerProcess : IAsyncDisposable
                 _language,
                 ex);
         }
+        catch (ConnectionLostException ex)
+        {
+            _logger.LogError(ex, "Language server [{Language}] disconnected during '{Method}'. Process running: {IsRunning}",
+                _language, method, IsRunning);
+            throw new LanguageServerTerminatedException(
+                $"Language server [{_language}] disconnected during '{method}'",
+                _language,
+                ex);
+        }
+        catch (TaskCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogError(ex, "LSP request '{Method}' timed out or LS died. Process running: {IsRunning}",
+                method, IsRunning);
+            if (!IsRunning)
+            {
+                throw new LanguageServerTerminatedException(
+                    $"Language server [{_language}] terminated during '{method}'",
+                    _language,
+                    ex);
+            }
+            throw;
+        }
     }
 
     /// <summary>

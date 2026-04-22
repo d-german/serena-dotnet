@@ -28,19 +28,8 @@ public sealed class ReadMemoryTool : ToolBase
         string memoryName = GetRequired<string>(arguments, "memory_name");
 
         var mm = CreateMemoriesManager();
-        try
-        {
-            string content = mm.LoadMemory(memoryName);
-            return Task.FromResult(content);
-        }
-        catch (FileNotFoundException)
-        {
-            return Task.FromResult($"Error: Memory '{memoryName}' not found.");
-        }
-        catch (InvalidOperationException ex)
-        {
-            return Task.FromResult($"Error: {ex.Message}");
-        }
+        string content = mm.LoadMemory(memoryName);
+        return Task.FromResult(content);
     }
 }
 
@@ -67,21 +56,14 @@ public sealed class WriteMemoryTool : ToolBase
 
         if (maxChars > 0 && content.Length > maxChars)
         {
-            return Task.FromResult(
-                $"Error: Content exceeds max_chars ({content.Length} > {maxChars}). " +
+            throw new InvalidOperationException(
+                $"Content exceeds max_chars ({content.Length} > {maxChars}). " +
                 "Please reduce the content length before writing.");
         }
 
         var mm = CreateMemoriesManager();
-        try
-        {
-            mm.SaveMemory(memoryName, content);
-            return Task.FromResult($"Memory '{memoryName}' saved ({content.Length} chars).");
-        }
-        catch (UnauthorizedAccessException ex)
-        {
-            return Task.FromResult($"Error: {ex.Message}");
-        }
+        mm.SaveMemory(memoryName, content);
+        return Task.FromResult($"Memory '{memoryName}' saved ({content.Length} chars).");
     }
 }
 
@@ -126,15 +108,8 @@ public sealed class DeleteMemoryTool : ToolBase
         string memoryName = GetRequired<string>(arguments, "memory_name");
 
         var mm = CreateMemoriesManager();
-        try
-        {
-            mm.DeleteMemory(memoryName);
-            return Task.FromResult($"Memory '{memoryName}' deleted.");
-        }
-        catch (UnauthorizedAccessException ex)
-        {
-            return Task.FromResult($"Error: {ex.Message}");
-        }
+        mm.DeleteMemory(memoryName);
+        return Task.FromResult($"Memory '{memoryName}' deleted.");
     }
 }
 
@@ -270,23 +245,8 @@ public sealed class RenameMemoryTool : ToolBase
         string newName = GetRequired<string>(arguments, "new_name");
 
         var mm = CreateMemoriesManager();
-        try
-        {
-            mm.MoveMemory(oldName, newName);
-            return Task.FromResult($"Memory renamed from '{oldName}' to '{newName}'.");
-        }
-        catch (FileNotFoundException)
-        {
-            return Task.FromResult($"Error: Memory '{oldName}' not found.");
-        }
-        catch (InvalidOperationException ex)
-        {
-            return Task.FromResult($"Error: {ex.Message}");
-        }
-        catch (UnauthorizedAccessException ex)
-        {
-            return Task.FromResult($"Error: {ex.Message}");
-        }
+        mm.MoveMemory(oldName, newName);
+        return Task.FromResult($"Memory renamed from '{oldName}' to '{newName}'.");
     }
 }
 
@@ -316,23 +276,8 @@ public sealed class EditMemoryTool : ToolBase
         bool allowMultiple = GetOptional(arguments, "allow_multiple_occurrences", false);
 
         var mm = CreateMemoriesManager();
-        try
-        {
-            mm.EditMemory(memoryName, needle, repl, mode, allowMultiple);
-            return Task.FromResult($"Memory '{memoryName}' updated successfully.");
-        }
-        catch (FileNotFoundException)
-        {
-            return Task.FromResult($"Error: Memory '{memoryName}' not found.");
-        }
-        catch (InvalidOperationException ex)
-        {
-            return Task.FromResult($"Error: {ex.Message}");
-        }
-        catch (UnauthorizedAccessException ex)
-        {
-            return Task.FromResult($"Error: {ex.Message}");
-        }
+        mm.EditMemory(memoryName, needle, repl, mode, allowMultiple);
+        return Task.FromResult($"Memory '{memoryName}' updated successfully.");
     }
 }
 
@@ -356,7 +301,7 @@ public sealed class ActivateProjectTool : ToolBase
         var result = await Context.Agent.TryActivateProjectAsync(project, ct);
         if (result.IsFailure)
         {
-            return $"Error: {result.Error}";
+            throw new InvalidOperationException(result.Error);
         }
 
         var active = Context.ActiveProject;
@@ -505,9 +450,12 @@ public sealed class RemoveProjectTool : ToolBase
 
         var result = Context.Agent.Config.RemoveProject(project);
 
-        return Task.FromResult(result.IsSuccess
-            ? $"Removed project '{project}'."
-            : $"Error: {result.Error}");
+        if (result.IsFailure)
+        {
+            throw new InvalidOperationException(result.Error);
+        }
+
+        return Task.FromResult($"Removed project '{project}'.");
     }
 }
 
@@ -575,28 +523,18 @@ public sealed class QueryProjectTool : ToolBase
         string toolParamsJson = GetRequired<string>(arguments, "tool_params");
 
         // Look up the tool in the current registry before switching projects.
-        ITool? tool = Context.Agent.Tools.Get(toolName);
-        if (tool is null)
-        {
-            return $"Error: Tool '{toolName}' not found.";
-        }
+        ITool? tool = Context.Agent.Tools.Get(toolName)
+            ?? throw new InvalidOperationException($"Tool '{toolName}' not found.");
 
         // Only allow read-only tools (no [CanEdit] or [SymbolicEdit] attributes).
         if (tool is ToolBase tb && tb.CanEdit)
         {
-            return $"Error: Tool '{toolName}' is not read-only and cannot be used with query_project.";
+            throw new InvalidOperationException(
+                $"Tool '{toolName}' is not read-only and cannot be used with query_project.");
         }
 
         // Parse the tool parameters JSON.
-        Dictionary<string, object?>? parsedParams;
-        try
-        {
-            parsedParams = ParseToolParams(toolParamsJson);
-        }
-        catch (JsonException ex)
-        {
-            return $"Error: Invalid tool_params JSON: {ex.Message}";
-        }
+        var parsedParams = ParseToolParams(toolParamsJson);
 
         // Temporarily activate the target project, run the tool, then restore.
         await using var ctx = await Context.Agent.ActivateProjectTemporarilyAsync(project, ct);

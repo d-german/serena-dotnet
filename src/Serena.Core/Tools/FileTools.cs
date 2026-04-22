@@ -32,7 +32,7 @@ public sealed class ReadFileTool : ToolBase
         string fullPath = ResolvePath(relativePath);
         if (!File.Exists(fullPath))
         {
-            return $"Error: File not found: {relativePath}";
+            throw new FileNotFoundException($"File not found: {relativePath}", relativePath);
         }
 
         string[] lines = await File.ReadAllLinesAsync(fullPath, GetProjectEncoding(), ct);
@@ -46,8 +46,9 @@ public sealed class ReadFileTool : ToolBase
         string result = string.Join('\n', lines);
         if (maxChars > 0 && result.Length > maxChars)
         {
-            return $"Error: File content ({result.Length} chars) exceeds max_answer_chars ({maxChars}). " +
-                "Use start_line/end_line to read specific sections.";
+            throw new InvalidOperationException(
+                $"File content ({result.Length} chars) exceeds max_answer_chars ({maxChars}). " +
+                "Use start_line/end_line to read specific sections.");
         }
 
         return result;
@@ -118,11 +119,7 @@ public sealed class ListDirTool : ToolBase
         string fullPath = ResolvePath(relativePath);
         if (!Directory.Exists(fullPath))
         {
-            return Task.FromResult(ToJson(new
-            {
-                error = $"Directory not found: {relativePath}",
-                hint = "Check if the path is correct relative to the project root"
-            }));
+            throw new DirectoryNotFoundException($"Directory not found: {relativePath}");
         }
 
         string projectRoot = RequireProjectRoot();
@@ -156,7 +153,7 @@ public sealed class FindFileTool : ToolBase
         string fullPath = ResolvePath(relativePath);
         if (!Directory.Exists(fullPath))
         {
-            return Task.FromResult(ToJson(new { error = $"Directory not found: {relativePath}" }));
+            throw new DirectoryNotFoundException($"Directory not found: {relativePath}");
         }
 
         string projectRoot = RequireProjectRoot();
