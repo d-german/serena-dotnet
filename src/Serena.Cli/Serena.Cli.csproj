@@ -10,7 +10,7 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>serena-dotnet</ToolCommandName>
     <PackageId>Serena.DotNet</PackageId>
-    <Version>1.0.0</Version>
+    <Version>1.0.5</Version>
     <Authors>dgerman</Authors>
     <PackageDescription>Serena is a code-aware MCP (Model Context Protocol) coding agent that provides 26 tools for navigating, understanding, and editing code using language server protocol integration.</PackageDescription>
     <PackageTags>mcp;coding-agent;lsp;serena;ai-tools</PackageTags>

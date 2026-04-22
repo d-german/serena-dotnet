@@ -235,7 +235,10 @@ public sealed class MemoriesManager
         }
 
         // Literal mode
-        int occurrences = TextReplacementHelper.CountOccurrences(content, needle);
+        string normalizedNeedle = TextReplacementHelper.NormalizeLineEndings(needle, content);
+        string normalizedRepl = TextReplacementHelper.NormalizeLineEndings(replacement, content);
+
+        int occurrences = TextReplacementHelper.CountOccurrences(content, normalizedNeedle);
         if (occurrences == 0)
         {
             throw new InvalidOperationException($"Literal string '{needle}' not found in memory.");
@@ -247,8 +250,8 @@ public sealed class MemoriesManager
         }
 
         return allowMultiple
-            ? content.Replace(needle, replacement, StringComparison.Ordinal)
-            : TextReplacementHelper.ReplaceFirst(content, needle, replacement);
+            ? content.Replace(normalizedNeedle, normalizedRepl, StringComparison.Ordinal)
+            : TextReplacementHelper.ReplaceFirst(content, normalizedNeedle, normalizedRepl);
     }
 
     private bool IsIgnored(string name) =>

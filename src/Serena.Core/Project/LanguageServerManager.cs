@@ -72,6 +72,8 @@ public sealed class LanguageServerManager : IAsyncDisposable
             definition.GetWorkspaceSettings(_projectRoot, lsSettings),
             ct);
 
+        await definition.PostStartAsync(client, _projectRoot, ct);
+
         _clients[language] = client;
         EnsureSymbolCache(language);
         _logger.LogInformation("Started language server for {Language}", language);

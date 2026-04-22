@@ -4,6 +4,7 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
+using Serena.Lsp.Client;
 using Serena.Lsp.Protocol;
 
 namespace Serena.Lsp.LanguageServers;
@@ -107,6 +108,13 @@ public abstract class LanguageServerDefinition
     /// The runtime dependencies required by this language server.
     /// </summary>
     public virtual IReadOnlyList<RuntimeDependency> GetRuntimeDependencies() => [];
+
+    /// <summary>
+    /// Hook called after the language server has been initialized.
+    /// Override to perform post-initialization setup (e.g., opening solutions/projects).
+    /// </summary>
+    public virtual Task PostStartAsync(LspClient client, string projectRoot, CancellationToken ct = default)
+        => Task.CompletedTask;
 
     /// <summary>
     /// Discovers the language server binary on the system.

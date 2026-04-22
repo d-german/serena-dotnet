@@ -61,6 +61,7 @@ public sealed class ProjectIndexer
     public async Task<IndexResult> IndexProjectAsync(
         string projectRoot,
         Action<IndexProgress>? onProgress = null,
+        Action<string>? onStatus = null,
         TimeSpan? perFileTimeout = null,
         CancellationToken ct = default)
     {
@@ -70,8 +71,10 @@ public sealed class ProjectIndexer
 
         try
         {
+            onStatus?.Invoke("Discovering source files…");
             var sourceFiles = project.GatherSourceFiles();
             var grouped = GroupFilesByLanguage(sourceFiles, project);
+            onStatus?.Invoke($"Found {sourceFiles.Count} source files ({grouped.Count} language(s))");
 
             var filesPerLanguage = new Dictionary<Language, int>();
             var failures = new List<IndexFailure>();
@@ -81,6 +84,7 @@ public sealed class ProjectIndexer
 
             foreach (var (language, files) in grouped)
             {
+                onStatus?.Invoke($"Starting {language.ToIdentifier()} language server…");
                 LspClient? client = await StartLanguageServerSafe(lsManager, language);
                 if (client is null)
                 {
@@ -90,6 +94,7 @@ public sealed class ProjectIndexer
                     }
                     continue;
                 }
+                onStatus?.Invoke($"Indexing {files.Count} {language.ToIdentifier()} files…");
 
                 filesPerLanguage[language] = 0;
                 var cache = lsManager.GetSymbolCache(language);

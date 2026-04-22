@@ -6,6 +6,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="Serena.Lsp.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\Serena.Lsp.Protocol\Serena.Lsp.Protocol.csproj" />
   </ItemGroup>
 

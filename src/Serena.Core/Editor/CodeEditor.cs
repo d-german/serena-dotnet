@@ -1,4 +1,4 @@
-// CodeEditor - Phase D2
+﻿// CodeEditor - Phase D2
 // Provides file editing operations with LSP synchronization.
 // Ported from serena/code_editor.py LanguageServerCodeEditor.
 
@@ -221,6 +221,7 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
         string content, string needle, string replacement, bool allowMultiple, string relativePath)
     {
         string normalizedReplacement = TextReplacementHelper.NormalizeBackreferences(replacement);
+        normalizedReplacement = TextReplacementHelper.NormalizeLineEndings(normalizedReplacement, content);
         var regex = TextReplacementHelper.CreateSearchRegex(needle);
         int count = regex.Matches(content).Count;
 
@@ -233,14 +234,17 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
     private static (string NewContent, int Count) ReplaceWithLiteral(
         string content, string needle, string replacement, bool allowMultiple, string relativePath)
     {
-        int count = TextReplacementHelper.CountOccurrences(content, needle);
+        string normalizedNeedle = TextReplacementHelper.NormalizeLineEndings(needle, content);
+        string normalizedRepl = TextReplacementHelper.NormalizeLineEndings(replacement, content);
+
+        int count = TextReplacementHelper.CountOccurrences(content, normalizedNeedle);
 
         ValidateOccurrenceCount(count, allowMultiple, relativePath,
-            $"Text not found in {relativePath}: {Truncate(needle, 100)}");
+            $"Text not found in {relativePath}: {Truncate(normalizedNeedle, 100)}");
 
         string newContent = allowMultiple
-            ? content.Replace(needle, replacement)
-            : TextReplacementHelper.ReplaceFirst(content, needle, replacement);
+            ? content.Replace(normalizedNeedle, normalizedRepl)
+            : TextReplacementHelper.ReplaceFirst(content, normalizedNeedle, normalizedRepl);
 
         return (newContent, count);
     }
@@ -378,7 +382,7 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to notify LSP of file change: {Path}", absolutePath);
+            _logger.LogError(ex, "Failed to notify LSP of file change: {Path} — LS may be desynchronized", absolutePath);
         }
     }
 
@@ -429,14 +433,21 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
         return count;
     }
 
-    private static TextDocumentEdit? ResolveTextDocumentEdit(object docChange)
+    private TextDocumentEdit? ResolveTextDocumentEdit(object docChange)
     {
         return docChange switch
         {
             TextDocumentEdit edit => edit,
             JObject jObj => jObj.ToObject<TextDocumentEdit>(),
-            _ => null
+            _ => LogUnrecognizedDocChange(docChange)
         };
+    }
+
+    private TextDocumentEdit? LogUnrecognizedDocChange(object docChange)
+    {
+        _logger.LogWarning("ResolveTextDocumentEdit: unrecognized docChange type {Type}: {Value}",
+            docChange.GetType().Name, docChange);
+        return null;
     }
 
     private async Task ApplyTextEditsAsync(
@@ -465,15 +476,18 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
 
     internal static int GetOffset(string[] lines, int line, int character)
     {
+        if (line >= lines.Length)
+        {
+            // Line is beyond end of file — clamp to total content length
+            return lines.Sum(l => l.Length + 1);
+        }
+
         int offset = 0;
-        for (int i = 0; i < line && i < lines.Length; i++)
+        for (int i = 0; i < line; i++)
         {
             offset += lines[i].Length + 1; // +1 for newline
         }
-        if (line < lines.Length)
-        {
-            offset += Math.Min(character, lines[line].Length);
-        }
+        offset += Math.Min(character, lines[line].Length);
         return offset;
     }
 

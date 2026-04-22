@@ -1,4 +1,4 @@
-// Shared text manipulation utilities to eliminate duplication across tools, editors, and project managers.
+﻿// Shared text manipulation utilities to eliminate duplication across tools, editors, and project managers.
 
 using System.Text.RegularExpressions;
 
@@ -54,5 +54,36 @@ public static class TextReplacementHelper
     public static Regex CreateSearchRegex(string pattern)
     {
         return new Regex(pattern, RegexOptions.Singleline | RegexOptions.Multiline, RegexTimeout);
+    }
+
+    /// <summary>
+    /// Normalizes line endings in <paramref name="text"/> to match those used in <paramref name="referenceContent"/>.
+    /// This is needed because MCP JSON transport delivers strings with LF (\n) but files on Windows
+    /// may use CRLF (\r\n). Python avoids this because <c>open()</c> normalizes to LF on read;
+    /// C# <c>File.ReadAllTextAsync</c> preserves the original line endings.
+    /// </summary>
+    public static string NormalizeLineEndings(string text, string referenceContent)
+    {
+        if (string.IsNullOrEmpty(text) || !text.Contains('\n'))
+        {
+            return text;
+        }
+
+        bool contentHasCrlf = referenceContent.Contains("\r\n");
+        bool textHasCrlf = text.Contains("\r\n");
+
+        if (contentHasCrlf && !textHasCrlf)
+        {
+            // File has CRLF but text has bare LF — upgrade to CRLF
+            return text.Replace("\n", "\r\n");
+        }
+
+        if (!contentHasCrlf && textHasCrlf)
+        {
+            // File has LF but text has CRLF — downgrade to LF
+            return text.Replace("\r\n", "\n");
+        }
+
+        return text;
     }
 }

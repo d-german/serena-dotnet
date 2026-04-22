@@ -412,6 +412,73 @@ public class ReplaceContentIntegrationTests : IDisposable
         Assert.Contains("Error", result);
     }
 
+    [Fact]
+    public async Task LiteralReplace_CrlfFile_NeedleWithLf_Matches()
+    {
+        // Core CRLF bug: file has \r\n but needle from MCP JSON has \n
+        File.WriteAllText(Path.Combine(_tempDir, "crlf.cs"), "int x = 1;\r\nint y = 2;\r\nint z = 3;\r\n");
+
+        var result = await _replaceContentTool.ExecuteAsync(
+            new Dictionary<string, object?>
+            {
+                ["relative_path"] = "crlf.cs",
+                ["needle"] = "int x = 1;\nint y = 2;",
+                ["repl"] = "int x = 42;\nint y = 99;",
+                ["mode"] = "literal",
+            },
+            CancellationToken.None);
+
+        Assert.Contains("Replaced", result);
+        string content = File.ReadAllText(Path.Combine(_tempDir, "crlf.cs"));
+        Assert.Contains("int x = 42;\r\nint y = 99;", content);
+        Assert.Contains("int z = 3;", content);
+        // Verify replacement preserved CRLF (didn't inject bare \n)
+        Assert.DoesNotContain("42;\nint", content.Replace("\r\n", "CRLF"));
+    }
+
+    [Fact]
+    public async Task LiteralReplace_CrlfFile_SingleLine_StillWorks()
+    {
+        // Single-line replacement should still work on CRLF files
+        File.WriteAllText(Path.Combine(_tempDir, "crlf2.cs"), "int x = 1;\r\nint y = 2;\r\n");
+
+        var result = await _replaceContentTool.ExecuteAsync(
+            new Dictionary<string, object?>
+            {
+                ["relative_path"] = "crlf2.cs",
+                ["needle"] = "int x = 1;",
+                ["repl"] = "int x = 42;",
+                ["mode"] = "literal",
+            },
+            CancellationToken.None);
+
+        Assert.Contains("Replaced", result);
+        string content = File.ReadAllText(Path.Combine(_tempDir, "crlf2.cs"));
+        Assert.Equal("int x = 42;\r\nint y = 2;\r\n", content);
+    }
+
+    [Fact]
+    public async Task RegexReplace_CrlfFile_ReplacementPreservesCrlf()
+    {
+        // Regex replacement text should also get CRLF normalization
+        File.WriteAllText(Path.Combine(_tempDir, "crlf3.cs"), "// old\r\nint x = 1;\r\n");
+
+        var result = await _replaceContentTool.ExecuteAsync(
+            new Dictionary<string, object?>
+            {
+                ["relative_path"] = "crlf3.cs",
+                ["needle"] = "// old",
+                ["repl"] = "// new line 1\n// new line 2",
+                ["mode"] = "regex",
+            },
+            CancellationToken.None);
+
+        Assert.Contains("Replaced", result);
+        string content = File.ReadAllText(Path.Combine(_tempDir, "crlf3.cs"));
+        // Replacement \n should have been normalized to \r\n
+        Assert.Contains("// new line 1\r\n// new line 2", content);
+    }
+
     public void Dispose()
     {
         try

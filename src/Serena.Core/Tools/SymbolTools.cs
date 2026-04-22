@@ -1,6 +1,7 @@
-// Symbol Tools - Phase 6C
+﻿// Symbol Tools - Phase 6C
 // Tools for symbol operations: find_symbol, get_symbols_overview, find_referencing_symbols
 
+using Microsoft.Extensions.Logging;
 using Serena.Core.Editor;
 using Serena.Lsp.Protocol.Types;
 
@@ -51,25 +52,25 @@ public sealed class FindSymbolTool : ToolBase
             ct);
 
         var filtered = SymbolKindFilter.FilterByKind(symbols, includeKinds, excludeKinds, s => (int)s.Kind);
+        var filteredList = filtered.ToList();
 
-        if (maxMatches > 0 && symbols.Count > maxMatches)
+        if (maxMatches > 0 && filteredList.Count > maxMatches)
         {
-            return FormatTooManyMatches(filtered, symbols.Count, maxMatches);
+            return FormatTooManyMatches(filteredList, filteredList.Count, maxMatches);
         }
 
-        var symbolList = filtered.ToList();
-        if (symbolList.Count == 0)
+        if (filteredList.Count == 0)
         {
             return $"No symbols found matching '{namePathPattern}'" +
                    (string.IsNullOrEmpty(relativePath) ? "" : $" in {relativePath}");
         }
 
-        var resultDicts = await BuildResultDictsAsync(symbolList, retriever, includeBody, includeInfo, depth, ct);
+        var resultDicts = await BuildResultDictsAsync(filteredList, retriever, includeBody, includeInfo, depth, ct);
 
         var grouped = SymbolDictGrouper.GroupByMultiple(resultDicts, ["relative_path", "kind"]);
         string result = ToolResultFormatter.FormatGroupedSymbols(grouped, maxChars: -1);
         return LimitLength(result, maxAnswerChars,
-            () => string.Join("\n", symbolList.Select(s => s.NamePath)));
+            () => string.Join("\n", filteredList.Select(s => s.NamePath)));
     }
 
     private static string FormatTooManyMatches(
@@ -262,7 +263,7 @@ public sealed class FindReferencingSymbolsTool : ToolBase
         if (includeKinds is not null || excludeKinds is not null)
         {
             references = await FilterReferencesByKindAsync(
-                retriever, references, includeKinds, excludeKinds, ct);
+                retriever, references, includeKinds, excludeKinds, Logger, ct);
         }
 
         if (references.Count == 0)
@@ -312,6 +313,7 @@ public sealed class FindReferencingSymbolsTool : ToolBase
         IReadOnlyList<ReferenceResult> references,
         List<int>? includeKinds,
         List<int>? excludeKinds,
+        ILogger logger,
         CancellationToken ct)
     {
         var symbolsByFile = new Dictionary<string, IReadOnlyList<LanguageServerSymbol>>();
@@ -319,7 +321,7 @@ public sealed class FindReferencingSymbolsTool : ToolBase
 
         foreach (var r in references)
         {
-            var fileSymbols = await GetOrLoadFileSymbolsAsync(retriever, symbolsByFile, r.RelativePath, ct);
+            var fileSymbols = await GetOrLoadFileSymbolsAsync(retriever, symbolsByFile, r.RelativePath, logger, ct);
             if (ShouldIncludeReference(fileSymbols, r.Line, includeKinds, excludeKinds))
             {
                 filtered.Add(r);
@@ -333,6 +335,7 @@ public sealed class FindReferencingSymbolsTool : ToolBase
         ISymbolRetriever retriever,
         Dictionary<string, IReadOnlyList<LanguageServerSymbol>> cache,
         string relativePath,
+        ILogger logger,
         CancellationToken ct)
     {
         if (!cache.TryGetValue(relativePath, out var fileSymbols))
@@ -341,8 +344,9 @@ public sealed class FindReferencingSymbolsTool : ToolBase
             {
                 fileSymbols = await retriever.GetSymbolsAsync(relativePath, ct);
             }
-            catch
+            catch (Exception ex)
             {
+                logger.LogDebug(ex, "Failed to load symbols for {Path}", relativePath);
                 fileSymbols = [];
             }
             cache[relativePath] = fileSymbols;

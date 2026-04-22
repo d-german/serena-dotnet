@@ -445,6 +445,7 @@ public static class Program
 
             var registry = new LanguageServerRegistry();
             BuiltInLanguageServers.RegisterAll(registry, loggerFactory);
+            AdditionalLanguageServers.RegisterAll(registry, loggerFactory);
             var indexer = new ProjectIndexer(registry, loggerFactory);
 
             Console.WriteLine($"Indexing symbols in {projectRoot} …");
@@ -452,6 +453,7 @@ public static class Program
             var result = await indexer.IndexProjectAsync(
                 projectRoot,
                 onProgress: ReportIndexProgress,
+                onStatus: status => { Console.WriteLine($"  {status}"); Console.Out.Flush(); },
                 perFileTimeout: TimeSpan.FromSeconds(timeout),
                 ct: ct);
 
@@ -540,6 +542,7 @@ public static class Program
 
             var registry = new LanguageServerRegistry();
             BuiltInLanguageServers.RegisterAll(registry, loggerFactory);
+            AdditionalLanguageServers.RegisterAll(registry, loggerFactory);
             var indexer = new ProjectIndexer(registry, loggerFactory);
 
             string ext = Path.GetExtension(absoluteFile);

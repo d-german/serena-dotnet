@@ -1,6 +1,7 @@
-// Core LSP Client - Ported from solidlsp/ls.py SolidLanguageServer
+﻿// Core LSP Client - Ported from solidlsp/ls.py SolidLanguageServer
 // Phase 3A: The main language server client for symbol operations
 
+using System.Diagnostics;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json.Linq;
@@ -31,6 +32,9 @@ public sealed class LspClient : IAsyncDisposable
 
     private ServerCapabilities? _serverCapabilities;
     private bool _serverStarted;
+    private readonly TaskCompletionSource<bool> _projectInitComplete = new();
+    private long _lastActivityTicks = Stopwatch.GetTimestamp();
+    private int _crossFileRefsReady; // 0 = not ready, 1 = ready; use Interlocked for thread safety
 
     public Language Language => _language;
     public string ProjectRoot => _projectRoot;
@@ -96,32 +100,96 @@ public sealed class LspClient : IAsyncDisposable
     }
 
     /// <summary>
+    /// Records language server activity to extend the inactivity timeout.
+    /// </summary>
+    private void RecordActivity() => Interlocked.Exchange(ref _lastActivityTicks, Stopwatch.GetTimestamp());
+
+    /// <summary>
     /// Configures default handlers for common server-initiated requests/notifications.
     /// Called before StartListening() via the configureRpc callback.
     /// Roslyn LS requires workspace/configuration and window/workDoneProgress/create.
     /// </summary>
-    private static void ConfigureDefaultHandlers(JsonRpc rpc)
+    private void ConfigureDefaultHandlers(JsonRpc rpc)
     {
         // Roslyn LS sends workspace/configuration with a list of items.
         // We must return one result per requested item (null = use defaults).
         rpc.AddLocalRpcMethod("workspace/configuration", (JToken? paramsToken) =>
         {
+            RecordActivity();
             int itemCount = 0;
             if (paramsToken is JObject obj && obj["items"] is JArray items)
             {
                 itemCount = items.Count;
             }
 
+            _logger.LogDebug("workspace/configuration: returning {Count} null defaults", itemCount);
             var result = new object?[itemCount];
             return (object?)result;
         });
 
         rpc.AddLocalRpcMethod("window/workDoneProgress/create",
-            (JToken? _) => (object?)null);
+            (JToken? _) => { RecordActivity(); return (object?)null; });
 
         rpc.AddLocalRpcMethod("client/registerCapability",
-            (JToken? _) => (object?)null);
+            (JToken? token) => { RecordActivity(); _logger.LogDebug("client/registerCapability: {Token}", token?.ToString(Newtonsoft.Json.Formatting.None)); return (object?)null; });
+
+        rpc.AddLocalRpcMethod("workspace/projectInitializationComplete",
+            (JToken? _) => { RecordActivity(); _projectInitComplete.TrySetResult(true); return (object?)null; });
+
+        // Track activity from progress and diagnostics notifications.
+        // These fire continuously during project loading/indexing and keep the inactivity timer alive.
+        rpc.AddLocalRpcMethod("$/progress",
+            (JToken? _) => { RecordActivity(); return (object?)null; });
+
+        rpc.AddLocalRpcMethod("textDocument/publishDiagnostics",
+            (JToken? _) => { RecordActivity(); return (object?)null; });
     }
+
+    /// <summary>
+    /// Waits for the language server to signal project initialization complete,
+    /// or until the server has been inactive for the specified duration.
+    /// Keeps waiting as long as the LS sends activity ($/progress, diagnostics, etc.).
+    /// Returns true if the explicit completion signal was received, false if timed out due to inactivity.
+    /// </summary>
+    public async Task<bool> WaitForProjectIndexingAsync(TimeSpan inactivityTimeout, CancellationToken ct = default)
+    {
+        var pollInterval = TimeSpan.FromSeconds(1);
+
+        while (!ct.IsCancellationRequested)
+        {
+            // Check if the explicit completion signal fired
+            if (_projectInitComplete.Task.IsCompleted)
+            {
+                return true;
+            }
+
+            // Check if the LS has gone quiet
+            var elapsed = Stopwatch.GetElapsedTime(Interlocked.Read(ref _lastActivityTicks));
+            if (elapsed > inactivityTimeout)
+            {
+                return false;
+            }
+
+            // Wait up to 1s for the completion signal before re-checking activity
+            try
+            {
+                await _projectInitComplete.Task.WaitAsync(pollInterval, ct);
+                return true;
+            }
+            catch (TimeoutException)
+            {
+                // Not signaled yet — loop and check activity
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Sends a custom notification to the language server.
+    /// </summary>
+    public Task SendNotificationAsync(string method, object? args)
+        => _process.SendNotificationAsync(method, args);
 
     /// <summary>
     /// Opens a file in the language server and returns the file buffer.
@@ -169,6 +237,7 @@ public sealed class LspClient : IAsyncDisposable
         var buffer = _fileBuffers.GetBuffer(uri);
         if (buffer is null)
         {
+            _logger.LogWarning("NotifyFileChangedAsync: no open buffer for {Uri}, skipping notification", uri);
             return;
         }
 
@@ -248,6 +317,16 @@ public sealed class LspClient : IAsyncDisposable
         string absolutePath, int line, int character,
         bool includeDeclaration = true, CancellationToken ct = default)
     {
+        if (Interlocked.CompareExchange(ref _crossFileRefsReady, 1, 0) == 0)
+        {
+            // Safety delay: if indexing wasn't explicitly awaited, give the LS time
+            if (!_projectInitComplete.Task.IsCompleted)
+            {
+                _logger.LogDebug("Waiting 2s for cross-file reference readiness");
+                await Task.Delay(TimeSpan.FromSeconds(2), ct);
+            }
+        }
+
         string uri = PathToUri(absolutePath);
 
         var result = await _requests.ReferencesAsync(
@@ -380,12 +459,11 @@ public sealed class LspClient : IAsyncDisposable
     // --- Utility Methods ---
 
     /// <summary>
-    /// Converts a file path to a file:// URI.
+    /// Converts a file path to a file:// URI with proper percent-encoding.
     /// </summary>
     public static string PathToUri(string absolutePath)
     {
-        string normalized = Path.GetFullPath(absolutePath).Replace('\\', '/');
-        return normalized.StartsWith('/') ? $"file://{normalized}" : $"file:///{normalized}";
+        return new Uri(Path.GetFullPath(absolutePath)).AbsoluteUri;
     }
 
     /// <summary>
@@ -397,7 +475,7 @@ public sealed class LspClient : IAsyncDisposable
         {
             return uri;
         }
-        string path = uri["file://".Length..];
+        string path = Uri.UnescapeDataString(uri["file://".Length..]);
         if (path.StartsWith('/') && path.Length > 2 && path[2] == ':')
         {
             path = path[1..]; // Remove leading / for Windows paths like /C:/...
@@ -417,7 +495,7 @@ public sealed class LspClient : IAsyncDisposable
         }
     }
 
-    private static IReadOnlyList<UnifiedSymbolInformation> ParseDocumentSymbolResponse(
+    private IReadOnlyList<UnifiedSymbolInformation> ParseDocumentSymbolResponse(
         JToken token, string uri, string? relativePath)
     {
         if (token is not JArray { Count: > 0 } arr)
@@ -436,19 +514,33 @@ public sealed class LspClient : IAsyncDisposable
                 arr.ToObject<SymbolInformation[]>()
                     ?.Select(UnifiedSymbolInformation.FromSymbolInformation)
                     .ToList() ?? [],
-            _ => []
+            _ => LogAndReturnEmpty(first)
         };
     }
 
-    private static IReadOnlyList<Location> ParseLocationResponse(JToken? token)
+    private IReadOnlyList<UnifiedSymbolInformation> LogAndReturnEmpty(JToken token)
+    {
+        _logger.LogWarning("ParseDocumentSymbolResponse: unrecognized symbol format: {Token}",
+            token.ToString(Newtonsoft.Json.Formatting.None));
+        return [];
+    }
+
+    private IReadOnlyList<Location> ParseLocationResponse(JToken? token)
     {
         return token switch
         {
             null or { Type: JTokenType.Null } => [],
             JObject obj when obj["uri"] is not null => ParseSingleLocation(obj),
             JArray arr => ParseLocationArray(arr),
-            _ => []
+            _ => LogAndReturnEmptyLocations(token)
         };
+    }
+
+    private IReadOnlyList<Location> LogAndReturnEmptyLocations(JToken? token)
+    {
+        _logger.LogDebug("ParseLocationResponse: unrecognized format: {Token}",
+            token?.ToString(Newtonsoft.Json.Formatting.None));
+        return [];
     }
 
     private static IReadOnlyList<Location> ParseSingleLocation(JObject obj)

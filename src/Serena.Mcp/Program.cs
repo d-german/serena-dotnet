@@ -32,6 +32,7 @@ public static class Program
 
         var lsRegistry = new LanguageServerRegistry();
         BuiltInLanguageServers.RegisterAll(lsRegistry, loggerFactory);
+        AdditionalLanguageServers.RegisterAll(lsRegistry, loggerFactory);
 
         var agent = new SerenaAgent(config, lsRegistry, loggerFactory);
         var toolRegistry = BuildToolRegistry(agent, loggerFactory);

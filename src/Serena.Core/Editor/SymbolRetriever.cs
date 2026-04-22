@@ -1,4 +1,4 @@
-// SymbolRetriever - Phase D1
+﻿// SymbolRetriever - Phase D1
 // Bridge between tools and LspClient for symbol operations.
 // Ported from serena/symbol.py LanguageServerSymbol & LanguageServerSymbolRetriever
 
@@ -496,8 +496,9 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
 
             return FindDeepestContainingSymbol(fileSymbols, line, character)?.NamePath;
         }
-        catch
+        catch (Exception ex)
         {
+            _logger.LogDebug(ex, "Failed to resolve containing symbol for {Path} at ({Line},{Char})", relPath, line, character);
             return null;
         }
     }

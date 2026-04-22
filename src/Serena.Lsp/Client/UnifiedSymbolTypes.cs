@@ -1,4 +1,4 @@
-// Unified Symbol Types - Ported from solidlsp/ls_types.py
+﻿// Unified Symbol Types - Ported from solidlsp/ls_types.py
 // Phase 3A: UnifiedSymbolInformation and related types
 
 using System.Text.Json.Serialization;
@@ -77,16 +77,41 @@ public sealed class UnifiedSymbolInformation
     public int? EndLine => BodyRange?.End.Line ?? Location?.Range.End.Line;
 
     /// <summary>
+    /// Normalizes a symbol name that may contain signature decoration (e.g. from Roslyn).
+    /// Returns the bare name and any extracted detail.
+    /// </summary>
+    internal static (string BaseName, string? Detail) NormalizeSymbolName(string name)
+    {
+        // Method pattern: name contains '(' → baseName is everything before first '('
+        int parenIdx = name.IndexOf('(');
+        if (parenIdx >= 0)
+        {
+            return (name[..parenIdx], name[parenIdx..]);
+        }
+
+        // Property pattern: name contains ' : ' but no '(' → baseName is everything before first ' : '
+        int colonIdx = name.IndexOf(" : ", StringComparison.Ordinal);
+        if (colonIdx >= 0)
+        {
+            return (name[..colonIdx], name[colonIdx..]);
+        }
+
+        return (name, null);
+    }
+
+    /// <summary>
     /// Creates a UnifiedSymbolInformation from a DocumentSymbol.
     /// </summary>
     public static UnifiedSymbolInformation FromDocumentSymbol(
         DocumentSymbol ds, string uri, string? relativePath)
     {
+        var (baseName, extractedDetail) = NormalizeSymbolName(ds.Name);
+
         var symbol = new UnifiedSymbolInformation
         {
-            Name = ds.Name,
+            Name = baseName,
             Kind = ds.Kind,
-            Detail = ds.Detail,
+            Detail = ds.Detail ?? extractedDetail,
             Deprecated = ds.Deprecated ?? false,
             BodyRange = ds.Range,
             SelectionRange = ds.SelectionRange,
@@ -112,9 +137,11 @@ public sealed class UnifiedSymbolInformation
     /// </summary>
     public static UnifiedSymbolInformation FromSymbolInformation(SymbolInformation si)
     {
+        var (baseName, detail) = NormalizeSymbolName(si.Name);
         return new UnifiedSymbolInformation
         {
-            Name = si.Name,
+            Name = baseName,
+            Detail = detail,
             Kind = si.Kind,
             ContainerName = si.ContainerName,
             Deprecated = si.Deprecated ?? false,

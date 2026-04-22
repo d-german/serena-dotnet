@@ -2,6 +2,7 @@
 // C#, Python, TypeScript, Rust, Go language server definitions
 
 using Microsoft.Extensions.Logging;
+using Serena.Lsp.Client;
 using Serena.Lsp.Protocol;
 using SysProcess = System.Diagnostics.Process;
 using SysProcessStartInfo = System.Diagnostics.ProcessStartInfo;
@@ -99,6 +100,59 @@ public sealed class CSharpLanguageServer : LanguageServerDefinition
         catch (Exception ex)
         {
             Logger.LogWarning(ex, "Auto-install of roslyn-language-server failed");
+        }
+    }
+
+    public override async Task PostStartAsync(LspClient client, string projectRoot, CancellationToken ct = default)
+    {
+        // Discover all solution files (including subdirectories for mono-repos)
+        var slnFiles = Directory.GetFiles(projectRoot, "*.sln", SearchOption.AllDirectories)
+            .Concat(Directory.GetFiles(projectRoot, "*.slnx", SearchOption.AllDirectories))
+            .ToArray();
+
+        // Discover all project files
+        var csprojFiles = Directory.GetFiles(projectRoot, "*.csproj", SearchOption.AllDirectories);
+
+        if (slnFiles.Length > 0)
+        {
+            Logger.LogInformation("Found {Count} solution file(s)", slnFiles.Length);
+            for (int i = 0; i < slnFiles.Length; i++)
+            {
+                string solutionUri = LspClient.PathToUri(slnFiles[i]);
+                Logger.LogInformation("Opening solution {Index}/{Total}: {Solution}",
+                    i + 1, slnFiles.Length, Path.GetFileName(slnFiles[i]));
+                await client.SendNotificationAsync("solution/open", new { solution = solutionUri });
+            }
+        }
+
+        // Open all project files (Roslyn deduplicates by path)
+        if (csprojFiles.Length > 0)
+        {
+            var projectUris = csprojFiles.Select(LspClient.PathToUri).ToArray();
+            Logger.LogInformation("Opening {Count} project(s)", csprojFiles.Length);
+            await client.SendNotificationAsync("project/open", new { projects = projectUris });
+        }
+
+        // Only wait for indexing if we actually opened something
+        if (slnFiles.Length == 0 && csprojFiles.Length == 0)
+        {
+            Logger.LogInformation("No solution or project files found — skipping indexing wait");
+            return;
+        }
+
+        // Wait for indexing: keep waiting as long as Roslyn is sending us activity ($/progress, diagnostics).
+        // Give up after 30s of silence — works for any repo size.
+        var inactivityTimeout = TimeSpan.FromSeconds(30);
+        Logger.LogInformation("Waiting for project indexing (will keep waiting while Roslyn is active)\u2026");
+        bool indexed = await client.WaitForProjectIndexingAsync(inactivityTimeout, ct);
+        if (indexed)
+        {
+            Logger.LogInformation("C# project indexing completed");
+        }
+        else
+        {
+            Logger.LogWarning("C# project indexing stopped \u2014 no activity for {Timeout}s. Cross-file references may be incomplete",
+                (int)inactivityTimeout.TotalSeconds);
         }
     }
 }

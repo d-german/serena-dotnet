@@ -126,6 +126,7 @@ public sealed class ReplaceContentTool : ToolBase
         string content, string needle, string repl, bool allowMultiple, string relativePath)
     {
         string normalizedRepl = TextReplacementHelper.NormalizeBackreferences(repl);
+        normalizedRepl = TextReplacementHelper.NormalizeLineEndings(normalizedRepl, content);
         var regex = TextReplacementHelper.CreateSearchRegex(needle);
         int count = regex.Matches(content).Count;
 
@@ -137,13 +138,18 @@ public sealed class ReplaceContentTool : ToolBase
     private static (string NewContent, int Count) ReplaceWithLiteral(
         string content, string needle, string repl, bool allowMultiple, string relativePath)
     {
-        int count = TextReplacementHelper.CountOccurrences(content, needle);
+        // Normalize line endings: MCP JSON delivers \n but files may have \r\n.
+        // Python Serena avoids this because open() normalizes to \n on read.
+        string normalizedNeedle = TextReplacementHelper.NormalizeLineEndings(needle, content);
+        string normalizedRepl = TextReplacementHelper.NormalizeLineEndings(repl, content);
+
+        int count = TextReplacementHelper.CountOccurrences(content, normalizedNeedle);
 
         ValidateOccurrenceCount(count, allowMultiple, relativePath, $"Text not found in {relativePath}");
 
         string newContent = allowMultiple
-            ? content.Replace(needle, repl)
-            : TextReplacementHelper.ReplaceFirst(content, needle, repl);
+            ? content.Replace(normalizedNeedle, normalizedRepl)
+            : TextReplacementHelper.ReplaceFirst(content, normalizedNeedle, normalizedRepl);
 
         return (newContent, count);
     }
