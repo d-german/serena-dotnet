@@ -174,27 +174,28 @@ public abstract class LanguageServerDefinition
 
     /// <summary>
     /// Installs npm packages locally into the given resource directory.
-    /// Uses <c>npm install --prefix ./ {packages}</c> so binaries end up
-    /// in <c>{resourceDir}/node_modules/.bin/</c>.
+    /// Invokes <c>node.exe npm-cli.js install --prefix ./ {packages}</c> directly,
+    /// bypassing .cmd wrappers that hang in console-less subprocess environments.
     /// </summary>
     protected void TryLocalNpmInstall(string resourceDir, params string[] packages)
     {
         try
         {
-            string? npm = FindInPath("npm");
-            if (npm is null)
+            (string? node, string? npmCli) = FindNodeAndNpmCli();
+            if (node is null || npmCli is null)
             {
                 Logger.LogWarning(
-                    "npm not found in PATH. Install Node.js or run 'serena-dotnet doctor' to diagnose.");
+                    "Node.js or npm not found. Install Node.js or run 'serena-dotnet doctor' to diagnose.");
                 return;
             }
 
             Directory.CreateDirectory(resourceDir);
-            string args = "install --prefix ./ " + string.Join(' ', packages);
+            string args = $"\"{npmCli}\" install --prefix ./ " + string.Join(' ', packages);
             var psi = new ProcessStartInfo
             {
-                FileName = npm,
+                FileName = node,
                 Arguments = args,
+                RedirectStandardInput = true,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
@@ -208,24 +209,68 @@ public abstract class LanguageServerDefinition
                 return;
             }
 
+            process.StandardInput.Close();
+
+            // Read stdout/stderr concurrently to prevent pipe buffer deadlock.
+            var stdoutTask = Task.Run(() => process.StandardOutput.ReadToEnd());
+            var stderrTask = Task.Run(() => process.StandardError.ReadToEnd());
             process.WaitForExit(TimeSpan.FromSeconds(120));
+
             if (process.ExitCode == 0)
             {
                 Logger.LogInformation("Successfully installed npm packages locally: {Packages}", string.Join(", ", packages));
             }
             else
             {
-                string stderr = process.StandardError.ReadToEnd();
-                string stdout = process.StandardOutput.ReadToEnd();
                 Logger.LogWarning(
                     "Failed to install npm packages (exit code {ExitCode}): stderr={Error}, stdout={Output}",
-                    process.ExitCode, stderr, stdout);
+                    process.ExitCode, stderrTask.Result, stdoutTask.Result);
             }
         }
         catch (Exception ex)
         {
             Logger.LogWarning(ex, "Local npm install failed for: {Packages}", string.Join(", ", packages));
         }
+    }
+
+    /// <summary>
+    /// Locates <c>node.exe</c> and the <c>npm-cli.js</c> script bundled alongside it.
+    /// Returns nulls if either cannot be found.
+    /// </summary>
+    private static (string? nodeExe, string? npmCliJs) FindNodeAndNpmCli()
+    {
+        // On Windows, explicitly require the .exe to avoid .cmd/.bat wrappers.
+        string? node = PlatformUtils.IsWindows
+            ? FindInPathWithExtension("node", ".exe")
+            : FindInPath("node");
+
+        if (node is null)
+        {
+            return (null, null);
+        }
+
+        string npmCli = Path.Combine(
+            Path.GetDirectoryName(node) ?? string.Empty,
+            "node_modules", "npm", "bin", "npm-cli.js");
+
+        return File.Exists(npmCli) ? (node, npmCli) : (null, null);
+    }
+
+    /// <summary>
+    /// Searches PATH for an executable with an exact file extension.
+    /// </summary>
+    private static string? FindInPathWithExtension(string name, string extension)
+    {
+        string pathVar = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+        foreach (string dir in pathVar.Split(Path.PathSeparator))
+        {
+            string candidate = Path.Combine(dir, name + extension);
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+        return null;
     }
 
     /// <summary>
