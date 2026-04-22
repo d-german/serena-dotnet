@@ -1,10 +1,11 @@
-// Memory, Config & Shell Tools - Phase 6D
 // Tools for: read_memory, write_memory, list_memories, execute_shell_command, etc.
 
 using System.Diagnostics;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
+using Microsoft.Extensions.Logging;
 using Serena.Core.Project;
 
 namespace Serena.Core.Tools;
@@ -66,7 +67,9 @@ public sealed class WriteMemoryTool : ToolBase
 
         if (maxChars > 0 && content.Length > maxChars)
         {
-            content = content[..maxChars];
+            return Task.FromResult(
+                $"Error: Content exceeds max_chars ({content.Length} > {maxChars}). " +
+                "Please reduce the content length before writing.");
         }
 
         var mm = CreateMemoriesManager();
@@ -161,11 +164,44 @@ public sealed class ExecuteShellCommandTool : ToolBase
         bool captureStderr = GetOptional(arguments, "capture_stderr", true);
         int maxChars = GetOptional(arguments, "max_answer_chars", -1);
         int timeoutSeconds = GetOptional(arguments, "timeout_seconds", DefaultTimeoutSeconds);
-
         string projectRoot = RequireProjectRoot();
         string workingDir = cwd is not null ? ResolvePath(cwd) : projectRoot;
 
-        var psi = new ProcessStartInfo
+        // Audit log the command at Information level
+        Logger.LogInformation("Shell command requested: {Command} (cwd: {Cwd})", command, workingDir);
+
+        EnforceDenyPatterns(command);
+
+        var psi = ConfigureProcess(command, workingDir);
+
+        using var process = Process.Start(psi)
+            ?? throw new InvalidOperationException("Failed to start process.");
+
+        return await RunProcessAsync(process, captureStderr, workingDir, maxChars, timeoutSeconds, ct);
+    }
+
+    private void EnforceDenyPatterns(string command)
+    {
+        var denyPatterns = Context.ActiveProject?.Config?.ShellCommandDenyPatterns;
+        if (denyPatterns is not { Count: > 0 })
+        {
+            return;
+        }
+
+        foreach (string pattern in denyPatterns)
+        {
+            if (Regex.IsMatch(command, pattern, RegexOptions.IgnoreCase, TimeSpan.FromSeconds(5)))
+            {
+                Logger.LogWarning("Shell command blocked by deny pattern '{Pattern}': {Command}", pattern, command);
+                throw new InvalidOperationException(
+                    $"Command blocked by security policy. It matches deny pattern: {pattern}");
+            }
+        }
+    }
+
+    private static ProcessStartInfo ConfigureProcess(string command, string workingDir)
+    {
+        return new ProcessStartInfo
         {
             FileName = OperatingSystem.IsWindows() ? "cmd" : "/bin/sh",
             Arguments = OperatingSystem.IsWindows() ? $"/c {command}" : $"-c \"{command.Replace("\"", "\\\"")}\"",
@@ -175,10 +211,11 @@ public sealed class ExecuteShellCommandTool : ToolBase
             UseShellExecute = false,
             CreateNoWindow = true,
         };
+    }
 
-        using var process = Process.Start(psi)
-            ?? throw new InvalidOperationException("Failed to start process.");
-
+    private async Task<string> RunProcessAsync(
+        Process process, bool captureStderr, string workingDir, int maxChars, int timeoutSeconds, CancellationToken ct)
+    {
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
 
@@ -202,9 +239,9 @@ public sealed class ExecuteShellCommandTool : ToolBase
             {
                 process.Kill(entireProcessTree: true);
             }
-            catch
+            catch (Exception ex)
             {
-                // Best-effort kill
+                Logger.LogDebug(ex, "Best-effort process kill failed");
             }
             return ToJson(new { error = $"Command timed out after {timeoutSeconds} seconds." });
         }

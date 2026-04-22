@@ -1,6 +1,10 @@
 // Serena.Core - Agent, project management, tools, code editor, configuration
 // This assembly contains the Serena application logic ported from serena/
 
+using System.Runtime.CompilerServices;
+
+[assembly: InternalsVisibleTo("Serena.Core.Tests")]
+
 namespace Serena.Core;
 
 /// <summary>

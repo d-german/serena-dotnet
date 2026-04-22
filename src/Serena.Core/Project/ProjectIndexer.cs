@@ -92,31 +92,12 @@ public sealed class ProjectIndexer
                 }
 
                 filesPerLanguage[language] = 0;
-
                 var cache = lsManager.GetSymbolCache(language);
 
-                foreach (string file in files)
-                {
-                    ct.ThrowIfCancellationRequested();
-                    fileIndex++;
-                    string absolutePath = Path.Combine(projectRoot, file);
-
-                    var result = await IndexSingleFileSafe(client, absolutePath, timeout, cache);
-                    bool success = result.IsSuccess;
-
-                    if (success)
-                    {
-                        filesPerLanguage[language]++;
-                    }
-                    else
-                    {
-                        failures.Add(new IndexFailure(file, result.Error));
-                    }
-
-                    onProgress?.Invoke(new IndexProgress(
-                        fileIndex, totalMapped, file, language, success,
-                        success ? null : result.Error));
-                }
+                fileIndex = await IndexLanguageFilesAsync(
+                    client, files, projectRoot, timeout, cache,
+                    filesPerLanguage, language, failures,
+                    fileIndex, totalMapped, onProgress, ct);
             }
 
             return new IndexResult(filesPerLanguage, failures, sourceFiles.Count, skipped);
@@ -125,6 +106,39 @@ public sealed class ProjectIndexer
         {
             await lsManager.DisposeAsync();
         }
+    }
+
+    private static async Task<int> IndexLanguageFilesAsync(
+        LspClient client, List<string> files, string projectRoot, TimeSpan timeout,
+        SymbolCache<UnifiedSymbolInformation[]>? cache,
+        Dictionary<Language, int> filesPerLanguage, Language language,
+        List<IndexFailure> failures, int fileIndex, int totalMapped,
+        Action<IndexProgress>? onProgress, CancellationToken ct)
+    {
+        foreach (string file in files)
+        {
+            ct.ThrowIfCancellationRequested();
+            fileIndex++;
+            string absolutePath = Path.Combine(projectRoot, file);
+
+            var result = await IndexSingleFileSafe(client, absolutePath, timeout, cache);
+            bool success = result.IsSuccess;
+
+            if (success)
+            {
+                filesPerLanguage[language]++;
+            }
+            else
+            {
+                failures.Add(new IndexFailure(file, result.Error));
+            }
+
+            onProgress?.Invoke(new IndexProgress(
+                fileIndex, totalMapped, file, language, success,
+                success ? null : result.Error));
+        }
+
+        return fileIndex;
     }
 
     /// <summary>

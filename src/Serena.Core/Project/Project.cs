@@ -6,6 +6,7 @@ using System.Text.RegularExpressions;
 using Microsoft.Extensions.FileSystemGlobbing;
 using Microsoft.Extensions.Logging;
 using Serena.Core.Config;
+using Serena.Core.Tools;
 using Serena.Lsp;
 
 namespace Serena.Core.Project;
@@ -219,7 +220,7 @@ public sealed class MemoriesManager
     {
         if (string.Equals(mode, "regex", StringComparison.OrdinalIgnoreCase))
         {
-            var regex = new Regex(needle, RegexOptions.Multiline | RegexOptions.Singleline);
+            var regex = TextReplacementHelper.CreateSearchRegex(needle);
             int matchCount = regex.Matches(content).Count;
             if (matchCount == 0)
             {
@@ -234,7 +235,7 @@ public sealed class MemoriesManager
         }
 
         // Literal mode
-        int occurrences = CountOccurrences(content, needle);
+        int occurrences = TextReplacementHelper.CountOccurrences(content, needle);
         if (occurrences == 0)
         {
             throw new InvalidOperationException($"Literal string '{needle}' not found in memory.");
@@ -247,29 +248,7 @@ public sealed class MemoriesManager
 
         return allowMultiple
             ? content.Replace(needle, replacement, StringComparison.Ordinal)
-            : ReplaceFirst(content, needle, replacement);
-    }
-
-    private static int CountOccurrences(string text, string needle)
-    {
-        int count = 0;
-        int index = 0;
-        while ((index = text.IndexOf(needle, index, StringComparison.Ordinal)) >= 0)
-        {
-            count++;
-            index += needle.Length;
-        }
-        return count;
-    }
-
-    private static string ReplaceFirst(string text, string needle, string replacement)
-    {
-        int index = text.IndexOf(needle, StringComparison.Ordinal);
-        if (index < 0)
-        {
-            return text;
-        }
-        return string.Concat(text.AsSpan(0, index), replacement, text.AsSpan(index + needle.Length));
+            : TextReplacementHelper.ReplaceFirst(content, needle, replacement);
     }
 
     private bool IsIgnored(string name) =>

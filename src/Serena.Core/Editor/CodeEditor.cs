@@ -6,6 +6,7 @@ using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json.Linq;
 using Serena.Core.Editor;
+using Serena.Core.Tools;
 using Serena.Lsp.Client;
 using Serena.Lsp.Protocol.Types;
 
@@ -89,10 +90,10 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
         }
 
         string absolutePath = ResolvePath(relativePath);
-        string[] lines = await File.ReadAllLinesAsync(absolutePath, ct);
+        string content = await File.ReadAllTextAsync(absolutePath, ct);
+        string[] lines = content.Split('\n');
 
         var loc = symbol.BodyLocation;
-        string content = string.Join(Environment.NewLine, lines);
 
         // Calculate character offsets from line/column positions
         int startOffset = GetOffset(lines, loc.StartLine, loc.StartColumn);
@@ -119,15 +120,22 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
         }
 
         string absolutePath = ResolvePath(relativePath);
-        string[] lines = await File.ReadAllLinesAsync(absolutePath, ct);
+        string content = await File.ReadAllTextAsync(absolutePath, ct);
+        string[] lines = content.Split('\n');
 
         int insertLine = symbol.BodyLocation.StartLine;
 
-        // Ensure body ends with newline and has appropriate trailing spacing
+        // Count original trailing newlines (minus 1 for the mandatory trailing EOL)
+        int originalTrailingNewlines = CountTrailingNewlines(body) - 1;
+
+        // Ensure body ends with exactly one newline
         body = body.TrimEnd() + Environment.NewLine;
 
-        // Add a blank line separator for class/method definitions
-        if (IsDefinitionSymbol(symbol))
+        // Add suitable number of trailing blank lines:
+        // at least 1 for definition symbols, otherwise as many as the caller provided
+        int minTrailingEmptyLines = IsDefinitionSymbol(symbol) ? 1 : 0;
+        int numTrailingNewlines = Math.Max(minTrailingEmptyLines, originalTrailingNewlines);
+        for (int i = 0; i < numTrailingNewlines; i++)
         {
             body += Environment.NewLine;
         }
@@ -135,7 +143,7 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
         var lineList = new List<string>(lines);
         lineList.Insert(insertLine, body.TrimEnd('\r', '\n'));
 
-        string newContent = string.Join(Environment.NewLine, lineList);
+        string newContent = string.Join("\n", lineList);
         await WriteAndSyncAsync(absolutePath, newContent, ct);
 
         return $"Inserted content before '{namePath}' in {relativePath}";
@@ -153,21 +161,29 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
         }
 
         string absolutePath = ResolvePath(relativePath);
-        string[] lines = await File.ReadAllLinesAsync(absolutePath, ct);
+        string content = await File.ReadAllTextAsync(absolutePath, ct);
+        string[] lines = content.Split('\n');
 
         int insertAfterLine = symbol.BodyLocation.EndLine;
 
-        // Ensure body ends with newline
+        // Ensure body ends with at least one newline
         if (!body.EndsWith('\n'))
         {
             body += Environment.NewLine;
         }
 
-        // Add leading blank line for definition symbols
-        if (IsDefinitionSymbol(symbol))
+        // Count and preserve caller's leading newlines, enforcing minimum for definition symbols
+        int originalLeadingNewlines = CountLeadingNewlines(body);
+        body = body.TrimStart('\r', '\n');
+        int minEmptyLines = IsDefinitionSymbol(symbol) ? 1 : 0;
+        int numLeadingEmptyLines = Math.Max(minEmptyLines, originalLeadingNewlines);
+        if (numLeadingEmptyLines > 0)
         {
-            body = Environment.NewLine + body;
+            body = new string('\n', numLeadingEmptyLines) + body;
         }
+
+        // Ensure exactly one trailing newline
+        body = body.TrimEnd('\r', '\n') + Environment.NewLine;
 
         var lineList = new List<string>(lines);
         if (insertAfterLine + 1 <= lineList.Count)
@@ -179,7 +195,7 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
             lineList.Add(body.TrimEnd('\r', '\n'));
         }
 
-        string newContent = string.Join(Environment.NewLine, lineList);
+        string newContent = string.Join("\n", lineList);
         await WriteAndSyncAsync(absolutePath, newContent, ct);
 
         return $"Inserted content after '{namePath}' in {relativePath}";
@@ -192,65 +208,57 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
         string absolutePath = ResolvePath(relativePath);
         string content = await File.ReadAllTextAsync(absolutePath, ct);
 
-        string newContent;
-        int count;
-
-        if (string.Equals(mode, "regex", StringComparison.OrdinalIgnoreCase))
-        {
-            // Use $!N backreference syntax → convert to standard $N
-            string normalizedReplacement = Regex.Replace(replacement, @"\$!(\d+)", @"$$$1");
-
-            var regex = new Regex(needle, RegexOptions.Singleline | RegexOptions.Multiline);
-            var matches = regex.Matches(content);
-            count = matches.Count;
-
-            if (count == 0)
-            {
-                throw new InvalidOperationException(
-                    $"Pattern not found in {relativePath}: {needle}");
-            }
-
-            if (count > 1 && !allowMultipleOccurrences)
-            {
-                throw new InvalidOperationException(
-                    $"Pattern matches {count} occurrences in {relativePath}, " +
-                    "but allow_multiple_occurrences is false.");
-            }
-
-            newContent = regex.Replace(content, normalizedReplacement);
-        }
-        else
-        {
-            // Literal mode
-            count = CountOccurrences(content, needle);
-
-            if (count == 0)
-            {
-                throw new InvalidOperationException(
-                    $"Text not found in {relativePath}: {Truncate(needle, 100)}");
-            }
-
-            if (count > 1 && !allowMultipleOccurrences)
-            {
-                throw new InvalidOperationException(
-                    $"Text matches {count} occurrences in {relativePath}, " +
-                    "but allow_multiple_occurrences is false.");
-            }
-
-            if (allowMultipleOccurrences)
-            {
-                newContent = content.Replace(needle, replacement);
-            }
-            else
-            {
-                int index = content.IndexOf(needle, StringComparison.Ordinal);
-                newContent = content[..index] + replacement + content[(index + needle.Length)..];
-            }
-        }
+        var (newContent, count) = string.Equals(mode, "regex", StringComparison.OrdinalIgnoreCase)
+            ? ReplaceWithRegex(content, needle, replacement, allowMultipleOccurrences, relativePath)
+            : ReplaceWithLiteral(content, needle, replacement, allowMultipleOccurrences, relativePath);
 
         await WriteAndSyncAsync(absolutePath, newContent, ct);
 
         return $"Replaced {count} occurrence(s) in {relativePath}";
+    }
+
+    private static (string NewContent, int Count) ReplaceWithRegex(
+        string content, string needle, string replacement, bool allowMultiple, string relativePath)
+    {
+        string normalizedReplacement = TextReplacementHelper.NormalizeBackreferences(replacement);
+        var regex = TextReplacementHelper.CreateSearchRegex(needle);
+        int count = regex.Matches(content).Count;
+
+        ValidateOccurrenceCount(count, allowMultiple, relativePath,
+            $"Pattern not found in {relativePath}: {needle}");
+
+        return (regex.Replace(content, normalizedReplacement), count);
+    }
+
+    private static (string NewContent, int Count) ReplaceWithLiteral(
+        string content, string needle, string replacement, bool allowMultiple, string relativePath)
+    {
+        int count = TextReplacementHelper.CountOccurrences(content, needle);
+
+        ValidateOccurrenceCount(count, allowMultiple, relativePath,
+            $"Text not found in {relativePath}: {Truncate(needle, 100)}");
+
+        string newContent = allowMultiple
+            ? content.Replace(needle, replacement)
+            : TextReplacementHelper.ReplaceFirst(content, needle, replacement);
+
+        return (newContent, count);
+    }
+
+    private static void ValidateOccurrenceCount(
+        int count, bool allowMultiple, string relativePath, string notFoundMessage)
+    {
+        if (count == 0)
+        {
+            throw new InvalidOperationException(notFoundMessage);
+        }
+
+        if (count > 1 && !allowMultiple)
+        {
+            throw new InvalidOperationException(
+                $"Text matches {count} occurrences in {relativePath}, " +
+                "but allow_multiple_occurrences is false.");
+        }
     }
 
     public async Task<string> RenameSymbolAsync(
@@ -316,7 +324,8 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
 
         // Delete the symbol
         string absolutePath = ResolvePath(relativePath);
-        string[] lines = await File.ReadAllLinesAsync(absolutePath, ct);
+        string content = await File.ReadAllTextAsync(absolutePath, ct);
+        string[] lines = content.Split('\n');
 
         int startLine = symbol.BodyLocation.StartLine;
         int endLine = symbol.BodyLocation.EndLine;
@@ -325,7 +334,7 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
         int deleteCount = Math.Min(endLine - startLine + 1, lineList.Count - startLine);
         lineList.RemoveRange(startLine, deleteCount);
 
-        string newContent = string.Join(Environment.NewLine, lineList);
+        string newContent = string.Join("\n", lineList);
         await WriteAndSyncAsync(absolutePath, newContent, ct);
 
         return $"Deleted symbol '{namePath}' from {relativePath}";
@@ -379,38 +388,55 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
 
         if (edit.Changes is { } changes)
         {
-            foreach (var (uri, edits) in changes)
-            {
-                string filePath = LspClient.UriToPath(uri);
-                await ApplyTextEditsAsync(filePath, edits, ct);
-                changeCount++;
-            }
+            changeCount += await ApplyChangesAsync(changes, ct);
         }
 
         if (edit.DocumentChanges is { } docChanges)
         {
-            foreach (var docChange in docChanges)
-            {
-                if (docChange is TextDocumentEdit textDocEdit)
-                {
-                    string filePath = LspClient.UriToPath(textDocEdit.TextDocument.Uri);
-                    await ApplyTextEditsAsync(filePath, textDocEdit.Edits, ct);
-                    changeCount++;
-                }
-                else if (docChange is JObject jObj)
-                {
-                    var parsed = jObj.ToObject<TextDocumentEdit>();
-                    if (parsed?.TextDocument?.Uri is not null && parsed.Edits is not null)
-                    {
-                        string filePath = LspClient.UriToPath(parsed.TextDocument.Uri);
-                        await ApplyTextEditsAsync(filePath, parsed.Edits, ct);
-                        changeCount++;
-                    }
-                }
-            }
+            changeCount += await ApplyDocumentChangesAsync(docChanges, ct);
         }
 
         return changeCount;
+    }
+
+    private async Task<int> ApplyChangesAsync(
+        IDictionary<string, IReadOnlyList<TextEdit>> changes, CancellationToken ct)
+    {
+        int count = 0;
+        foreach (var (uri, edits) in changes)
+        {
+            string filePath = LspClient.UriToPath(uri);
+            await ApplyTextEditsAsync(filePath, edits, ct);
+            count++;
+        }
+        return count;
+    }
+
+    private async Task<int> ApplyDocumentChangesAsync(
+        IReadOnlyList<object> docChanges, CancellationToken ct)
+    {
+        int count = 0;
+        foreach (var docChange in docChanges)
+        {
+            var textDocEdit = ResolveTextDocumentEdit(docChange);
+            if (textDocEdit?.TextDocument?.Uri is not null && textDocEdit.Edits is not null)
+            {
+                string filePath = LspClient.UriToPath(textDocEdit.TextDocument.Uri);
+                await ApplyTextEditsAsync(filePath, textDocEdit.Edits, ct);
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private static TextDocumentEdit? ResolveTextDocumentEdit(object docChange)
+    {
+        return docChange switch
+        {
+            TextDocumentEdit edit => edit,
+            JObject jObj => jObj.ToObject<TextDocumentEdit>(),
+            _ => null
+        };
     }
 
     private async Task ApplyTextEditsAsync(
@@ -437,7 +463,7 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
         await WriteAndSyncAsync(absolutePath, content, ct);
     }
 
-    private static int GetOffset(string[] lines, int line, int character)
+    internal static int GetOffset(string[] lines, int line, int character)
     {
         int offset = 0;
         for (int i = 0; i < line && i < lines.Length; i++)
@@ -458,17 +484,42 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
             or SymbolKind.Module or SymbolKind.Namespace;
     }
 
-    private static int CountOccurrences(string text, string needle)
+    private static int CountLeadingNewlines(string text)
     {
         int count = 0;
-        int index = 0;
-        while ((index = text.IndexOf(needle, index, StringComparison.Ordinal)) != -1)
+        foreach (char c in text)
         {
-            count++;
-            index += needle.Length;
+            if (c == '\n')
+            {
+                count++;
+            }
+            else if (c != '\r')
+            {
+                break;
+            }
         }
+
         return count;
     }
+
+    private static int CountTrailingNewlines(string text)
+    {
+        int count = 0;
+        for (int i = text.Length - 1; i >= 0; i--)
+        {
+            if (text[i] == '\n')
+            {
+                count++;
+            }
+            else if (text[i] != '\r')
+            {
+                break;
+            }
+        }
+
+        return count;
+    }
+
 
     private static string Truncate(string text, int maxLength)
     {

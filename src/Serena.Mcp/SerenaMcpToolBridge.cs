@@ -61,12 +61,14 @@ internal sealed class SerenaMcpServerTool : McpServerTool
             }
         }
 
-        var result = await ((ToolBase)_tool).ExecuteSafeAsync(arguments, ct);
+        // Use ITool.ExecuteAsync to go through the hook pipeline (ExecuteSafeAsync bypasses hooks).
+        string output = await _tool.ExecuteAsync(arguments, ct);
+        bool isError = output.StartsWith("Error:", StringComparison.Ordinal);
 
         return new CallToolResult
         {
-            Content = [new TextContentBlock { Text = result.IsSuccess ? result.Value : result.Error }],
-            IsError = result.IsFailure,
+            Content = [new TextContentBlock { Text = output }],
+            IsError = isError,
         };
     }
 

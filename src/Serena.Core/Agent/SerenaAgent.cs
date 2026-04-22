@@ -32,6 +32,7 @@ public sealed class SerenaAgent : IAsyncDisposable
     private Project.LanguageServerManager? _lsManager;
     private SerenaAgentMode? _activeMode;
     private readonly List<IPreToolUseHook> _hooks = [];
+    private readonly SemaphoreSlim _projectLock = new(1, 1);
 
     public SerenaAgent(
         SerenaConfig config,
@@ -66,7 +67,7 @@ public sealed class SerenaAgent : IAsyncDisposable
     /// </summary>
     public void SetToolRegistry(ToolRegistry registry)
     {
-        _toolRegistry = registry;
+        Volatile.Write(ref _toolRegistry, registry);
     }
 
     /// <summary>
@@ -148,15 +149,24 @@ public sealed class SerenaAgent : IAsyncDisposable
             }
             _disposed = true;
 
-            // Dispose the temporarily-activated language server manager.
-            if (_agent._lsManager is not null)
+            try
             {
-                await _agent._lsManager.DisposeAsync();
+                // Dispose the temporarily-activated language server manager.
+                if (_agent._lsManager is not null)
+                {
+                    await _agent._lsManager.DisposeAsync();
+                }
             }
-
-            // Restore the previous state.
-            _agent._activeProject = _previousProject;
-            _agent._lsManager = _previousLsManager;
+            catch (Exception ex)
+            {
+                _agent._logger.LogWarning(ex, "Failed to dispose temporary LS manager during project context restore");
+            }
+            finally
+            {
+                // Always restore the previous state, even if disposal failed.
+                _agent._activeProject = _previousProject;
+                _agent._lsManager = _previousLsManager;
+            }
         }
     }
 
@@ -165,10 +175,13 @@ public sealed class SerenaAgent : IAsyncDisposable
     /// </summary>
     public async Task<Result> TryActivateProjectAsync(string nameOrPath, CancellationToken ct = default)
     {
-        if (_lsManager is not null)
+        await _projectLock.WaitAsync(ct);
+        try
         {
-            await _lsManager.DisposeAsync();
-        }
+            if (_lsManager is not null)
+            {
+                await _lsManager.DisposeAsync();
+            }
 
         RegisteredProject? projectConfig = null;
         if (_config.RegisteredProjects.TryGetValue(nameOrPath, out var found))
@@ -194,7 +207,12 @@ public sealed class SerenaAgent : IAsyncDisposable
             _loggerFactory);
 
         _logger.LogInformation("Activated project: {Path}", projectRoot);
-        return Result.Success();
+            return Result.Success();
+        }
+        finally
+        {
+            _projectLock.Release();
+        }
     }
 
     /// <summary>
@@ -305,23 +323,31 @@ public sealed class SerenaAgent : IAsyncDisposable
     /// </summary>
     public async Task ResetLanguageServerManagerAsync()
     {
-        if (_lsManager is not null)
+        await _projectLock.WaitAsync();
+        try
         {
-            await _lsManager.DisposeAsync();
-        }
+            if (_lsManager is not null)
+            {
+                await _lsManager.DisposeAsync();
+            }
 
-        if (_activeProject is not null)
-        {
-            _lsManager = new Project.LanguageServerManager(
-                _activeProject.Root,
-                _lsRegistry,
-                _loggerFactory);
-            _logger.LogInformation("Language server manager has been reset");
+            if (_activeProject is not null)
+            {
+                _lsManager = new Project.LanguageServerManager(
+                    _activeProject.Root,
+                    _lsRegistry,
+                    _loggerFactory);
+                _logger.LogInformation("Language server manager has been reset");
+            }
+            else
+            {
+                _lsManager = null;
+                _logger.LogWarning("No active project; language server manager cleared");
+            }
         }
-        else
+        finally
         {
-            _lsManager = null;
-            _logger.LogWarning("No active project; language server manager cleared");
+            _projectLock.Release();
         }
     }
 

@@ -210,24 +210,19 @@ public class WriteMemoryMaxCharsTests : IDisposable
     }
 
     [Fact]
-    public async Task MaxChars_TruncatesContent()
+    public async Task MaxChars_RejectsOversizedContent()
     {
         var write = _registry.All.First(t => t.Name == "write_memory");
-        var read = _registry.All.First(t => t.Name == "read_memory");
 
-        await write.ExecuteAsync(new Dictionary<string, object?>
+        var result = await write.ExecuteAsync(new Dictionary<string, object?>
         {
-            ["memory_name"] = "truncated",
+            ["memory_name"] = "rejected",
             ["content"] = "Hello, World! This is a long string.",
             ["max_chars"] = 5,
         });
 
-        var result = await read.ExecuteAsync(new Dictionary<string, object?>
-        {
-            ["memory_name"] = "truncated",
-        });
-
-        Assert.Equal("Hello", result);
+        Assert.Contains("Error", result);
+        Assert.Contains("exceeds max_chars", result);
     }
 
     [Fact]
@@ -371,7 +366,7 @@ public class LineEditToolTests : IDisposable
 
         Assert.Contains("Inserted", result);
         string content = File.ReadAllText(Path.Combine(_tempDir, file));
-        string[] lines = content.Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries);
+        string[] lines = content.Split('\n', StringSplitOptions.RemoveEmptyEntries);
         Assert.Equal("inserted", lines[0]);
         Assert.Equal("line1", lines[1]);
     }
@@ -390,7 +385,7 @@ public class LineEditToolTests : IDisposable
         });
 
         string content = File.ReadAllText(Path.Combine(_tempDir, file));
-        Assert.EndsWith("appended" + Environment.NewLine, content);
+        Assert.EndsWith("appended\n", content);
     }
 
     [Fact]
@@ -469,6 +464,15 @@ public class LineEditToolTests : IDisposable
         Assert.True(new DeleteLinesTool(ctx).CanEdit);
         Assert.True(new InsertAtLineTool(ctx).CanEdit);
         Assert.True(new ReplaceLinesTool(ctx).CanEdit);
+    }
+
+    [Fact]
+    public void AllLineEditTools_AreOptional()
+    {
+        var ctx = NullToolContext.Instance;
+        Assert.True(new DeleteLinesTool(ctx).IsOptional);
+        Assert.True(new InsertAtLineTool(ctx).IsOptional);
+        Assert.True(new ReplaceLinesTool(ctx).IsOptional);
     }
 
     public void Dispose()

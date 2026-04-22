@@ -105,42 +105,46 @@ public sealed class PromptCollection
         foreach (string file in Directory.EnumerateFiles(directory, "*.yml")
                      .Concat(Directory.EnumerateFiles(directory, "*.yaml")))
         {
-            string yaml = File.ReadAllText(file);
-            var data = YamlDeserializer.Deserialize<Dictionary<string, object>>(yaml);
+            LoadYamlFile(file, isFirst);
+        }
+    }
 
-            if (!data.TryGetValue("prompts", out var promptsObj) || promptsObj is not Dictionary<object, object> prompts)
-            {
-                _logger?.LogWarning("Invalid YAML structure in {File}: missing 'prompts' key", file);
-                continue;
-            }
+    private void LoadYamlFile(string file, bool isFirst)
+    {
+        string yaml = File.ReadAllText(file);
+        var data = YamlDeserializer.Deserialize<Dictionary<string, object>>(yaml);
 
-            foreach (var (nameObj, valueObj) in prompts)
-            {
-                string name = nameObj.ToString()!;
+        if (!data.TryGetValue("prompts", out var promptsObj) || promptsObj is not Dictionary<object, object> prompts)
+        {
+            _logger?.LogWarning("Invalid YAML structure in {File}: missing 'prompts' key", file);
+            return;
+        }
 
-                if (valueObj is List<object> list)
-                {
-                    if (!isFirst && _lists.ContainsKey(name))
-                    {
-                        _logger?.LogDebug("Skipping list '{Name}' (already exists)", name);
-                        continue;
-                    }
-                    _lists[name] = new PromptList(list.Select(x => x.ToString()!));
-                }
-                else if (valueObj is string templateStr)
-                {
-                    if (!isFirst && _templates.ContainsKey(name))
-                    {
-                        _logger?.LogDebug("Skipping template '{Name}' (already exists)", name);
-                        continue;
-                    }
-                    _templates[name] = new PromptTemplate(name, templateStr);
-                }
-                else
-                {
-                    _logger?.LogWarning("Invalid prompt type for '{Name}' in {File}", name, file);
-                }
-            }
+        foreach (var (nameObj, valueObj) in prompts)
+        {
+            ProcessPromptEntry(nameObj.ToString()!, valueObj, isFirst, file);
+        }
+    }
+
+    private void ProcessPromptEntry(string name, object valueObj, bool isFirst, string file)
+    {
+        switch (valueObj)
+        {
+            case List<object> list when isFirst || !_lists.ContainsKey(name):
+                _lists[name] = new PromptList(list.Select(x => x.ToString()!));
+                break;
+            case List<object>:
+                _logger?.LogDebug("Skipping list '{Name}' (already exists)", name);
+                break;
+            case string templateStr when isFirst || !_templates.ContainsKey(name):
+                _templates[name] = new PromptTemplate(name, templateStr);
+                break;
+            case string:
+                _logger?.LogDebug("Skipping template '{Name}' (already exists)", name);
+                break;
+            default:
+                _logger?.LogWarning("Invalid prompt type for '{Name}' in {File}", name, file);
+                break;
         }
     }
 

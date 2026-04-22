@@ -451,52 +451,58 @@ public static class Program
 
             var result = await indexer.IndexProjectAsync(
                 projectRoot,
-                onProgress: progress =>
-                {
-                    string status = progress.Success ? "✓" : "✗";
-                    int pct = (int)(100.0 * progress.CurrentFile / progress.TotalFiles);
-                    Console.Write($"\r  [{pct,3}%] {progress.CurrentFile}/{progress.TotalFiles} {status} {progress.FilePath}");
-                    if (!progress.Success)
-                    {
-                        Console.WriteLine();
-                        Console.Error.WriteLine($"    Error: {progress.Error}");
-                    }
-                },
+                onProgress: ReportIndexProgress,
                 perFileTimeout: TimeSpan.FromSeconds(timeout),
                 ct: ct);
 
             Console.WriteLine();
             Console.WriteLine();
 
-            // Report per-language counts
-            Console.WriteLine("Indexed files per language:");
-            foreach (var (lang, count) in result.FilesPerLanguage)
-            {
-                Console.WriteLine($"  {lang.ToIdentifier()}: {count}");
-            }
-
-            if (result.SkippedFiles > 0)
-            {
-                Console.WriteLine($"  (skipped {result.SkippedFiles} files with no matching language server)");
-            }
-
-            // Write failures to log file
-            if (result.Failures.Count > 0)
-            {
-                string logDir = Path.Combine(projectRoot, ".serena", "logs");
-                Directory.CreateDirectory(logDir);
-                string logFile = Path.Combine(logDir, "indexing.txt");
-
-                var lines = result.Failures.SelectMany(f => new[] { f.FilePath, f.Error, "" });
-                await File.WriteAllLinesAsync(logFile, lines, ct);
-
-                Console.WriteLine();
-                Console.WriteLine($"Failed to index {result.Failures.Count} files, see:");
-                Console.WriteLine($"  {logFile}");
-            }
+            await ReportIndexResultAsync(result, projectRoot, ct);
         });
 
         return command;
+    }
+
+    private static void ReportIndexProgress(IndexProgress progress)
+    {
+        string status = progress.Success ? "✓" : "✗";
+        int pct = (int)(100.0 * progress.CurrentFile / progress.TotalFiles);
+        Console.Write($"\r  [{pct,3}%] {progress.CurrentFile}/{progress.TotalFiles} {status} {progress.FilePath}");
+        if (!progress.Success)
+        {
+            Console.WriteLine();
+            Console.Error.WriteLine($"    Error: {progress.Error}");
+        }
+    }
+
+    private static async Task ReportIndexResultAsync(
+        IndexResult result, string projectRoot, CancellationToken ct)
+    {
+        Console.WriteLine("Indexed files per language:");
+        foreach (var (lang, count) in result.FilesPerLanguage)
+        {
+            Console.WriteLine($"  {lang.ToIdentifier()}: {count}");
+        }
+
+        if (result.SkippedFiles > 0)
+        {
+            Console.WriteLine($"  (skipped {result.SkippedFiles} files with no matching language server)");
+        }
+
+        if (result.Failures.Count > 0)
+        {
+            string logDir = Path.Combine(projectRoot, ".serena", "logs");
+            Directory.CreateDirectory(logDir);
+            string logFile = Path.Combine(logDir, "indexing.txt");
+
+            var lines = result.Failures.SelectMany(f => new[] { f.FilePath, f.Error, "" });
+            await File.WriteAllLinesAsync(logFile, lines, ct);
+
+            Console.WriteLine();
+            Console.WriteLine($"Failed to index {result.Failures.Count} files, see:");
+            Console.WriteLine($"  {logFile}");
+        }
     }
 
     private static Command CreateProjectIndexFileCommand()

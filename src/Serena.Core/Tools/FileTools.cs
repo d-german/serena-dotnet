@@ -17,12 +17,12 @@ public sealed class ReadFileTool : ToolBase
     protected override IReadOnlyList<ToolParameter> ExtractParameters() =>
     [
         new("relative_path", "The relative path to the file to read.", typeof(string), Required: true),
-        new("start_line", "The 0-based index of the first line to be retrieved.", typeof(int), Required: false, DefaultValue: 0),
-        new("end_line", "The 0-based index of the last line to be retrieved (inclusive). -1 for end of file.", typeof(int), Required: false, DefaultValue: -1),
+        new("start_line", "The 0-based line index to start reading from. Default: 0 (beginning of file).", typeof(int), Required: false, DefaultValue: 0),
+        new("end_line", "The 0-based line index to stop reading at (inclusive). -1 means end of file.", typeof(int), Required: false, DefaultValue: -1),
         new("max_answer_chars", "Max characters for the result. -1 for no limit.", typeof(int), Required: false, DefaultValue: -1),
     ];
 
-    protected override Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
+    protected override async Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
     {
         string relativePath = GetRequired<string>(arguments, "relative_path");
         int startLine = GetOptional(arguments, "start_line", 0);
@@ -32,10 +32,10 @@ public sealed class ReadFileTool : ToolBase
         string fullPath = ResolvePath(relativePath);
         if (!File.Exists(fullPath))
         {
-            return Task.FromResult($"Error: File not found: {relativePath}");
+            return $"Error: File not found: {relativePath}";
         }
 
-        string[] lines = File.ReadAllLines(fullPath);
+        string[] lines = await File.ReadAllLinesAsync(fullPath, GetProjectEncoding(), ct);
         if (startLine > 0 || endLine >= 0)
         {
             int end = endLine >= 0 ? Math.Min(endLine + 1, lines.Length) : lines.Length;
@@ -46,12 +46,11 @@ public sealed class ReadFileTool : ToolBase
         string result = string.Join('\n', lines);
         if (maxChars > 0 && result.Length > maxChars)
         {
-            return Task.FromResult(
-                $"Error: File content ({result.Length} chars) exceeds max_answer_chars ({maxChars}). " +
-                "Use start_line/end_line to read specific sections.");
+            return $"Error: File content ({result.Length} chars) exceeds max_answer_chars ({maxChars}). " +
+                "Use start_line/end_line to read specific sections.";
         }
 
-        return Task.FromResult(result);
+        return result;
     }
 }
 
@@ -69,7 +68,7 @@ public sealed class CreateTextFileTool : ToolBase
         new("content", "The content to write to the file.", typeof(string), Required: true),
     ];
 
-    protected override Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
+    protected override async Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
     {
         string relativePath = GetRequired<string>(arguments, "relative_path");
         string content = GetRequired<string>(arguments, "content");
@@ -83,14 +82,14 @@ public sealed class CreateTextFileTool : ToolBase
             Directory.CreateDirectory(dir);
         }
 
-        File.WriteAllText(fullPath, content, Encoding.UTF8);
+        await File.WriteAllTextAsync(fullPath, content, GetProjectEncoding(), ct);
 
         string answer = $"File created: {relativePath}.";
         if (willOverwrite)
         {
             answer += " Overwrote existing file.";
         }
-        return Task.FromResult(answer);
+        return answer;
     }
 }
 
@@ -192,7 +191,7 @@ public sealed class SearchForPatternTool : ToolBase
         new("restrict_search_to_code_files", "When true, only search files that the language server can analyze.", typeof(bool), Required: false, DefaultValue: false),
     ];
 
-    protected override Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
+    protected override async Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
     {
         string pattern = GetRequired<string>(arguments, "substring_pattern");
         string relativePath = GetOptional(arguments, "relative_path", "");
@@ -207,36 +206,46 @@ public sealed class SearchForPatternTool : ToolBase
         string searchRoot = string.IsNullOrEmpty(relativePath)
             ? projectRoot
             : ResolvePath(relativePath);
+        var regex = new Regex(pattern, RegexOptions.Singleline | RegexOptions.Multiline, TimeSpan.FromSeconds(10));
 
-        var regex = new Regex(pattern, RegexOptions.Singleline | RegexOptions.Multiline);
-        var results = new Dictionary<string, List<string>>();
+        var filesToSearch = EnumerateSearchFiles(searchRoot, projectRoot, includeGlob, excludeGlob, codeFilesOnly);
+        var results = await CollectMatchesAsync(filesToSearch, regex, contextBefore, contextAfter, projectRoot, ct);
 
-        IEnumerable<string> filesToSearch;
-        if (File.Exists(searchRoot))
-        {
-            filesToSearch = [searchRoot];
-        }
-        else
-        {
-            filesToSearch = Directory.EnumerateFiles(searchRoot, "*", SearchOption.AllDirectories)
-                .Where(f => !IsPathIgnored(
-                    Path.GetRelativePath(projectRoot, f)));
-        }
+        string result = ToJson(results);
+        return LimitLength(result, maxChars);
+    }
+
+    private IEnumerable<string> EnumerateSearchFiles(
+        string searchRoot, string projectRoot, string includeGlob, string excludeGlob, bool codeFilesOnly)
+    {
+        IEnumerable<string> files = File.Exists(searchRoot)
+            ? [searchRoot]
+            : Directory.EnumerateFiles(searchRoot, "*", SearchOption.AllDirectories)
+                .Where(f => !IsPathIgnored(Path.GetRelativePath(projectRoot, f)));
 
         if (!string.IsNullOrEmpty(includeGlob))
         {
-            filesToSearch = filesToSearch.Where(f => FileSystemHelpers.MatchesGlob(Path.GetFileName(f), includeGlob));
+            files = files.Where(f => FileSystemHelpers.MatchesGlob(Path.GetFileName(f), includeGlob));
         }
 
         if (!string.IsNullOrEmpty(excludeGlob))
         {
-            filesToSearch = filesToSearch.Where(f => !FileSystemHelpers.MatchesGlob(Path.GetFileName(f), excludeGlob));
+            files = files.Where(f => !FileSystemHelpers.MatchesGlob(Path.GetFileName(f), excludeGlob));
         }
 
         if (codeFilesOnly)
         {
-            filesToSearch = filesToSearch.Where(LanguageServerSymbolRetriever.CanAnalyzeFile);
+            files = files.Where(LanguageServerSymbolRetriever.CanAnalyzeFile);
         }
+
+        return files;
+    }
+
+    private async Task<Dictionary<string, List<string>>> CollectMatchesAsync(
+        IEnumerable<string> filesToSearch, Regex regex, int contextBefore, int contextAfter,
+        string projectRoot, CancellationToken ct)
+    {
+        var results = new Dictionary<string, List<string>>();
 
         foreach (string filePath in filesToSearch)
         {
@@ -245,46 +254,61 @@ public sealed class SearchForPatternTool : ToolBase
                 break;
             }
 
-            try
+            var fileMatches = await FindMatchesInFileAsync(filePath, regex, contextBefore, contextAfter, ct);
+            if (fileMatches is not null)
             {
-                string content = File.ReadAllText(filePath);
-                var matches = regex.Matches(content);
-                if (matches.Count == 0)
-                {
-                    continue;
-                }
-
-                string[] lines = content.Split('\n');
-                var fileMatches = new List<string>();
-
-                foreach (Match match in matches)
-                {
-                    int matchLine = content[..match.Index].Count(c => c == '\n');
-                    int matchEndLine = matchLine + match.Value.Count(c => c == '\n');
-
-                    int startLine = Math.Max(0, matchLine - contextBefore);
-                    int endLine = Math.Min(lines.Length - 1, matchEndLine + contextAfter);
-
-                    var sb = new StringBuilder();
-                    for (int i = startLine; i <= endLine; i++)
-                    {
-                        string prefix = (i >= matchLine && i <= matchEndLine) ? "  > " : "    ";
-                        sb.AppendLine($"{prefix}{i + 1,4}:{lines[i]}");
-                    }
-                    fileMatches.Add(sb.ToString().TrimEnd());
-                }
-
                 string rel = Path.GetRelativePath(projectRoot, filePath).Replace('\\', '/');
                 results[rel] = fileMatches;
             }
-            catch (Exception)
-            {
-                // Skip binary files or files that can't be read
-            }
         }
 
-        string result = ToJson(results);
-        return Task.FromResult(LimitLength(result, maxChars));
+        return results;
+    }
+
+    private async Task<List<string>?> FindMatchesInFileAsync(
+        string filePath, Regex regex, int contextBefore, int contextAfter, CancellationToken ct)
+    {
+        try
+        {
+            string content = await File.ReadAllTextAsync(filePath, GetProjectEncoding(), ct);
+            var matches = regex.Matches(content);
+            if (matches.Count == 0)
+            {
+                return null;
+            }
+
+            string[] lines = content.Split('\n');
+            var fileMatches = new List<string>();
+
+            foreach (Match match in matches)
+            {
+                fileMatches.Add(FormatMatchContext(content, lines, match, contextBefore, contextAfter));
+            }
+
+            return fileMatches;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    private static string FormatMatchContext(
+        string content, string[] lines, Match match, int contextBefore, int contextAfter)
+    {
+        int matchLine = content[..match.Index].Count(c => c == '\n');
+        int matchEndLine = matchLine + match.Value.Count(c => c == '\n');
+
+        int startLine = Math.Max(0, matchLine - contextBefore);
+        int endLine = Math.Min(lines.Length - 1, matchEndLine + contextAfter);
+
+        var sb = new StringBuilder();
+        for (int i = startLine; i <= endLine; i++)
+        {
+            string prefix = (i >= matchLine && i <= matchEndLine) ? "  > " : "    ";
+            sb.AppendLine($"{prefix}{i + 1,4}:{lines[i]}");
+        }
+        return sb.ToString().TrimEnd();
     }
 }
 
@@ -330,23 +354,30 @@ internal static class FileSystemHelpers
                 continue;
             }
 
-            if (Directory.Exists(entry))
-            {
-                dirs.Add(relative);
-                if (recursive)
-                {
-                    var (subDirs, subFiles) = ScanDirectory(entry, relativeTo, true, isIgnored);
-                    dirs.AddRange(subDirs);
-                    files.AddRange(subFiles);
-                }
-            }
-            else
-            {
-                files.Add(relative);
-            }
+            ClassifyEntry(entry, relative, relativeTo, recursive, isIgnored, dirs, files);
         }
 
         return (dirs, files);
+    }
+
+    private static void ClassifyEntry(
+        string entry, string relative, string relativeTo, bool recursive,
+        Func<string, bool>? isIgnored, List<string> dirs, List<string> files)
+    {
+        if (Directory.Exists(entry))
+        {
+            dirs.Add(relative);
+            if (recursive)
+            {
+                var (subDirs, subFiles) = ScanDirectory(entry, relativeTo, true, isIgnored);
+                dirs.AddRange(subDirs);
+                files.AddRange(subFiles);
+            }
+        }
+        else
+        {
+            files.Add(relative);
+        }
     }
 
     public static bool MatchesGlob(string fileName, string pattern)

@@ -2,6 +2,7 @@
 // Phase 6A: ITool, ToolBase, ToolRegistry, ToolMarkers
 
 using System.Reflection;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using CSharpFunctionalExtensions;
@@ -225,6 +226,36 @@ public abstract class ToolBase : ITool
                 $"Path '{relativePath}' resolves outside the project root.");
         }
         return fullPath;
+    }
+
+    /// <summary>
+    /// Gets the file encoding configured for the active project, defaulting to UTF-8.
+    /// </summary>
+    protected Encoding GetProjectEncoding()
+    {
+        string? encodingName = Context.ActiveProject?.Config?.Encoding;
+        return string.IsNullOrEmpty(encodingName)
+            ? Encoding.UTF8
+            : Encoding.GetEncoding(encodingName);
+    }
+
+    /// <summary>
+    /// Best-effort LSP notification when a file's content changes.
+    /// </summary>
+    protected async Task TryNotifyLspAsync(string absolutePath, string content, CancellationToken ct)
+    {
+        try
+        {
+            var lsp = await Context.Agent.GetLanguageServerForFileAsync(absolutePath, ct);
+            if (lsp is not null)
+            {
+                await lsp.NotifyFileChangedAsync(absolutePath, content);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "LSP notification failed for {Path} (best-effort)", absolutePath);
+        }
     }
 
     /// <summary>
@@ -505,30 +536,6 @@ public sealed class ToolRegistry
     public IReadOnlyList<ITool> Where(Func<ITool, bool> predicate) =>
         _tools.Values.Where(predicate).ToList();
 
-    /// <summary>
-    /// Discovers and registers all Tool subclasses from the given assemblies.
-    /// </summary>
-    public static ToolRegistry DiscoverFrom(IEnumerable<Assembly> assemblies, Func<Type, ITool?> factory)
-    {
-        var registry = new ToolRegistry();
-        foreach (var assembly in assemblies)
-        {
-            foreach (var type in assembly.GetTypes())
-            {
-                if (type.IsAbstract || !typeof(ITool).IsAssignableFrom(type))
-                {
-                    continue;
-                }
-
-                var tool = factory(type);
-                if (tool is not null)
-                {
-                    registry.Register(tool);
-                }
-            }
-        }
-        return registry;
-    }
 }
 
 /// <summary>

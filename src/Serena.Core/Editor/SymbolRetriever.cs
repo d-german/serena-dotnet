@@ -129,21 +129,28 @@ public sealed class LanguageServerSymbol
         foreach (var child in children)
         {
             string kind = child.Kind.ToString();
-            if (!grouped.ContainsKey(kind))
+            if (!grouped.TryGetValue(kind, out var list))
             {
-                grouped[kind] = [];
+                list = [];
+                grouped[kind] = list;
             }
 
-            var childDict = child.ToDict(childDepth: remainingDepth);
-
-            // kind is redundant (already the grouping key) and relative_path
-            // is inherited from the parent — omit both to reduce output size.
-            childDict.Remove("kind");
-            childDict.Remove("relative_path");
-
-            grouped[kind].Add(childDict);
+            list.Add(BuildChildDict(child, remainingDepth));
         }
         return grouped;
+    }
+
+    private static Dictionary<string, object?> BuildChildDict(
+        LanguageServerSymbol child, int remainingDepth)
+    {
+        var childDict = child.ToDict(childDepth: remainingDepth);
+
+        // kind is redundant (already the grouping key) and relative_path
+        // is inherited from the parent — omit both to reduce output size.
+        childDict.Remove("kind");
+        childDict.Remove("relative_path");
+
+        return childDict;
     }
 
     private static LanguageServerSymbolLocation? CreateLocation(
@@ -445,43 +452,54 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
         var results = new List<ReferenceResult>();
         foreach (var loc in locations)
         {
-            string refAbsPath = LspClient.UriToPath(loc.Uri);
-            string refRelPath = Path.GetRelativePath(_projectRoot, refAbsPath).Replace('\\', '/');
-
-            int refLine = loc.Range.Start.Line;
-            string? snippet = SourceContext.RetrieveContentAroundLine(
-                refAbsPath, refLine, contextLinesBefore, contextLinesAfter);
-
-            // Look up the containing symbol for this reference location
-            string? containingName = null;
-            try
-            {
-                if (!symbolsByFile.TryGetValue(refRelPath, out var fileSymbols))
-                {
-                    fileSymbols = await GetSymbolsAsync(refRelPath, ct);
-                    symbolsByFile[refRelPath] = fileSymbols;
-                }
-
-                var containing = FindDeepestContainingSymbol(
-                    fileSymbols, loc.Range.Start.Line, loc.Range.Start.Character);
-                containingName = containing?.NamePath;
-            }
-            catch
-            {
-                // Skip if symbols can't be resolved
-            }
-
-            results.Add(new ReferenceResult
-            {
-                RelativePath = refRelPath,
-                Line = loc.Range.Start.Line,
-                Character = loc.Range.Start.Character,
-                ContextSnippet = snippet,
-                ContainingSymbolName = containingName,
-            });
+            results.Add(await BuildReferenceResultAsync(
+                loc, symbolsByFile, contextLinesBefore, contextLinesAfter, ct));
         }
 
         return results;
+    }
+
+    private async Task<ReferenceResult> BuildReferenceResultAsync(
+        Location loc, Dictionary<string, IReadOnlyList<LanguageServerSymbol>> symbolsByFile,
+        int contextLinesBefore, int contextLinesAfter, CancellationToken ct)
+    {
+        string refAbsPath = LspClient.UriToPath(loc.Uri);
+        string refRelPath = Path.GetRelativePath(_projectRoot, refAbsPath).Replace('\\', '/');
+
+        string? snippet = SourceContext.RetrieveContentAroundLine(
+            refAbsPath, loc.Range.Start.Line, contextLinesBefore, contextLinesAfter);
+
+        string? containingName = await ResolveContainingSymbolNameAsync(
+            refRelPath, loc.Range.Start.Line, loc.Range.Start.Character, symbolsByFile, ct);
+
+        return new ReferenceResult
+        {
+            RelativePath = refRelPath,
+            Line = loc.Range.Start.Line,
+            Character = loc.Range.Start.Character,
+            ContextSnippet = snippet,
+            ContainingSymbolName = containingName,
+        };
+    }
+
+    private async Task<string?> ResolveContainingSymbolNameAsync(
+        string relPath, int line, int character,
+        Dictionary<string, IReadOnlyList<LanguageServerSymbol>> symbolsByFile, CancellationToken ct)
+    {
+        try
+        {
+            if (!symbolsByFile.TryGetValue(relPath, out var fileSymbols))
+            {
+                fileSymbols = await GetSymbolsAsync(relPath, ct);
+                symbolsByFile[relPath] = fileSymbols;
+            }
+
+            return FindDeepestContainingSymbol(fileSymbols, line, character)?.NamePath;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     /// <inheritdoc />

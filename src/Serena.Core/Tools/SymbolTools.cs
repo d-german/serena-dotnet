@@ -41,7 +41,6 @@ public sealed class FindSymbolTool : ToolBase
         int maxMatches = GetOptional(arguments, "max_matches", -1);
         int maxAnswerChars = GetOptional(arguments, "max_answer_chars", -1);
 
-        // Determine which path to use for LS lookup
         string searchPath = string.IsNullOrEmpty(relativePath) ? "." : relativePath;
         var retriever = await RequireSymbolRetrieverAsync(searchPath, ct);
 
@@ -51,15 +50,11 @@ public sealed class FindSymbolTool : ToolBase
             substringMatching,
             ct);
 
-        // Apply kind filtering
         var filtered = SymbolKindFilter.FilterByKind(symbols, includeKinds, excludeKinds, s => (int)s.Kind);
 
         if (maxMatches > 0 && symbols.Count > maxMatches)
         {
-            var names = filtered.Take(maxMatches + 5).Select(s => s.NamePath);
-            return $"Too many matches ({symbols.Count}). Showing first {maxMatches + 5}:\n" +
-                   string.Join("\n", names) +
-                   "\nRefine your pattern to narrow results.";
+            return FormatTooManyMatches(filtered, symbols.Count, maxMatches);
         }
 
         var symbolList = filtered.ToList();
@@ -69,7 +64,27 @@ public sealed class FindSymbolTool : ToolBase
                    (string.IsNullOrEmpty(relativePath) ? "" : $" in {relativePath}");
         }
 
-        // Build result with optional body and children
+        var resultDicts = await BuildResultDictsAsync(symbolList, retriever, includeBody, includeInfo, depth, ct);
+
+        var grouped = SymbolDictGrouper.GroupByMultiple(resultDicts, ["relative_path", "kind"]);
+        string result = ToolResultFormatter.FormatGroupedSymbols(grouped, maxChars: -1);
+        return LimitLength(result, maxAnswerChars,
+            () => string.Join("\n", symbolList.Select(s => s.NamePath)));
+    }
+
+    private static string FormatTooManyMatches(
+        IEnumerable<LanguageServerSymbol> filtered, int totalCount, int maxMatches)
+    {
+        var names = filtered.Take(maxMatches + 5).Select(s => s.NamePath);
+        return $"Too many matches ({totalCount}). Showing first {maxMatches + 5}:\n" +
+               string.Join("\n", names) +
+               "\nRefine your pattern to narrow results.";
+    }
+
+    private static async Task<List<Dictionary<string, object?>>> BuildResultDictsAsync(
+        List<LanguageServerSymbol> symbolList, ISymbolRetriever retriever,
+        bool includeBody, bool includeInfo, int depth, CancellationToken ct)
+    {
         var resultDicts = new List<Dictionary<string, object?>>();
         foreach (var symbol in symbolList)
         {
@@ -77,7 +92,6 @@ public sealed class FindSymbolTool : ToolBase
 
             if (includeBody && !dict.ContainsKey("body"))
             {
-                // Try to load body from file if not already included
                 var body = await retriever.GetSymbolBodyAsync(symbol, ct);
                 if (body is not null)
                 {
@@ -88,23 +102,26 @@ public sealed class FindSymbolTool : ToolBase
             resultDicts.Add(dict);
         }
 
-        // Attach hover info when requested (skip when body is already included)
         if (includeInfo && !includeBody)
         {
-            var infoMap = await retriever.RequestInfoForSymbolBatchAsync(symbolList, ct);
-            for (int i = 0; i < symbolList.Count; i++)
-            {
-                if (infoMap.TryGetValue(symbolList[i], out string? info) && info is not null)
-                {
-                    resultDicts[i]["info"] = info;
-                }
-            }
+            await AttachHoverInfoAsync(symbolList, resultDicts, retriever, ct);
         }
 
-        var grouped = SymbolDictGrouper.GroupByMultiple(resultDicts, ["relative_path", "kind"]);
-        string result = ToolResultFormatter.FormatGroupedSymbols(grouped, maxChars: -1);
-        return LimitLength(result, maxAnswerChars,
-            () => string.Join("\n", symbolList.Select(s => s.NamePath)));
+        return resultDicts;
+    }
+
+    private static async Task AttachHoverInfoAsync(
+        List<LanguageServerSymbol> symbolList, List<Dictionary<string, object?>> resultDicts,
+        ISymbolRetriever retriever, CancellationToken ct)
+    {
+        var infoMap = await retriever.RequestInfoForSymbolBatchAsync(symbolList, ct);
+        for (int i = 0; i < symbolList.Count; i++)
+        {
+            if (infoMap.TryGetValue(symbolList[i], out string? info) && info is not null)
+            {
+                resultDicts[i]["info"] = info;
+            }
+        }
     }
 }
 
@@ -302,40 +319,54 @@ public sealed class FindReferencingSymbolsTool : ToolBase
 
         foreach (var r in references)
         {
-            if (!symbolsByFile.TryGetValue(r.RelativePath, out var fileSymbols))
+            var fileSymbols = await GetOrLoadFileSymbolsAsync(retriever, symbolsByFile, r.RelativePath, ct);
+            if (ShouldIncludeReference(fileSymbols, r.Line, includeKinds, excludeKinds))
             {
-                try
-                {
-                    fileSymbols = await retriever.GetSymbolsAsync(r.RelativePath, ct);
-                }
-                catch
-                {
-                    fileSymbols = [];
-                }
-                symbolsByFile[r.RelativePath] = fileSymbols;
-            }
-
-            var kind = SymbolKindFilter.FindContainingSymbolKind(fileSymbols, r.Line);
-            if (kind is null)
-            {
-                // Cannot determine kind; include by default
                 filtered.Add(r);
-                continue;
             }
-
-            int kindInt = (int)kind.Value;
-            if (excludeKinds?.Contains(kindInt) == true)
-            {
-                continue;
-            }
-            if (includeKinds is not null && !includeKinds.Contains(kindInt))
-            {
-                continue;
-            }
-            filtered.Add(r);
         }
 
         return filtered;
+    }
+
+    private static async Task<IReadOnlyList<LanguageServerSymbol>> GetOrLoadFileSymbolsAsync(
+        ISymbolRetriever retriever,
+        Dictionary<string, IReadOnlyList<LanguageServerSymbol>> cache,
+        string relativePath,
+        CancellationToken ct)
+    {
+        if (!cache.TryGetValue(relativePath, out var fileSymbols))
+        {
+            try
+            {
+                fileSymbols = await retriever.GetSymbolsAsync(relativePath, ct);
+            }
+            catch
+            {
+                fileSymbols = [];
+            }
+            cache[relativePath] = fileSymbols;
+        }
+        return fileSymbols;
+    }
+
+    private static bool ShouldIncludeReference(
+        IReadOnlyList<LanguageServerSymbol> fileSymbols, int line,
+        List<int>? includeKinds, List<int>? excludeKinds)
+    {
+        var kind = SymbolKindFilter.FindContainingSymbolKind(fileSymbols, line);
+        if (kind is null)
+        {
+            return true; // Cannot determine kind; include by default
+        }
+
+        int kindInt = (int)kind.Value;
+        if (excludeKinds?.Contains(kindInt) == true)
+        {
+            return false;
+        }
+
+        return includeKinds is null || includeKinds.Contains(kindInt);
     }
 }
 

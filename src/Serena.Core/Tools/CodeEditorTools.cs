@@ -1,6 +1,8 @@
 // Code Editor & Symbol Retriever - Phase 6E
 // Tools for symbol editing: replace_symbol_body, insert_before/after_symbol, replace_content, rename_symbol
 
+using Microsoft.Extensions.Logging;
+
 namespace Serena.Core.Tools;
 
 [SymbolicEdit]
@@ -107,85 +109,57 @@ public sealed class ReplaceContentTool : ToolBase
         bool allowMultiple = GetOptional(arguments, "allow_multiple_occurrences", false);
 
         string absolutePath = ResolvePath(relativePath);
-        string content = await File.ReadAllTextAsync(absolutePath, ct);
+        var encoding = GetProjectEncoding();
+        string content = await File.ReadAllTextAsync(absolutePath, encoding, ct);
 
-        string newContent;
-        int count;
+        var (newContent, count) = string.Equals(mode, "regex", StringComparison.OrdinalIgnoreCase)
+            ? ReplaceWithRegex(content, needle, repl, allowMultiple, relativePath)
+            : ReplaceWithLiteral(content, needle, repl, allowMultiple, relativePath);
 
-        if (string.Equals(mode, "regex", StringComparison.OrdinalIgnoreCase))
-        {
-            // Convert $!N backreference syntax to standard $N
-            string normalizedRepl = System.Text.RegularExpressions.Regex.Replace(repl, @"\$!(\d+)", @"$$$1");
-            var regex = new System.Text.RegularExpressions.Regex(
-                needle, System.Text.RegularExpressions.RegexOptions.Singleline | System.Text.RegularExpressions.RegexOptions.Multiline);
-            count = regex.Matches(content).Count;
-
-            if (count == 0)
-            {
-                throw new InvalidOperationException($"Pattern not found in {relativePath}: {needle}");
-            }
-            if (count > 1 && !allowMultiple)
-            {
-                throw new InvalidOperationException(
-                    $"Pattern matches {count} occurrences in {relativePath}, but allow_multiple_occurrences is false.");
-            }
-
-            newContent = regex.Replace(content, normalizedRepl);
-        }
-        else
-        {
-            count = CountOccurrences(content, needle);
-
-            if (count == 0)
-            {
-                throw new InvalidOperationException($"Text not found in {relativePath}");
-            }
-            if (count > 1 && !allowMultiple)
-            {
-                throw new InvalidOperationException(
-                    $"Text matches {count} occurrences in {relativePath}, but allow_multiple_occurrences is false.");
-            }
-
-            if (allowMultiple)
-            {
-                newContent = content.Replace(needle, repl);
-            }
-            else
-            {
-                int index = content.IndexOf(needle, StringComparison.Ordinal);
-                newContent = content[..index] + repl + content[(index + needle.Length)..];
-            }
-        }
-
-        await File.WriteAllTextAsync(absolutePath, newContent, ct);
-
-        // Try to notify LSP if available
-        try
-        {
-            var lsp = await Context.Agent.GetLanguageServerForFileAsync(absolutePath, ct);
-            if (lsp is not null)
-            {
-                await lsp.NotifyFileChangedAsync(absolutePath, newContent);
-            }
-        }
-        catch
-        {
-            // LSP notification is best-effort
-        }
+        await File.WriteAllTextAsync(absolutePath, newContent, encoding, ct);
+        await TryNotifyLspAsync(absolutePath, newContent, ct);
 
         return $"Replaced {count} occurrence(s) in {relativePath}";
     }
 
-    private static int CountOccurrences(string text, string needle)
+    private static (string NewContent, int Count) ReplaceWithRegex(
+        string content, string needle, string repl, bool allowMultiple, string relativePath)
     {
-        int count = 0;
-        int index = 0;
-        while ((index = text.IndexOf(needle, index, StringComparison.Ordinal)) != -1)
+        string normalizedRepl = TextReplacementHelper.NormalizeBackreferences(repl);
+        var regex = TextReplacementHelper.CreateSearchRegex(needle);
+        int count = regex.Matches(content).Count;
+
+        ValidateOccurrenceCount(count, allowMultiple, relativePath, $"Pattern not found in {relativePath}: {needle}");
+
+        return (regex.Replace(content, normalizedRepl), count);
+    }
+
+    private static (string NewContent, int Count) ReplaceWithLiteral(
+        string content, string needle, string repl, bool allowMultiple, string relativePath)
+    {
+        int count = TextReplacementHelper.CountOccurrences(content, needle);
+
+        ValidateOccurrenceCount(count, allowMultiple, relativePath, $"Text not found in {relativePath}");
+
+        string newContent = allowMultiple
+            ? content.Replace(needle, repl)
+            : TextReplacementHelper.ReplaceFirst(content, needle, repl);
+
+        return (newContent, count);
+    }
+
+    private static void ValidateOccurrenceCount(int count, bool allowMultiple, string relativePath, string notFoundMessage)
+    {
+        if (count == 0)
         {
-            count++;
-            index += needle.Length;
+            throw new InvalidOperationException(notFoundMessage);
         }
-        return count;
+
+        if (count > 1 && !allowMultiple)
+        {
+            throw new InvalidOperationException(
+                $"Text matches {count} occurrences in {relativePath}, but allow_multiple_occurrences is false.");
+        }
     }
 }
 

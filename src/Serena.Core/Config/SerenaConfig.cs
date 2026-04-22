@@ -12,7 +12,7 @@ namespace Serena.Core.Config;
 /// </summary>
 public sealed class SerenaPaths
 {
-    private static SerenaPaths? _instance;
+    private static readonly Lazy<SerenaPaths> _lazy = new(() => new SerenaPaths());
 
     public string SerenaUserHomeDir { get; }
     public string UserPromptTemplatesDir { get; }
@@ -36,7 +36,7 @@ public sealed class SerenaPaths
         NewsReadItemsFile = Path.Combine(SerenaUserHomeDir, "news_read.json");
     }
 
-    public static SerenaPaths Instance => _instance ??= new SerenaPaths();
+    public static SerenaPaths Instance => _lazy.Value;
 
     /// <summary>
     /// Ensures that all required directories exist.
@@ -121,6 +121,14 @@ public sealed record ProjectConfig
     /// <summary>
     /// Shell commands that are suggested to the agent for common tasks.
     /// </summary>
+
+    /// <summary>
+    /// Regex patterns for shell commands that should be blocked.
+    /// When a command matches any of these patterns, execution is denied.
+    /// Example patterns: "rm\s+-rf\s+/", "format\s+[a-z]:", "mkfs\."
+    /// </summary>
+    public IReadOnlyList<string>? ShellCommandDenyPatterns { get; init; }
+
     public IReadOnlyDictionary<string, string>? SuggestedCommands { get; init; }
 }
 
@@ -234,22 +242,27 @@ public sealed class SerenaConfig
 
         foreach (string filePath in Directory.GetFiles(contextsDirectory, "*.yml"))
         {
-            try
-            {
-                var context = SerenaAgentContext.LoadFromYaml(filePath);
-                if (context is null)
-                {
-                    _logger.LogWarning("Context file was empty or unreadable: {Path}", filePath);
-                    continue;
-                }
+            TryLoadContext(filePath);
+        }
+    }
 
-                _contexts[context.Name] = context;
-                _logger.LogInformation("Loaded context: {Name} from {Path}", context.Name, filePath);
-            }
-            catch (Exception ex)
+    private void TryLoadContext(string filePath)
+    {
+        try
+        {
+            var context = SerenaAgentContext.LoadFromYaml(filePath);
+            if (context is null)
             {
-                _logger.LogError(ex, "Failed to load context from {Path}", filePath);
+                _logger.LogWarning("Context file was empty or unreadable: {Path}", filePath);
+                return;
             }
+
+            _contexts[context.Name] = context;
+            _logger.LogInformation("Loaded context: {Name} from {Path}", context.Name, filePath);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to load context from {Path}", filePath);
         }
     }
 

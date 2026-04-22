@@ -420,75 +420,65 @@ public sealed class LspClient : IAsyncDisposable
     private static IReadOnlyList<UnifiedSymbolInformation> ParseDocumentSymbolResponse(
         JToken token, string uri, string? relativePath)
     {
-        if (token is JArray arr && arr.Count > 0)
-        {
-            var first = arr[0];
-            // DocumentSymbol has "range" and "selectionRange"; SymbolInformation has "location"
-            if (first["selectionRange"] is not null)
-            {
-                var docSymbols = arr.ToObject<DocumentSymbol[]>();
-                if (docSymbols is not null)
-                {
-                    return docSymbols
-                        .Select(ds => UnifiedSymbolInformation.FromDocumentSymbol(ds, uri, relativePath))
-                        .ToList();
-                }
-            }
-            else if (first["location"] is not null)
-            {
-                var symbolInfos = arr.ToObject<SymbolInformation[]>();
-                if (symbolInfos is not null)
-                {
-                    return symbolInfos
-                        .Select(UnifiedSymbolInformation.FromSymbolInformation)
-                        .ToList();
-                }
-            }
-        }
-        return [];
-    }
-
-    private static IReadOnlyList<Location> ParseLocationResponse(JToken? token)
-    {
-        if (token is null || token.Type == JTokenType.Null)
+        if (token is not JArray { Count: > 0 } arr)
         {
             return [];
         }
 
-        // Single Location
-        if (token is JObject obj && obj["uri"] is not null)
+        var first = arr[0];
+        return first switch
         {
-            var loc = obj.ToObject<Location>();
-            return loc is not null ? [loc] : [];
-        }
+            _ when first["selectionRange"] is not null =>
+                arr.ToObject<DocumentSymbol[]>()
+                    ?.Select(ds => UnifiedSymbolInformation.FromDocumentSymbol(ds, uri, relativePath))
+                    .ToList() ?? [],
+            _ when first["location"] is not null =>
+                arr.ToObject<SymbolInformation[]>()
+                    ?.Select(UnifiedSymbolInformation.FromSymbolInformation)
+                    .ToList() ?? [],
+            _ => []
+        };
+    }
 
-        // Array of Location or LocationLink
-        if (token is JArray arr)
+    private static IReadOnlyList<Location> ParseLocationResponse(JToken? token)
+    {
+        return token switch
         {
-            var locations = new List<Location>();
-            foreach (var item in arr)
+            null or { Type: JTokenType.Null } => [],
+            JObject obj when obj["uri"] is not null => ParseSingleLocation(obj),
+            JArray arr => ParseLocationArray(arr),
+            _ => []
+        };
+    }
+
+    private static IReadOnlyList<Location> ParseSingleLocation(JObject obj)
+    {
+        var loc = obj.ToObject<Location>();
+        return loc is not null ? [loc] : [];
+    }
+
+    private static IReadOnlyList<Location> ParseLocationArray(JArray arr)
+    {
+        var locations = new List<Location>();
+        foreach (var item in arr)
+        {
+            var loc = ParseLocationOrLink(item);
+            if (loc is not null)
             {
-                if (item is JObject itemObj && itemObj["targetUri"] is not null)
-                {
-                    // LocationLink → convert to Location
-                    var link = itemObj.ToObject<LocationLink>();
-                    if (link is not null)
-                    {
-                        locations.Add(new Location(link.TargetUri, link.TargetRange));
-                    }
-                }
-                else
-                {
-                    var loc = item.ToObject<Location>();
-                    if (loc is not null)
-                    {
-                        locations.Add(loc);
-                    }
-                }
+                locations.Add(loc);
             }
-            return locations;
+        }
+        return locations;
+    }
+
+    private static Location? ParseLocationOrLink(JToken item)
+    {
+        if (item is JObject itemObj && itemObj["targetUri"] is not null)
+        {
+            var link = itemObj.ToObject<LocationLink>();
+            return link is not null ? new Location(link.TargetUri, link.TargetRange) : null;
         }
 
-        return [];
+        return item.ToObject<Location>();
     }
 }

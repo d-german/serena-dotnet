@@ -150,7 +150,7 @@ public sealed class GitIgnoreFilter : IIgnoreFilter
         }
         catch (UnauthorizedAccessException)
         {
-            // Skip directories we can't access
+            // Expected for directories we don't have read access to — silently skip
         }
     }
 }
@@ -215,7 +215,6 @@ internal sealed class GitIgnoreRule
 
     private static string ConvertGitIgnorePatternToRegex(string pattern, string basePath, bool isRooted)
     {
-        // Handle leading slash (anchored to root/base)
         if (pattern.StartsWith('/'))
         {
             pattern = pattern[1..];
@@ -223,7 +222,15 @@ internal sealed class GitIgnoreRule
         }
 
         var sb = new System.Text.StringBuilder("^");
+        AppendPathPrefix(sb, basePath, isRooted);
+        ConvertGlobChars(sb, pattern);
+        sb.Append("(\\/.*)?$");
 
+        return sb.ToString();
+    }
+
+    private static void AppendPathPrefix(System.Text.StringBuilder sb, string basePath, bool isRooted)
+    {
         if (isRooted && !string.IsNullOrEmpty(basePath))
         {
             sb.Append(Regex.Escape(basePath));
@@ -231,58 +238,54 @@ internal sealed class GitIgnoreRule
         }
         else if (!isRooted)
         {
-            // Non-rooted patterns can match at any depth
             sb.Append("(.*\\/)?");
         }
+    }
 
-        // Convert glob pattern to regex
+    private static void ConvertGlobChars(System.Text.StringBuilder sb, string pattern)
+    {
         for (int i = 0; i < pattern.Length; i++)
         {
             char c = pattern[i];
-            if (c == '*')
+            switch (c)
             {
-                if (i + 1 < pattern.Length && pattern[i + 1] == '*')
-                {
-                    // ** matches everything including /
-                    if (i + 2 < pattern.Length && pattern[i + 2] == '/')
-                    {
-                        sb.Append("(.+\\/)?");
-                        i += 2; // Skip **/
-                    }
-                    else
-                    {
-                        sb.Append(".*");
-                        i++; // Skip second *
-                    }
-                }
-                else
-                {
-                    // * matches everything except /
-                    sb.Append("[^/]*");
-                }
-            }
-            else if (c == '?')
-            {
-                sb.Append("[^/]");
-            }
-            else if (c == '[')
-            {
-                // Character class — pass through
-                sb.Append('[');
-            }
-            else if (c == ']')
-            {
-                sb.Append(']');
-            }
-            else
-            {
-                sb.Append(Regex.Escape(c.ToString()));
+                case '*':
+                    i += AppendStarPattern(sb, pattern, i);
+                    break;
+                case '?':
+                    sb.Append("[^/]");
+                    break;
+                case '[':
+                    sb.Append('[');
+                    break;
+                case ']':
+                    sb.Append(']');
+                    break;
+                default:
+                    sb.Append(Regex.Escape(c.ToString()));
+                    break;
             }
         }
+    }
 
-        // Pattern should match the path or any path within (for directories)
-        sb.Append("(\\/.*)?$");
+    /// <summary>
+    /// Appends the regex for a * or ** glob pattern. Returns the number of extra characters consumed.
+    /// </summary>
+    private static int AppendStarPattern(System.Text.StringBuilder sb, string pattern, int index)
+    {
+        if (index + 1 < pattern.Length && pattern[index + 1] == '*')
+        {
+            if (index + 2 < pattern.Length && pattern[index + 2] == '/')
+            {
+                sb.Append("(.+\\/)?");
+                return 2; // Skip **/
+            }
 
-        return sb.ToString();
+            sb.Append(".*");
+            return 1; // Skip second *
+        }
+
+        sb.Append("[^/]*");
+        return 0;
     }
 }

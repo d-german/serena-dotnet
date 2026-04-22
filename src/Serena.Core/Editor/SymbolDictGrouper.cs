@@ -84,21 +84,26 @@ public static class SymbolDictGrouper
 
         foreach (var (key, bucket) in buckets)
         {
-            if (remainingKeys.Length > 0)
-            {
-                result[key] = GroupByMultiple(bucket, remainingKeys, collapseSingleton);
-            }
-            else if (collapseSingleton && bucket.Count == 1)
-            {
-                result[key] = bucket[0];
-            }
-            else
-            {
-                result[key] = bucket;
-            }
+            result[key] = ResolveBucket(bucket, remainingKeys, collapseSingleton);
         }
 
         return result;
+    }
+
+    private static object ResolveBucket(
+        List<Dictionary<string, object?>> bucket, string[] remainingKeys, bool collapseSingleton)
+    {
+        if (remainingKeys.Length > 0)
+        {
+            return GroupByMultiple(bucket, remainingKeys, collapseSingleton);
+        }
+
+        if (collapseSingleton && bucket.Count == 1)
+        {
+            return bucket[0];
+        }
+
+        return bucket;
     }
 
     /// <summary>
