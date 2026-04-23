@@ -44,7 +44,7 @@ public sealed class FindSymbolTool : ToolBase
         int maxAnswerChars = GetOptional(arguments, "max_answer_chars", -1);
 
         string searchPath = string.IsNullOrEmpty(relativePath) ? "." : relativePath;
-        var retriever = await RequireSymbolRetrieverAsync(searchPath, ct);
+        var retriever = await RequireReadOnlyRetrieverAsync(searchPath, ct);
 
         var symbols = await retriever.FindSymbolsByNamePathAsync(
             namePathPattern,
@@ -162,7 +162,7 @@ public sealed class GetSymbolsOverviewTool : ToolBase
             }
 
             string firstRelative = Path.GetRelativePath(root, firstFile).Replace('\\', '/');
-            var dirRetriever = await RequireSymbolRetrieverAsync(firstRelative, ct);
+            var dirRetriever = await RequireReadOnlyRetrieverAsync(firstRelative, ct);
             var dirOverview = await dirRetriever.GetDirectoryOverviewAsync(relativePath, depth, ct);
 
             if (dirOverview.Count == 0)
@@ -176,17 +176,11 @@ public sealed class GetSymbolsOverviewTool : ToolBase
                 () => FormatKindCounts(dirOverview.Values.SelectMany(o => o).ToDictionary(kv => kv.Key, kv => kv.Value)));
         }
 
-        // Cache-first fast path: try to serve the overview from the persisted
-        // symbol cache WITHOUT starting the language server. For large solutions
-        // (OnBase.NET: 909 projects) Roslyn startup can take 10-15 minutes, so
-        // answering from cache when possible is essential.
-        string? cachedOverview = TryBuildOverviewFromCache(absPath, relativePath, root, depth, maxAnswerChars);
-        if (cachedOverview is not null)
-        {
-            return cachedOverview;
-        }
-
-        var retriever = await RequireSymbolRetrieverAsync(relativePath, ct);
+        // Cache-first fast path is built into RequireReadOnlyRetrieverAsync:
+        // the retriever consults the symbol cache before starting the LSP,
+        // so `GetSymbolOverviewAsync` below is instant on cached files and
+        // only falls through to Roslyn on a genuine cache miss.
+        var retriever = await RequireReadOnlyRetrieverAsync(relativePath, ct);
         var overview = await retriever.GetSymbolOverviewAsync(relativePath, depth, ct);
 
         if (overview.Count == 0)
@@ -221,64 +215,14 @@ public sealed class GetSymbolsOverviewTool : ToolBase
     }
 
     /// <summary>
-    /// Attempts to build a symbol overview entirely from the persisted symbol
-    /// cache, without starting a language server. Returns null on any of:
-    /// path is a directory, file extension isn't mapped to a language, no cache
-    /// file on disk for that language, or the file isn't in the cache.
+    /// Previously this class carried a ~55-line <c>TryBuildOverviewFromCache</c>
+    /// helper that inlined cache-first logic to dodge LSP startup. That band-aid
+    /// is now handled generically by <c>ToolBase.RequireReadOnlyRetrieverAsync</c>
+    /// plus the lazy-LSP factory on <see cref="LanguageServerSymbolRetriever"/>,
+    /// so the tool code stays small and the optimization applies to every
+    /// read-only tool (find_symbol, find_referencing_symbols, etc.) instead of
+    /// being special-cased here.
     /// </summary>
-    private string? TryBuildOverviewFromCache(
-        string absPath, string relativePath, string projectRoot, int depth, int maxAnswerChars)
-    {
-        try
-        {
-            string ext = Path.GetExtension(absPath);
-            var language = LanguageExtensions.FromFileExtension(ext);
-            if (language is null)
-            {
-                return null;
-            }
-
-            var cache = Context.Agent.GetOrLoadSymbolCacheForLanguage(language.Value);
-            if (cache is null || cache.Count == 0)
-            {
-                return null;
-            }
-
-            // Unchecked read: ignore fingerprint. Stale overview is fine; we log
-            // hit/miss at the retriever layer when the LSP is used.
-            var cached = cache.TryGetUnchecked(absPath);
-            if (cached is null)
-            {
-                return null;
-            }
-
-            var symbols = cached.Select(s => LanguageServerSymbol.FromUnified(s, relativePath)).ToList();
-            var grouped = new Dictionary<string, List<Dictionary<string, object?>>>();
-            foreach (var symbol in symbols)
-            {
-                string kind = symbol.Kind.ToString();
-                if (!grouped.ContainsKey(kind))
-                {
-                    grouped[kind] = [];
-                }
-                grouped[kind].Add(symbol.ToDict(childDepth: depth));
-            }
-
-            if (grouped.Count == 0)
-            {
-                return null;
-            }
-
-            string result = ToolResultFormatter.FormatSymbolOverview(grouped, maxChars: -1);
-            return LimitLength(result, maxAnswerChars,
-                () => FormatOverviewDepthZero(grouped),
-                () => FormatKindCounts(grouped));
-        }
-        catch
-        {
-            return null;
-        }
-    }
 }
 
 [SymbolicRead]
@@ -310,9 +254,11 @@ public sealed class FindReferencingSymbolsTool : ToolBase
         int contextLinesAfter = GetOptional(arguments, "context_lines_after", 1);
         int maxAnswerChars = GetOptional(arguments, "max_answer_chars", -1);
 
-        var retriever = await RequireSymbolRetrieverAsync(relativePath, ct);
-
-        // Find the symbol first
+        // Cache-first: look up the symbol from the on-disk symbol cache with
+        // no LSP startup. The LSP is started lazily only if the symbol isn't
+        // cached, and unavoidably for FindReferencesAsync below (references are
+        // a semantic query that the cache doesn't answer).
+        var retriever = await RequireReadOnlyRetrieverAsync(relativePath, ct);
         var symbols = await retriever.FindSymbolsByNamePathAsync(namePath, relativePath, ct: ct);
 
         if (symbols.Count == 0)

@@ -342,8 +342,56 @@ public abstract class ToolBase : ITool
                 $"No language server available for '{relativePath}'. Ensure a language server is configured.");
 
         var logger = Context.LoggerFactory.CreateLogger<LanguageServerSymbolRetriever>();
-        var cache = Context.Agent.GetSymbolCacheForLanguage(lsp.Language);
+        var cache = Context.Agent.GetSymbolCache(lsp.Language);
         return new LanguageServerSymbolRetriever(lsp, root, logger, cache);
+    }
+
+    /// <summary>
+    /// Gets a cache-first <see cref="ISymbolRetriever"/> for read-only symbol
+    /// operations. The symbol cache is consulted before any LSP work, and the
+    /// language server is only started on true cache miss. Use this for
+    /// discovery tools (find_symbol, get_symbols_overview, find_referencing_symbols
+    /// symbol-lookup phase) so large repos (40k+ files) don't pay the 10+ minute
+    /// Roslyn startup cost when the answer is already on disk.
+    /// </summary>
+    protected Task<ISymbolRetriever> RequireReadOnlyRetrieverAsync(
+        string relativePath, CancellationToken ct = default)
+    {
+        string root = RequireProjectRoot();
+        string absPath = Path.GetFullPath(Path.Combine(root, relativePath));
+
+        // Determine language WITHOUT touching the LSP. If relativePath is a
+        // directory, probe it for the first analyzable file to pick a language;
+        // otherwise use the file's extension directly.
+        string languageProbePath = absPath;
+        if (Directory.Exists(absPath))
+        {
+            languageProbePath = Directory.EnumerateFiles(absPath, "*", SearchOption.AllDirectories)
+                .FirstOrDefault(LanguageServerSymbolRetriever.CanAnalyzeFile)
+                ?? absPath;
+        }
+
+        var language = Serena.Lsp.LanguageExtensions.FromFileExtension(Path.GetExtension(languageProbePath));
+        if (language is null)
+        {
+            // Unknown language: fall back to the LSP-starting retriever so the
+            // error path is consistent with the pre-refactor behavior.
+            return RequireSymbolRetrieverAsync(relativePath, ct);
+        }
+
+        var cache = Context.Agent.GetSymbolCache(language.Value);
+        var logger = Context.LoggerFactory.CreateLogger<LanguageServerSymbolRetriever>();
+
+        // Lazy LSP: only invoked if the retriever has a genuine cache miss.
+        async Task<Serena.Lsp.Client.LspClient> LspFactory(CancellationToken factoryCt)
+        {
+            return await Context.Agent.GetLanguageServerForFileAsync(languageProbePath, factoryCt)
+                ?? throw new InvalidOperationException(
+                    $"No language server available for '{relativePath}'. Ensure a language server is configured.");
+        }
+
+        ISymbolRetriever retriever = new LanguageServerSymbolRetriever(LspFactory, root, logger, cache);
+        return Task.FromResult(retriever);
     }
 
     /// <summary>
@@ -370,7 +418,7 @@ public abstract class ToolBase : ITool
                 $"No language server available for '{relativePath}'. Ensure a language server is configured.");
 
         var logger = Context.LoggerFactory.CreateLogger<LanguageServerCodeEditor>();
-        var cache = Context.Agent.GetSymbolCacheForLanguage(lsp.Language);
+        var cache = Context.Agent.GetSymbolCache(lsp.Language);
         var retriever = new LanguageServerSymbolRetriever(lsp, root,
             Context.LoggerFactory.CreateLogger<LanguageServerSymbolRetriever>(), cache);
         return new LanguageServerCodeEditor(retriever, lsp, root, logger);

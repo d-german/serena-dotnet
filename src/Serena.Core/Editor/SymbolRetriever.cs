@@ -316,7 +316,9 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
         [".cs", ".ts", ".tsx", ".js", ".jsx", ".py", ".java", ".go",
          ".rs", ".cpp", ".c", ".h", ".hpp", ".rb", ".swift", ".kt"];
 
-    private readonly LspClient _lsp;
+    private readonly Func<CancellationToken, Task<LspClient>> _lspFactory;
+    private LspClient? _resolvedLsp;
+    private readonly SemaphoreSlim _lspGate = new(1, 1);
     private readonly string _projectRoot;
     private readonly ILogger _logger;
     private readonly SymbolCache<UnifiedSymbolInformation[]>? _symbolCache;
@@ -331,14 +333,54 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
         return s_sourceExtensions.Any(e => string.Equals(ext, e, StringComparison.OrdinalIgnoreCase));
     }
 
+    /// <summary>
+    /// Constructs a retriever bound to an already-started LSP client. Cache-hit
+    /// paths still short-circuit without invoking the client.
+    /// </summary>
     public LanguageServerSymbolRetriever(
         LspClient lsp, string projectRoot, ILogger logger,
         SymbolCache<UnifiedSymbolInformation[]>? symbolCache = null)
+        : this(_ => Task.FromResult(lsp), projectRoot, logger, symbolCache)
     {
-        _lsp = lsp;
+        _resolvedLsp = lsp;
+    }
+
+    /// <summary>
+    /// Constructs a retriever with a lazy LSP factory. The factory is invoked
+    /// only when the request cannot be satisfied from the symbol cache,
+    /// enabling cache-first tools to avoid paying Roslyn startup cost on
+    /// large repos (10+ minutes for 40k-file solutions).
+    /// </summary>
+    public LanguageServerSymbolRetriever(
+        Func<CancellationToken, Task<LspClient>> lspFactory,
+        string projectRoot, ILogger logger,
+        SymbolCache<UnifiedSymbolInformation[]>? symbolCache = null)
+    {
+        _lspFactory = lspFactory;
         _projectRoot = Path.GetFullPath(projectRoot);
         _logger = logger;
         _symbolCache = symbolCache;
+    }
+
+    /// <summary>
+    /// Resolves the LSP client, invoking the factory on first use. Guarded so
+    /// concurrent cache-miss callers share a single startup.
+    /// </summary>
+    private async Task<LspClient> GetLspAsync(CancellationToken ct)
+    {
+        if (_resolvedLsp is not null)
+        {
+            return _resolvedLsp;
+        }
+        await _lspGate.WaitAsync(ct);
+        try
+        {
+            return _resolvedLsp ??= await _lspFactory(ct);
+        }
+        finally
+        {
+            _lspGate.Release();
+        }
     }
 
     public async Task<IReadOnlyList<LanguageServerSymbol>> GetSymbolsAsync(
@@ -369,11 +411,18 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
                 _logger.LogInformation(
                     "Symbol cache HIT (stale fingerprint) for {Path} — kicking background reindex",
                     relativePath);
-                _ = Task.Run(async () =>
+                // Only refresh in the background if LSP is already running. In
+                // lazy-LSP (cache-first) mode we deliberately do NOT start the
+                // LSP just to refresh a stale entry; the user can run
+                // `serena-dotnet project index` to rebuild.
+                if (TryGetRefresherIfLspRunning() is { } refresher)
                 {
-                    try { await GetRefresher().RefreshIfStaleAsync(absolutePath, CancellationToken.None); }
-                    catch (Exception ex) { _logger.LogDebug(ex, "Background reindex failed for {Path}", relativePath); }
-                }, CancellationToken.None);
+                    _ = Task.Run(async () =>
+                    {
+                        try { await refresher.RefreshIfStaleAsync(absolutePath, CancellationToken.None); }
+                        catch (Exception ex) { _logger.LogDebug(ex, "Background reindex failed for {Path}", relativePath); }
+                    }, CancellationToken.None);
+                }
                 return stale
                     .Select(s => LanguageServerSymbol.FromUnified(s, relativePath))
                     .ToList();
@@ -382,13 +431,14 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
             _logger.LogInformation("Symbol cache MISS for {Path} — falling through to LSP", relativePath);
         }
 
-        // Ensure file is open in LS
-        await _lsp.OpenFileAsync(absolutePath);
+        // Ensure file is open in LS (lazy: starts LSP if not already running)
+        var lsp = await GetLspAsync(ct);
+        await lsp.OpenFileAsync(absolutePath);
 
         // Honor the caller's cancellation token so MCP-side cancel actually
         // stops the LSP request and frees CPU. StreamJsonRpc will send
         // $/cancelRequest to Roslyn when the token fires.
-        var symbols = await _lsp.RequestDocumentSymbolsAsync(absolutePath, ct);
+        var symbols = await lsp.RequestDocumentSymbolsAsync(absolutePath, ct);
 
         // Populate cache
         if (_symbolCache is not null)
@@ -397,9 +447,7 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
             _symbolCache.Set(absolutePath, fingerprint, [.. symbols]);
         }
 
-        return symbols
-            .Select(s => LanguageServerSymbol.FromUnified(s, relativePath))
-            .ToList();
+        return [.. symbols.Select(s => LanguageServerSymbol.FromUnified(s, relativePath))];
     }
 
     public async Task<IReadOnlyList<LanguageServerSymbol>> FindSymbolsByNamePathAsync(
@@ -425,7 +473,10 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
             {
                 if (_symbolCache is not null && _symbolCache.Count > 0)
                 {
-                    _ = Task.Run(() => GetRefresher().RefreshIfStaleAsync(absPath, CancellationToken.None), CancellationToken.None);
+                    if (TryGetRefresherIfLspRunning() is { } dirRefresher)
+                    {
+                        _ = Task.Run(() => dirRefresher.RefreshIfStaleAsync(absPath, CancellationToken.None), CancellationToken.None);
+                    }
                     return SearchCachedSymbols(matcher, substringMatching, absPath);
                 }
                 return await SearchDirectoryAsync(absPath, matcher, substringMatching, ct);
@@ -439,7 +490,10 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
         // Fire refresh in background so the first call is instant; next call picks up any updates.
         if (_symbolCache is not null && _symbolCache.Count > 0)
         {
-            _ = Task.Run(() => GetRefresher().RefreshIfStaleAsync(scopeAbsPath: null, CancellationToken.None), CancellationToken.None);
+            if (TryGetRefresherIfLspRunning() is { } projRefresher)
+            {
+                _ = Task.Run(() => projRefresher.RefreshIfStaleAsync(scopeAbsPath: null, CancellationToken.None), CancellationToken.None);
+            }
             return SearchCachedSymbols(matcher, substringMatching, scopeAbsPath: null);
         }
 
@@ -458,18 +512,27 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
         return await SearchDirectoryAsync(_projectRoot, matcher, substringMatching, ct);
     }
 
-    private SymbolCacheRefresher GetRefresher()
+    /// <summary>
+    /// Returns the cache refresher ONLY if the LSP is already resolved/running.
+    /// In lazy-LSP (cache-first) mode we must never start the LSP just to
+    /// service a background refresh — the whole point of cache-first is to
+    /// avoid Roslyn startup when the cache can answer the query.
+    /// </summary>
+    private SymbolCacheRefresher? TryGetRefresherIfLspRunning()
     {
-        // Lazy: only allocate when we actually use the cache path.
-        return _refresher ??= SymbolCacheRefresher.ForLspClient(_projectRoot, _symbolCache!, _lsp, _logger);
+        if (_resolvedLsp is null || _symbolCache is null)
+        {
+            return null;
+        }
+        return _refresher ??= SymbolCacheRefresher.ForLspClient(_projectRoot, _symbolCache, _resolvedLsp, _logger);
     }
 
     private IReadOnlyList<LanguageServerSymbol> SearchCachedSymbols(
         NamePathMatcher matcher, bool substringMatching, string? scopeAbsPath)
     {
         var results = new List<LanguageServerSymbol>();
-        // Cache keys are normalized to forward slashes; normalize scope too.
-        string? scopeNormalized = scopeAbsPath?.Replace('\\', '/');
+        // Cache keys live in canonical (forward-slash) form; normalize scope the same way.
+        string? scopeNormalized = scopeAbsPath is null ? null : SymbolCacheKeys.Normalize(scopeAbsPath);
         foreach (string absPath in _symbolCache!.Keys)
         {
             // Filter to scoped directory when caller passed one
@@ -535,8 +598,9 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
         int line = symbol.Raw.SelectionRange?.Start.Line ?? symbol.BodyLocation.StartLine;
         int character = symbol.Raw.SelectionRange?.Start.Character ?? symbol.BodyLocation.StartColumn;
 
-        await _lsp.OpenFileAsync(absolutePath);
-        var locations = await _lsp.RequestReferencesAsync(absolutePath, line, character, ct: ct);
+        var lsp = await GetLspAsync(ct);
+        await lsp.OpenFileAsync(absolutePath);
+        var locations = await lsp.RequestReferencesAsync(absolutePath, line, character, ct: ct);
 
         // Cache document symbols per file to avoid redundant GetSymbolsAsync calls
         var symbolsByFile = new Dictionary<string, IReadOnlyList<LanguageServerSymbol>>();
@@ -729,10 +793,11 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
             .Where(s => s.BodyLocation is not null || s.Raw.SelectionRange is not null)
             .GroupBy(s => s.RelativePath);
 
+        var lsp = await GetLspAsync(ct);
         foreach (var group in byFile)
         {
             string absolutePath = Path.GetFullPath(Path.Combine(_projectRoot, group.Key));
-            await _lsp.OpenFileAsync(absolutePath);
+            await lsp.OpenFileAsync(absolutePath);
 
             foreach (var symbol in group)
             {
@@ -741,7 +806,7 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
 
                 try
                 {
-                    var hover = await _lsp.RequestHoverAsync(absolutePath, line, character, ct);
+                    var hover = await lsp.RequestHoverAsync(absolutePath, line, character, ct);
                     result[symbol] = ExtractHoverText(hover);
                 }
                 catch (Exception ex)

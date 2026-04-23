@@ -238,17 +238,12 @@ public sealed class SerenaAgent : IAsyncDisposable
     }
 
     /// <summary>
-    /// Gets the symbol cache for the specified language, or null if unavailable.
+    /// Gets the symbol cache for the specified language. Loads from disk on
+    /// demand WITHOUT starting a language server, so callers can serve from
+    /// cache before paying Roslyn startup cost on large repos. Returns null
+    /// when no cache file exists on disk.
     /// </summary>
-    public SymbolCache<UnifiedSymbolInformation[]>? GetSymbolCacheForLanguage(Language language) =>
-        _lsManager?.GetSymbolCache(language);
-
-    /// <summary>
-    /// Gets the symbol cache, loading from disk on demand WITHOUT starting
-    /// a language server. Use this on hot paths where we want to serve from
-    /// cache before paying the LSP startup cost.
-    /// </summary>
-    public SymbolCache<UnifiedSymbolInformation[]>? GetOrLoadSymbolCacheForLanguage(Language language) =>
+    public SymbolCache<UnifiedSymbolInformation[]>? GetSymbolCache(Language language) =>
         _lsManager?.GetOrLoadSymbolCache(language);
 
     /// <summary>

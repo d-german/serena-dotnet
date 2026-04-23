@@ -80,12 +80,11 @@ public sealed class SymbolCache<T>
     }
 
     /// <summary>
-    /// Normalizes a file path for use as a cache key. Replaces backslashes with
-    /// forward slashes so that keys are stable regardless of whether the caller
-    /// used Path.Combine (may produce mixed slashes on Windows) or
-    /// Path.GetFullPath (normalizes to backslashes on Windows).
+    /// Normalizes a file path for use as a cache key. Delegates to
+    /// <see cref="SymbolCacheKeys.Normalize"/> so the normalization rule lives
+    /// in exactly one (non-generic) place.
     /// </summary>
-    internal static string NormalizeKey(string filePath) => filePath.Replace('\\', '/');
+    public static string NormalizeKey(string filePath) => SymbolCacheKeys.Normalize(filePath);
 
     /// <summary>
     /// Saves the cache to disk if modified.
@@ -161,6 +160,21 @@ public sealed class SymbolCache<T>
 /// A single cached entry with its fingerprint for staleness detection.
 /// </summary>
 public sealed record CacheEntry<T>(string Fingerprint, T Data);
+
+/// <summary>
+/// Non-generic helpers for cache key handling. The symbol cache stores
+/// file-path keys in a canonical form (forward slashes, mixed case preserved)
+/// regardless of how they were produced (Path.Combine may leave mixed slashes
+/// on Windows; Path.GetFullPath produces backslashes). Keeping this rule in
+/// one place prevents callers from diverging and re-introducing lookup misses.
+/// </summary>
+public static class SymbolCacheKeys
+{
+    /// <summary>
+    /// Returns the canonical cache-key form of <paramref name="filePath"/>.
+    /// </summary>
+    public static string Normalize(string filePath) => filePath.Replace('\\', '/');
+}
 
 /// <summary>
 /// On-disk cache file format.

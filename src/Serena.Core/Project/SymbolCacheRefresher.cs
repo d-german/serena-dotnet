@@ -143,8 +143,8 @@ public sealed class SymbolCacheRefresher
         string? scopeAbsPath, CancellationToken ct)
     {
         var stale = new ConcurrentBag<string>();
-        // Normalize scope to match the cache's key normalization (forward slashes).
-        string? scopeNormalized = scopeAbsPath?.Replace('\\', '/');
+        // Cache keys live in canonical (forward-slash) form; normalize scope the same way.
+        string? scopeNormalized = scopeAbsPath is null ? null : SymbolCacheKeys.Normalize(scopeAbsPath);
         var keys = _cache.Keys
             .Where(k => scopeNormalized is null
                 || k.StartsWith(scopeNormalized, StringComparison.OrdinalIgnoreCase))
