@@ -48,13 +48,80 @@ public static class Program
         builder.Services
             .AddMcpServer()
             .WithStdioServerTransport()
-            .WithTools(SerenaMcpToolBridge.CreateMcpTools(toolRegistry));
+            .WithTools(SerenaMcpToolBridge.CreateMcpTools(toolRegistry, agent, loggerFactory));
 
         var app = builder.Build();
 
         await ActivateStartupProjectAsync(agent, config, projectToActivate, loggerFactory);
 
+        // Watch the parent process — when the MCP client (Codex, VS Code, etc.)
+        // exits, shut ourselves down so we don't leave Roslyn pinning CPU.
+        // The MCP SDK doesn't always propagate client cancel, so this is the
+        // safety net that prevents orphan CPU usage after the client closes.
+        StartParentProcessWatcher(app, loggerFactory.CreateLogger("ParentWatcher"));
+
         await app.RunAsync();
+    }
+
+    private static void StartParentProcessWatcher(IHost app, ILogger logger)
+    {
+        var parent = TryGetParentProcess();
+        if (parent is null)
+        {
+            logger.LogDebug("No parent process to watch.");
+            return;
+        }
+
+        logger.LogDebug("Watching parent process {Pid} ({Name})", parent.Id, parent.ProcessName);
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await parent.WaitForExitAsync();
+                logger.LogWarning("Parent process exited — shutting down MCP server.");
+            }
+            catch (Exception ex)
+            {
+                logger.LogDebug(ex, "Parent watcher error — shutting down anyway");
+            }
+
+            try
+            {
+                await app.StopAsync(TimeSpan.FromSeconds(5));
+            }
+            catch
+            {
+                // best-effort
+            }
+            Environment.Exit(0);
+        });
+    }
+
+    private static System.Diagnostics.Process? TryGetParentProcess()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            // Cross-platform parent-PID lookup is non-trivial; on non-Windows
+            // we rely on signals (SIGHUP/SIGTERM) caught by AppDomain.ProcessExit.
+            return null;
+        }
+
+        try
+        {
+            int pid = Environment.ProcessId;
+            using var query = new System.Management.ManagementObjectSearcher(
+                $"SELECT ParentProcessId FROM Win32_Process WHERE ProcessId = {pid}");
+            foreach (System.Management.ManagementObject mo in query.Get())
+            {
+                int parentPid = Convert.ToInt32(mo["ParentProcessId"]);
+                return System.Diagnostics.Process.GetProcessById(parentPid);
+            }
+        }
+        catch
+        {
+            // Parent may have already exited, or WMI unavailable
+        }
+        return null;
     }
 
     /// <summary>

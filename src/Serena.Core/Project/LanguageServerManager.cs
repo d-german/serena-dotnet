@@ -59,7 +59,8 @@ public sealed class LanguageServerManager : IAsyncDisposable
         var process = new LanguageServerProcess(
             launchInfo,
             language,
-            _loggerFactory.CreateLogger<LanguageServerProcess>());
+            _loggerFactory.CreateLogger<LanguageServerProcess>(),
+            GetLspRequestTimeout());
 
         var client = new LspClient(
             process,
@@ -85,6 +86,29 @@ public sealed class LanguageServerManager : IAsyncDisposable
     /// </summary>
     public SymbolCache<UnifiedSymbolInformation[]>? GetSymbolCache(Language language) =>
         _caches.GetValueOrDefault(language);
+
+    /// <summary>
+    /// Gets the symbol cache for a language, loading it from disk if needed.
+    /// Does NOT start a language server — safe to call on the hot path of a
+    /// cache-only lookup. Returns null only if no cache file exists on disk.
+    /// </summary>
+    public SymbolCache<UnifiedSymbolInformation[]>? GetOrLoadSymbolCache(Language language)
+    {
+        if (_caches.TryGetValue(language, out var existing))
+        {
+            return existing;
+        }
+        EnsureSymbolCache(language);
+        var cache = _caches.GetValueOrDefault(language);
+        // EnsureSymbolCache always inserts an entry but Load() may have returned
+        // false if the cache file doesn't exist. Report null in that case so the
+        // caller can fall through to LSP without thinking the cache is empty-but-real.
+        if (cache is not null && cache.Count == 0)
+        {
+            return null;
+        }
+        return cache;
+    }
 
     /// <summary>
     /// Stops a specific language server.
@@ -140,6 +164,43 @@ public sealed class LanguageServerManager : IAsyncDisposable
         _clients.Clear();
     }
 
+    /// <summary>
+    /// Force-kills all running language server processes immediately, bypassing
+    /// LSP shutdown handshake. Use when servers are hung or burning CPU.
+    /// Caches are still flushed to disk.
+    /// </summary>
+    public void ForceKillAll()
+    {
+        foreach (var (_, cache) in _caches)
+        {
+            try { cache.Save(); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Error saving symbol cache"); }
+        }
+        _caches.Clear();
+
+        foreach (var (language, client) in _clients.ToList())
+        {
+            try { client.ForceKill(); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Error force-killing LS for {Language}", language); }
+        }
+        _clients.Clear();
+    }
+
+    /// <summary>
+    /// Returns the per-LSP-request timeout. Reads SERENA_LSP_REQUEST_TIMEOUT_SECONDS
+    /// env var (clamped to 10..3600). Default: 300 seconds (5 min).
+    /// Protects against truly hung Roslyn calls while allowing slow uncached
+    /// symbol requests on very large repos to complete.
+    /// </summary>
+    private static TimeSpan GetLspRequestTimeout()
+    {
+        string? raw = Environment.GetEnvironmentVariable("SERENA_LSP_REQUEST_TIMEOUT_SECONDS");
+        if (int.TryParse(raw, out int value))
+        {
+            return TimeSpan.FromSeconds(Math.Clamp(value, 10, 3600));
+        }
+        return TimeSpan.FromSeconds(300);
+    }
     private void EnsureSymbolCache(Language language)
     {
         if (_caches.ContainsKey(language))

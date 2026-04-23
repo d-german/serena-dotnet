@@ -1,6 +1,7 @@
-// Symbol Caching Subsystem - Ported from solidlsp/ls.py cache methods + solidlsp/util/cache.py
+﻿// Symbol Caching Subsystem - Ported from solidlsp/ls.py cache methods + solidlsp/util/cache.py
 // Phase 3C: Cache persistence, fingerprinting, invalidation
 
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -19,8 +20,8 @@ public sealed class SymbolCache<T>
     private readonly int _cacheVersion;
     private readonly ILogger _logger;
 
-    private Dictionary<string, CacheEntry<T>> _entries = [];
-    private bool _isModified;
+    private ConcurrentDictionary<string, CacheEntry<T>> _entries = new(StringComparer.OrdinalIgnoreCase);
+    private volatile bool _isModified;
 
     public SymbolCache(string cacheDir, string cacheFilename, int cacheVersion, ILogger logger)
     {
@@ -36,8 +37,22 @@ public sealed class SymbolCache<T>
     /// </summary>
     public T? TryGet(string filePath, string currentFingerprint)
     {
-        if (_entries.TryGetValue(filePath, out var entry)
+        if (_entries.TryGetValue(NormalizeKey(filePath), out var entry)
             && entry.Fingerprint == currentFingerprint)
+        {
+            return entry.Data;
+        }
+        return default;
+    }
+
+    /// <summary>
+    /// Returns the cached value WITHOUT validating the fingerprint.
+    /// Use only for bulk operations where stale data is acceptable
+    /// (e.g., project-wide symbol search where false positives are tolerable).
+    /// </summary>
+    public T? TryGetUnchecked(string filePath)
+    {
+        if (_entries.TryGetValue(NormalizeKey(filePath), out var entry))
         {
             return entry.Data;
         }
@@ -49,7 +64,7 @@ public sealed class SymbolCache<T>
     /// </summary>
     public void Set(string filePath, string fingerprint, T data)
     {
-        _entries[filePath] = new CacheEntry<T>(fingerprint, data);
+        _entries[NormalizeKey(filePath)] = new CacheEntry<T>(fingerprint, data);
         _isModified = true;
     }
 
@@ -58,11 +73,19 @@ public sealed class SymbolCache<T>
     /// </summary>
     public void Remove(string filePath)
     {
-        if (_entries.Remove(filePath))
+        if (_entries.TryRemove(NormalizeKey(filePath), out _))
         {
             _isModified = true;
         }
     }
+
+    /// <summary>
+    /// Normalizes a file path for use as a cache key. Replaces backslashes with
+    /// forward slashes so that keys are stable regardless of whether the caller
+    /// used Path.Combine (may produce mixed slashes on Windows) or
+    /// Path.GetFullPath (normalizes to backslashes on Windows).
+    /// </summary>
+    internal static string NormalizeKey(string filePath) => filePath.Replace('\\', '/');
 
     /// <summary>
     /// Saves the cache to disk if modified.
@@ -78,7 +101,7 @@ public sealed class SymbolCache<T>
         {
             Directory.CreateDirectory(_cacheDir);
             string path = Path.Combine(_cacheDir, _cacheFilename);
-            var wrapper = new CacheFile<T>(_cacheVersion, _entries);
+            var wrapper = new CacheFile<T>(_cacheVersion, new Dictionary<string, CacheEntry<T>>(_entries));
             string json = JsonSerializer.Serialize(wrapper, CacheJsonOptions.Default);
             File.WriteAllText(path, json, Encoding.UTF8);
             _isModified = false;
@@ -111,7 +134,10 @@ public sealed class SymbolCache<T>
                 return false;
             }
 
-            _entries = wrapper.Entries;
+            _entries = new ConcurrentDictionary<string, CacheEntry<T>>(
+                wrapper.Entries.Select(kv =>
+                    new KeyValuePair<string, CacheEntry<T>>(NormalizeKey(kv.Key), kv.Value)),
+                StringComparer.OrdinalIgnoreCase);
             _isModified = false;
             _logger.LogDebug("Loaded cache {File} ({Count} entries)", _cacheFilename, _entries.Count);
             return true;
@@ -124,6 +150,11 @@ public sealed class SymbolCache<T>
     }
 
     public int Count => _entries.Count;
+
+    /// <summary>
+    /// Returns a snapshot of all cached file paths.
+    /// </summary>
+    public IReadOnlyCollection<string> Keys => [.. _entries.Keys];
 }
 
 /// <summary>

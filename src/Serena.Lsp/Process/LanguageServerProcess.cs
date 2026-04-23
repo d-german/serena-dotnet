@@ -2,6 +2,7 @@
 // Phase 2A: Process spawning, StreamJsonRpc transport, shutdown
 // StreamJsonRpc replaces ~400 lines of manual JSON-RPC framing from Python
 
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
@@ -23,6 +24,53 @@ public sealed class LanguageServerProcess : IAsyncDisposable
     private readonly Language _language;
     private readonly ILogger _logger;
     private readonly TimeSpan? _requestTimeout;
+
+    /// <summary>
+    /// Tracks all live LSP child processes so we can force-kill them if our own
+    /// process is shut down without DisposeAsync running (e.g., VS Code force-killing
+    /// the MCP stdio server). Keyed by PID.
+    /// </summary>
+    private static readonly ConcurrentDictionary<int, System.Diagnostics.Process> s_liveProcesses = new();
+    private static int s_exitHandlerInstalled;
+
+    private static void EnsureExitHandlerInstalled()
+    {
+        if (Interlocked.Exchange(ref s_exitHandlerInstalled, 1) != 0)
+        {
+            return;
+        }
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => KillAllTrackedProcesses();
+        AppDomain.CurrentDomain.UnhandledException += (_, _) => KillAllTrackedProcesses();
+    }
+
+    private static void KillAllTrackedProcesses() => KillAllLiveProcesses();
+
+    /// <summary>
+    /// Immediately kills every tracked language server process tree.
+    /// Safe to call from any thread; intended for "drop CPU now" cancel paths.
+    /// Returns the number of processes that were alive when killed.
+    /// </summary>
+    public static int KillAllLiveProcesses()
+    {
+        int killed = 0;
+        foreach (var kvp in s_liveProcesses)
+        {
+            try
+            {
+                if (!kvp.Value.HasExited)
+                {
+                    kvp.Value.Kill(entireProcessTree: true);
+                    killed++;
+                }
+            }
+            catch
+            {
+                // best-effort cleanup
+            }
+        }
+        s_liveProcesses.Clear();
+        return killed;
+    }
 
     private System.Diagnostics.Process? _process;
     private JsonRpc? _rpc;
@@ -117,6 +165,10 @@ public sealed class LanguageServerProcess : IAsyncDisposable
             throw new InvalidOperationException(
                 $"Language server process failed to start: {command} {arguments}");
         }
+
+        // Track this process for emergency cleanup if our process dies abruptly.
+        EnsureExitHandlerInstalled();
+        s_liveProcesses[_process.Id] = _process;
 
         // Set up StreamJsonRpc over stdin/stdout with LSP Content-Length framing.
         // Use JsonMessageFormatter (Newtonsoft.Json) with camelCase for LSP compatibility.
@@ -354,7 +406,11 @@ public sealed class LanguageServerProcess : IAsyncDisposable
             }
         }
 
-        _process?.Dispose();
+        if (_process is not null)
+        {
+            s_liveProcesses.TryRemove(_process.Id, out _);
+            _process.Dispose();
+        }
     }
 
     private void EnsureRunning()
@@ -440,6 +496,10 @@ public sealed class LanguageServerProcess : IAsyncDisposable
         catch (Exception)
         {
             // Best-effort cleanup
+        }
+        finally
+        {
+            s_liveProcesses.TryRemove(process.Id, out _);
         }
     }
 

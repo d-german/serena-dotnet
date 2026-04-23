@@ -30,6 +30,11 @@ public class SearchFilterTests : IDisposable
         File.WriteAllText(Path.Combine(_tempDir, "style.min.js"), "function Run(){}");
         File.WriteAllText(Path.Combine(_tempDir, "utils.py"), "def Run(): pass");
 
+        // Path-style glob target: ensure includeGlob with directory components works.
+        string subDir = Path.Combine(_tempDir, "src", "sub");
+        Directory.CreateDirectory(subDir);
+        File.WriteAllText(Path.Combine(subDir, "nested.cs"), "class Nested { void Run() { } }");
+
         var loggerFactory = NullLoggerFactory.Instance;
         var config = new SerenaConfig(NullLogger<SerenaConfig>.Instance);
         var lsRegistry = new LanguageServerRegistry();
@@ -56,6 +61,22 @@ public class SearchFilterTests : IDisposable
         Assert.Contains("app.cs", result);
         Assert.DoesNotContain("data.json", result);
         Assert.DoesNotContain("style.min.js", result);
+    }
+
+    [Fact]
+    public async Task IncludeGlob_PathStyleGlob_MatchesNestedFile()
+    {
+        // Regression: paths_include_glob containing directory components (e.g.
+        // "src/sub/*.cs") was previously matched against bare filenames only,
+        // which caused such globs to silently return zero matches.
+        var result = await _searchTool.ExecuteAsync(new Dictionary<string, object?>
+        {
+            ["substring_pattern"] = "Run",
+            ["paths_include_glob"] = "src/sub/*.cs",
+        });
+
+        Assert.Contains("nested.cs", result);
+        Assert.DoesNotContain("app.cs", result);
     }
 
     [Fact]

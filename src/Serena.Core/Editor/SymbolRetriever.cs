@@ -1,10 +1,12 @@
-﻿// SymbolRetriever - Phase D1
+// SymbolRetriever - Phase D1
 // Bridge between tools and LspClient for symbol operations.
 // Ported from serena/symbol.py LanguageServerSymbol & LanguageServerSymbolRetriever
 
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
+using Serena.Core.Project;
 using Serena.Lsp.Caching;
 using Serena.Lsp.Client;
 using Serena.Lsp.Protocol.Types;
@@ -318,6 +320,7 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
     private readonly string _projectRoot;
     private readonly ILogger _logger;
     private readonly SymbolCache<UnifiedSymbolInformation[]>? _symbolCache;
+    private SymbolCacheRefresher? _refresher;
 
     /// <summary>
     /// Returns true if the file has an extension recognized as analyzable source code.
@@ -343,22 +346,48 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
     {
         string absolutePath = Path.GetFullPath(Path.Combine(_projectRoot, relativePath));
 
-        // Check cache first
+        // Cache-first: if we have the file cached, serve it immediately.
+        // On fingerprint mismatch we still serve the cached data (stale is
+        // acceptable for overview) but trigger a background reindex so the
+        // next call is fresh. This matches FindSymbolsByNamePathAsync.
         if (_symbolCache is not null)
         {
             string fingerprint = CacheFingerprint.ForFile(absolutePath);
             var cached = _symbolCache.TryGet(absolutePath, fingerprint);
             if (cached is not null)
             {
+                _logger.LogDebug("Symbol cache HIT (fresh) for {Path}", relativePath);
                 return cached
                     .Select(s => LanguageServerSymbol.FromUnified(s, relativePath))
                     .ToList();
             }
+
+            // Fingerprint miss but we still have an entry: serve stale + background refresh.
+            var stale = _symbolCache.TryGetUnchecked(absolutePath);
+            if (stale is not null)
+            {
+                _logger.LogInformation(
+                    "Symbol cache HIT (stale fingerprint) for {Path} — kicking background reindex",
+                    relativePath);
+                _ = Task.Run(async () =>
+                {
+                    try { await GetRefresher().RefreshIfStaleAsync(absolutePath, CancellationToken.None); }
+                    catch (Exception ex) { _logger.LogDebug(ex, "Background reindex failed for {Path}", relativePath); }
+                }, CancellationToken.None);
+                return stale
+                    .Select(s => LanguageServerSymbol.FromUnified(s, relativePath))
+                    .ToList();
+            }
+
+            _logger.LogInformation("Symbol cache MISS for {Path} — falling through to LSP", relativePath);
         }
 
         // Ensure file is open in LS
         await _lsp.OpenFileAsync(absolutePath);
 
+        // Honor the caller's cancellation token so MCP-side cancel actually
+        // stops the LSP request and frees CPU. StreamJsonRpc will send
+        // $/cancelRequest to Roslyn when the token fires.
         var symbols = await _lsp.RequestDocumentSymbolsAsync(absolutePath, ct);
 
         // Populate cache
@@ -389,17 +418,80 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
                 return MatchSymbols(symbols, matcher, substringMatching);
             }
 
-            // Search within a directory
+            // Search within a directory — prefer cache when populated to avoid
+            // waking Roslyn for thousands of files. Cache may be slightly stale;
+            // fire refresh in the background and serve from cache immediately.
             if (Directory.Exists(absPath))
             {
+                if (_symbolCache is not null && _symbolCache.Count > 0)
+                {
+                    _ = Task.Run(() => GetRefresher().RefreshIfStaleAsync(absPath, CancellationToken.None), CancellationToken.None);
+                    return SearchCachedSymbols(matcher, substringMatching, absPath);
+                }
                 return await SearchDirectoryAsync(absPath, matcher, substringMatching, ct);
             }
 
             return [];
         }
 
-        // Search entire project
+        // Project-wide search: prefer the symbol cache (built by `serena-dotnet project index`)
+        // to avoid flooding the LSP with thousands of concurrent document-symbol requests.
+        // Fire refresh in background so the first call is instant; next call picks up any updates.
+        if (_symbolCache is not null && _symbolCache.Count > 0)
+        {
+            _ = Task.Run(() => GetRefresher().RefreshIfStaleAsync(scopeAbsPath: null, CancellationToken.None), CancellationToken.None);
+            return SearchCachedSymbols(matcher, substringMatching, scopeAbsPath: null);
+        }
+
+        // No cache available — guard against catastrophic CPU usage on large repos.
+        // Count source files; if too many, refuse with actionable guidance.
+        const int LargeRepoThreshold = 2000;
+        int fileCount = EnumerateSourceFiles(_projectRoot).Take(LargeRepoThreshold + 1).Count();
+        if (fileCount > LargeRepoThreshold)
+        {
+            throw new InvalidOperationException(
+                $"Project-wide find_symbol on a large repo ({fileCount}+ source files) is disabled " +
+                $"to prevent CPU overload. Either: (1) run 'serena-dotnet project index .' first to " +
+                $"populate the symbol cache, or (2) pass a 'relative_path' to scope the search.");
+        }
+
         return await SearchDirectoryAsync(_projectRoot, matcher, substringMatching, ct);
+    }
+
+    private SymbolCacheRefresher GetRefresher()
+    {
+        // Lazy: only allocate when we actually use the cache path.
+        return _refresher ??= SymbolCacheRefresher.ForLspClient(_projectRoot, _symbolCache!, _lsp, _logger);
+    }
+
+    private IReadOnlyList<LanguageServerSymbol> SearchCachedSymbols(
+        NamePathMatcher matcher, bool substringMatching, string? scopeAbsPath)
+    {
+        var results = new List<LanguageServerSymbol>();
+        // Cache keys are normalized to forward slashes; normalize scope too.
+        string? scopeNormalized = scopeAbsPath?.Replace('\\', '/');
+        foreach (string absPath in _symbolCache!.Keys)
+        {
+            // Filter to scoped directory when caller passed one
+            if (scopeNormalized is not null &&
+                !absPath.StartsWith(scopeNormalized, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            // Skip fingerprint validation for bulk search — 43K stat calls
+            // would take >60s on Windows. Stale entries are acceptable for
+            // discovery; the auto-reindexer keeps the cache fresh between calls.
+            var cached = _symbolCache.TryGetUnchecked(absPath);
+            if (cached is null)
+            {
+                continue;
+            }
+            string relPath = Path.GetRelativePath(_projectRoot, absPath).Replace('\\', '/');
+            var symbols = cached.Select(s => LanguageServerSymbol.FromUnified(s, relPath)).ToList();
+            results.AddRange(MatchSymbols(symbols, matcher, substringMatching));
+        }
+        return results;
     }
 
     public Task<string?> GetSymbolBodyAsync(
@@ -556,58 +648,57 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
         string relativeDirPath, int depth = 0, CancellationToken ct = default)
     {
         string absDir = Path.GetFullPath(Path.Combine(_projectRoot, relativeDirPath));
-        var result = new Dictionary<string, Dictionary<string, List<Dictionary<string, object?>>>>();
+        var result = new ConcurrentDictionary<string, Dictionary<string, List<Dictionary<string, object?>>>>();
+        var files = EnumerateSourceFiles(absDir).ToList();
 
-        foreach (string filePath in EnumerateSourceFiles(absDir))
-        {
-            if (ct.IsCancellationRequested)
+        await Parallel.ForEachAsync(files,
+            new ParallelOptions { MaxDegreeOfParallelism = GetParallelism(), CancellationToken = ct },
+            async (filePath, token) =>
             {
-                break;
-            }
-
-            string relPath = Path.GetRelativePath(_projectRoot, filePath).Replace('\\', '/');
-            try
-            {
-                var overview = await GetSymbolOverviewAsync(relPath, depth, ct);
-                if (overview.Count > 0)
+                string relPath = Path.GetRelativePath(_projectRoot, filePath).Replace('\\', '/');
+                try
                 {
-                    result[relPath] = overview;
+                    var overview = await GetSymbolOverviewAsync(relPath, depth, token);
+                    if (overview.Count > 0)
+                    {
+                        result[relPath] = overview;
+                    }
                 }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Failed to get symbol overview for {Path}", relPath);
-            }
-        }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Failed to get symbol overview for {Path}", relPath);
+                }
+            });
 
-        return result;
+        return new Dictionary<string, Dictionary<string, List<Dictionary<string, object?>>>>(result);
     }
 
     private async Task<IReadOnlyList<LanguageServerSymbol>> SearchDirectoryAsync(
         string directory, NamePathMatcher matcher, bool substringMatching, CancellationToken ct)
     {
-        var results = new List<LanguageServerSymbol>();
+        var results = new ConcurrentBag<LanguageServerSymbol>();
+        var files = EnumerateSourceFiles(directory).ToList();
 
-        foreach (string filePath in EnumerateSourceFiles(directory))
-        {
-            if (ct.IsCancellationRequested)
+        await Parallel.ForEachAsync(files,
+            new ParallelOptions { MaxDegreeOfParallelism = GetParallelism(), CancellationToken = ct },
+            async (filePath, token) =>
             {
-                break;
-            }
+                string relPath = Path.GetRelativePath(_projectRoot, filePath).Replace('\\', '/');
+                try
+                {
+                    var symbols = await GetSymbolsAsync(relPath, token);
+                    foreach (var match in MatchSymbols(symbols, matcher, substringMatching))
+                    {
+                        results.Add(match);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Failed to get symbols for {Path}", relPath);
+                }
+            });
 
-            string relPath = Path.GetRelativePath(_projectRoot, filePath).Replace('\\', '/');
-            try
-            {
-                var symbols = await GetSymbolsAsync(relPath, ct);
-                results.AddRange(MatchSymbols(symbols, matcher, substringMatching));
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Failed to get symbols for {Path}", relPath);
-            }
-        }
-
-        return results;
+        return [.. results];
     }
 
     private static List<LanguageServerSymbol> MatchSymbols(
@@ -694,6 +785,20 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
         return hover.Contents.ToString();
     }
 
+    /// <summary>
+    /// Returns the max degree of parallelism for LSP-backed directory operations.
+    /// Reads the SERENA_LSP_PARALLELISM env var (clamped to 1-16). Default: 2.
+    /// Higher values flood Roslyn and peg CPUs; 2 is a balanced default.
+    /// </summary>
+    private static int GetParallelism()
+    {
+        string? raw = Environment.GetEnvironmentVariable("SERENA_LSP_PARALLELISM");
+        if (int.TryParse(raw, out int value))
+        {
+            return Math.Clamp(value, 1, 16);
+        }
+        return 2;
+    }
     private IEnumerable<string> EnumerateSourceFiles(string directory)
     {
         return Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories)

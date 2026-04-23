@@ -1,6 +1,7 @@
-// File Tools - Phase 6B
+﻿// File Tools - Phase 6B
 // Tools for file operations: read_file, create_text_file, list_dir, find_file, search_for_pattern
 
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.RegularExpressions;
 using Serena.Core.Editor;
@@ -44,14 +45,7 @@ public sealed class ReadFileTool : ToolBase
         }
 
         string result = string.Join('\n', lines);
-        if (maxChars > 0 && result.Length > maxChars)
-        {
-            throw new InvalidOperationException(
-                $"File content ({result.Length} chars) exceeds max_answer_chars ({maxChars}). " +
-                "Use start_line/end_line to read specific sections.");
-        }
-
-        return result;
+        return LimitLength(result, maxChars);
     }
 }
 
@@ -222,12 +216,14 @@ public sealed class SearchForPatternTool : ToolBase
 
         if (!string.IsNullOrEmpty(includeGlob))
         {
-            files = files.Where(f => FileSystemHelpers.MatchesGlob(Path.GetFileName(f), includeGlob));
+            files = files.Where(f => FileSystemHelpers.MatchesGlob(
+                Path.GetRelativePath(projectRoot, f).Replace('\\', '/'), includeGlob));
         }
 
         if (!string.IsNullOrEmpty(excludeGlob))
         {
-            files = files.Where(f => !FileSystemHelpers.MatchesGlob(Path.GetFileName(f), excludeGlob));
+            files = files.Where(f => !FileSystemHelpers.MatchesGlob(
+                Path.GetRelativePath(projectRoot, f).Replace('\\', '/'), excludeGlob));
         }
 
         if (codeFilesOnly)
@@ -242,24 +238,36 @@ public sealed class SearchForPatternTool : ToolBase
         IEnumerable<string> filesToSearch, Regex regex, int contextBefore, int contextAfter,
         string projectRoot, CancellationToken ct)
     {
-        var results = new Dictionary<string, List<string>>();
+        var results = new ConcurrentDictionary<string, List<string>>();
+        // Parallel scanning: file I/O + regex are CPU/IO bound; high parallelism
+        // is safe here (no LSP involvement). Default to ProcessorCount, override
+        // with SERENA_SEARCH_PARALLELISM env var (clamped 1-32).
+        int parallelism = GetSearchParallelism();
 
-        foreach (string filePath in filesToSearch)
+        await Parallel.ForEachAsync(
+            filesToSearch,
+            new ParallelOptions { MaxDegreeOfParallelism = parallelism, CancellationToken = ct },
+            async (filePath, token) =>
+            {
+                var fileMatches = await FindMatchesInFileAsync(filePath, regex, contextBefore, contextAfter, token);
+                if (fileMatches is not null)
+                {
+                    string rel = Path.GetRelativePath(projectRoot, filePath).Replace('\\', '/');
+                    results[rel] = fileMatches;
+                }
+            });
+
+        return new Dictionary<string, List<string>>(results);
+    }
+
+    private static int GetSearchParallelism()
+    {
+        string? raw = Environment.GetEnvironmentVariable("SERENA_SEARCH_PARALLELISM");
+        if (int.TryParse(raw, out int value))
         {
-            if (ct.IsCancellationRequested)
-            {
-                break;
-            }
-
-            var fileMatches = await FindMatchesInFileAsync(filePath, regex, contextBefore, contextAfter, ct);
-            if (fileMatches is not null)
-            {
-                string rel = Path.GetRelativePath(projectRoot, filePath).Replace('\\', '/');
-                results[rel] = fileMatches;
-            }
+            return Math.Clamp(value, 1, 32);
         }
-
-        return results;
+        return Math.Min(Environment.ProcessorCount, 16);
     }
 
     private async Task<List<string>?> FindMatchesInFileAsync(

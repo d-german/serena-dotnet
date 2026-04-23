@@ -244,6 +244,19 @@ public sealed class SerenaAgent : IAsyncDisposable
         _lsManager?.GetSymbolCache(language);
 
     /// <summary>
+    /// Gets the symbol cache, loading from disk on demand WITHOUT starting
+    /// a language server. Use this on hot paths where we want to serve from
+    /// cache before paying the LSP startup cost.
+    /// </summary>
+    public SymbolCache<UnifiedSymbolInformation[]>? GetOrLoadSymbolCacheForLanguage(Language language) =>
+        _lsManager?.GetOrLoadSymbolCache(language);
+
+    /// <summary>
+    /// Project root for the active project, or null if none activated.
+    /// </summary>
+    public string? ActiveProjectRoot => _activeProject?.Root;
+
+    /// <summary>
     /// Sets the active mode.
     /// </summary>
     public void SetMode(SerenaAgentMode mode)
@@ -343,6 +356,37 @@ public sealed class SerenaAgent : IAsyncDisposable
             {
                 _lsManager = null;
                 _logger.LogWarning("No active project; language server manager cleared");
+            }
+        }
+        finally
+        {
+            _projectLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Force-kills the language server processes WITHOUT graceful shutdown.
+    /// Use when a tool is cancelled and Roslyn is burning CPU — graceful
+    /// shutdown can wait 10+ seconds for an unresponsive server.
+    /// </summary>
+    public async Task ForceResetLanguageServerManagerAsync()
+    {
+        await _projectLock.WaitAsync();
+        try
+        {
+            _lsManager?.ForceKillAll();
+
+            if (_activeProject is not null)
+            {
+                _lsManager = new Project.LanguageServerManager(
+                    _activeProject.Root,
+                    _lsRegistry,
+                    _loggerFactory);
+                _logger.LogWarning("Language server manager has been force-reset");
+            }
+            else
+            {
+                _lsManager = null;
             }
         }
         finally

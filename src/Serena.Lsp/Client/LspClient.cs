@@ -456,6 +456,18 @@ public sealed class LspClient : IAsyncDisposable
         await _process.DisposeAsync();
     }
 
+    /// <summary>
+    /// Force-kills the language server process tree without waiting for LSP shutdown.
+    /// Use when the server is hung or burning CPU and a graceful stop would block.
+    /// </summary>
+    public void ForceKill()
+    {
+        _logger.LogWarning("Force-killing language server [{Language}]", _language);
+        _serverStarted = false;
+        _fileBuffers.Clear();
+        _process.ForceStop();
+    }
+
     // --- Utility Methods ---
 
     /// <summary>

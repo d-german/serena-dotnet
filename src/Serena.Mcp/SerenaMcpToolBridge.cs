@@ -2,8 +2,10 @@
 // Dynamically bridges Serena ITool instances to MCP SDK McpServerTool instances.
 
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
+using Serena.Core.Agent;
 using Serena.Core.Tools;
 
 namespace Serena.Mcp;
@@ -17,8 +19,11 @@ public static class SerenaMcpToolBridge
     /// <summary>
     /// Creates MCP server tools from all tools in a Serena ToolRegistry.
     /// </summary>
-    public static IReadOnlyList<McpServerTool> CreateMcpTools(ToolRegistry registry) =>
-        registry.All.Select(tool => (McpServerTool)new SerenaMcpServerTool(tool)).ToList();
+    public static IReadOnlyList<McpServerTool> CreateMcpTools(
+        ToolRegistry registry, SerenaAgent agent, ILoggerFactory loggerFactory) =>
+        registry.All.Select(tool =>
+            (McpServerTool)new SerenaMcpServerTool(tool, agent, loggerFactory.CreateLogger<SerenaMcpServerTool>()))
+            .ToList();
 }
 
 /// <summary>
@@ -29,11 +34,15 @@ public static class SerenaMcpToolBridge
 internal sealed class SerenaMcpServerTool : McpServerTool
 {
     private readonly ITool _tool;
+    private readonly SerenaAgent _agent;
+    private readonly ILogger _logger;
     private readonly Tool _protocolTool;
 
-    public SerenaMcpServerTool(ITool tool)
+    public SerenaMcpServerTool(ITool tool, SerenaAgent agent, ILogger logger)
     {
         _tool = tool;
+        _agent = agent;
+        _logger = logger;
 
         using var schemaDoc = ToolBase.GenerateJsonSchema(tool.Parameters);
         _protocolTool = new Tool
@@ -61,15 +70,62 @@ internal sealed class SerenaMcpServerTool : McpServerTool
             }
         }
 
-        // Use ITool.ExecuteAsync to go through the hook pipeline (ExecuteSafeAsync bypasses hooks).
-        string output = await _tool.ExecuteAsync(arguments, ct);
-        bool isError = output.StartsWith("Error:", StringComparison.Ordinal);
+        // Apply per-tool timeout from env var (default 90s, under most MCP client caps).
+        TimeSpan timeout = GetToolTimeout();
+        using var timeoutCts = new CancellationTokenSource(timeout);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
 
-        return new CallToolResult
+        try
         {
-            Content = [new TextContentBlock { Text = output }],
-            IsError = isError,
-        };
+            string output = await _tool.ExecuteAsync(arguments, linked.Token);
+            bool isError = output.StartsWith("Error:", StringComparison.Ordinal);
+            return new CallToolResult
+            {
+                Content = [new TextContentBlock { Text = output }],
+                IsError = isError,
+            };
+        }
+        catch (OperationCanceledException)
+        {
+            // The caller cancelled OR our timeout fired. Roslyn often ignores LSP
+            // cancel during compilation, so force-restart the LS to actually free CPU.
+            bool timedOut = timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested;
+            string reason = timedOut
+                ? $"timed out after {timeout.TotalSeconds:0}s (SERENA_TOOL_TIMEOUT_SECONDS)"
+                : "cancelled by caller";
+            _logger.LogWarning("Tool '{Tool}' {Reason} — restarting LSP to release CPU.", _tool.Name, reason);
+
+            // Kill Roslyn process tree IMMEDIATELY (synchronous) so CPU drops before
+            // we even return from this method. Don't wait on the agent lock.
+            int killed = Serena.Lsp.Process.LanguageServerProcess.KillAllLiveProcesses();
+            if (killed > 0)
+            {
+                _logger.LogWarning("Force-killed {Count} live LSP process tree(s) on cancel.", killed);
+            }
+
+            // Then asynchronously rebuild the manager state so the next call works.
+            _ = Task.Run(async () =>
+            {
+                try { await _agent.ForceResetLanguageServerManagerAsync(); }
+                catch (Exception ex) { _logger.LogWarning(ex, "LSP force-reset failed after cancel"); }
+            });
+
+            return new CallToolResult
+            {
+                Content = [new TextContentBlock { Text = $"Error: tool '{_tool.Name}' {reason}. Language server is being restarted." }],
+                IsError = true,
+            };
+        }
+    }
+
+    private static TimeSpan GetToolTimeout()
+    {
+        string? raw = Environment.GetEnvironmentVariable("SERENA_TOOL_TIMEOUT_SECONDS");
+        if (int.TryParse(raw, out int value))
+        {
+            return TimeSpan.FromSeconds(Math.Clamp(value, 5, 3600));
+        }
+        return TimeSpan.FromSeconds(90);
     }
 
     /// <summary>

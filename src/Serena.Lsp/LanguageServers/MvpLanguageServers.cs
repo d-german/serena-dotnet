@@ -23,11 +23,17 @@ public sealed class CSharpLanguageServer : LanguageServerDefinition
     public override ProcessLaunchInfo CreateLaunchInfo(string projectRoot, CustomLsSettings settings)
     {
         string? explicitPath = settings.GetSetting("server_path");
+        // Opt-in: only pass --clientProcessId when SERENA_LSP_PASS_CLIENT_PID=1
+        // (some wrappers like SofusA/roslyn-language-server may not forward unknown args).
+        bool passPid = Environment.GetEnvironmentVariable("SERENA_LSP_PASS_CLIENT_PID") == "1";
+        string[] extraArgs = passPid
+            ? [$"--clientProcessId={Environment.ProcessId}"]
+            : [];
         if (explicitPath is not null)
         {
             return new ProcessLaunchInfo
             {
-                Command = [explicitPath, "--stdio"],
+                Command = [explicitPath, "--stdio", .. extraArgs],
                 WorkingDirectory = projectRoot,
             };
         }
@@ -45,7 +51,7 @@ public sealed class CSharpLanguageServer : LanguageServerDefinition
         {
             return new ProcessLaunchInfo
             {
-                Command = [roslynPath, "--stdio"],
+                Command = [roslynPath, "--stdio", .. extraArgs],
                 WorkingDirectory = projectRoot,
             };
         }

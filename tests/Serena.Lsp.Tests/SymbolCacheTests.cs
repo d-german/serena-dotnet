@@ -49,6 +49,31 @@ public class SymbolCacheTests
     }
 
     [Fact]
+    public void TryGet_NormalizesBackslashesToForwardSlashes()
+    {
+        // Regression: indexer stores keys with forward slashes (from Matcher glob
+        // output), but tool lookup goes through Path.GetFullPath which on Windows
+        // produces backslashes. Without normalization the cache never hits on Windows.
+        var cache = new SymbolCache<string>(
+            Path.GetTempPath(), "test_cache.json", 1, NullLogger.Instance);
+
+        cache.Set("C:/OnBase.NET/Libraries/Foo.cs", "fp1", "value");
+
+        cache.TryGet("C:\\OnBase.NET\\Libraries\\Foo.cs", "fp1").Should().Be("value");
+        cache.TryGetUnchecked("C:\\OnBase.NET\\Libraries\\Foo.cs").Should().Be("value");
+    }
+
+    [Fact]
+    public void Set_NormalizesBackslashesToForwardSlashes()
+    {
+        var cache = new SymbolCache<string>(
+            Path.GetTempPath(), "test_cache.json", 1, NullLogger.Instance);
+
+        cache.Set("C:\\OnBase.NET\\Libraries\\Foo.cs", "fp1", "value");
+        cache.TryGet("C:/OnBase.NET/Libraries/Foo.cs", "fp1").Should().Be("value");
+    }
+
+    [Fact]
     public void SaveAndLoad_RoundTrips()
     {
         string cacheDir = Path.Combine(Path.GetTempPath(), $"serena_test_{Guid.NewGuid():N}");

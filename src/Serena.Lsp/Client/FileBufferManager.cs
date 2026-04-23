@@ -1,6 +1,7 @@
-// File Buffer Management - Ported from solidlsp/ls.py LSPFileBuffer
+﻿// File Buffer Management - Ported from solidlsp/ls.py LSPFileBuffer
 // Phase 3B: Open file tracking, content caching, versioning
 
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using Serena.Lsp.Protocol.Types;
@@ -23,7 +24,8 @@ public sealed class LspFileBuffer
     public string Uri { get; }
     public string LanguageId { get; }
     public string Encoding { get; }
-    public int RefCount { get; set; }
+    internal int _refCount;
+    public int RefCount => _refCount;
     public bool IsOpenInLs { get; private set; }
     public int Version => _version;
 
@@ -40,7 +42,7 @@ public sealed class LspFileBuffer
         Encoding = encoding;
         _version = version;
         LanguageId = languageId;
-        RefCount = refCount;
+        _refCount = refCount;
     }
 
     /// <summary>
@@ -117,7 +119,7 @@ public sealed class LspFileBuffer
 /// </summary>
 public sealed class FileBufferManager
 {
-    private readonly Dictionary<string, LspFileBuffer> _buffers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, LspFileBuffer> _buffers = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// Gets the buffer for a file URI, or null if not tracked.
@@ -127,17 +129,13 @@ public sealed class FileBufferManager
 
     /// <summary>
     /// Gets or creates a buffer for a file.
+    /// Atomic via GetOrAdd — concurrent callers for the same URI get the same buffer.
     /// </summary>
     public LspFileBuffer OpenFile(string absolutePath, string uri, string languageId, string encoding = "utf-8")
     {
-        if (_buffers.TryGetValue(uri, out var existing))
-        {
-            existing.RefCount++;
-            return existing;
-        }
-
-        var buffer = new LspFileBuffer(absolutePath, uri, encoding, 0, languageId, 1);
-        _buffers[uri] = buffer;
+        var buffer = _buffers.GetOrAdd(uri,
+            _ => new LspFileBuffer(absolutePath, uri, encoding, 0, languageId, 0));
+        Interlocked.Increment(ref buffer._refCount);
         return buffer;
     }
 
@@ -152,10 +150,10 @@ public sealed class FileBufferManager
             return false;
         }
 
-        buffer.RefCount--;
-        if (buffer.RefCount <= 0)
+        int newCount = Interlocked.Decrement(ref buffer._refCount);
+        if (newCount <= 0)
         {
-            _buffers.Remove(uri);
+            _buffers.TryRemove(uri, out _);
             return true;
         }
         return false;
@@ -164,7 +162,7 @@ public sealed class FileBufferManager
     /// <summary>
     /// All currently tracked buffers.
     /// </summary>
-    public IReadOnlyCollection<LspFileBuffer> AllBuffers => _buffers.Values;
+    public IReadOnlyCollection<LspFileBuffer> AllBuffers => [.. _buffers.Values];
 
     /// <summary>
     /// Number of tracked files.

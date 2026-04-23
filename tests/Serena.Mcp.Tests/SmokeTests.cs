@@ -23,7 +23,7 @@ public class SmokeTests
             ctx => new ListDirTool(ctx),
             ctx => new FindFileTool(ctx));
 
-        var mcpTools = SerenaMcpToolBridge.CreateMcpTools(registry);
+        var mcpTools = SerenaMcpToolBridge.CreateMcpTools(registry, agent, NullLoggerFactory.Instance);
 
         Assert.Equal(3, mcpTools.Count);
         Assert.Contains(mcpTools, t => t.ProtocolTool.Name == "read_file");
@@ -34,9 +34,9 @@ public class SmokeTests
     [Fact]
     public void McpTool_HasCorrectSchemaWithProperties()
     {
-        var (_, registry) = CreateTestRegistryWithTools(ctx => new ReadFileTool(ctx));
+        var (agent, registry) = CreateTestRegistryWithTools(ctx => new ReadFileTool(ctx));
 
-        var mcpTools = SerenaMcpToolBridge.CreateMcpTools(registry);
+        var mcpTools = SerenaMcpToolBridge.CreateMcpTools(registry, agent, NullLoggerFactory.Instance);
         var tool = mcpTools[0];
 
         Assert.Equal("read_file", tool.ProtocolTool.Name);
