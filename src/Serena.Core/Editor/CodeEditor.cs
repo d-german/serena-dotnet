@@ -62,20 +62,65 @@ public interface ICodeEditor
 public sealed class LanguageServerCodeEditor : ICodeEditor
 {
     private readonly ISymbolRetriever _symbolRetriever;
-    private readonly LspClient _lsp;
+    private readonly Func<CancellationToken, Task<LspClient>> _lspFactory;
+    private LspClient? _resolvedLsp;
+    private readonly SemaphoreSlim _lspGate = new(1, 1);
     private readonly string _projectRoot;
     private readonly ILogger _logger;
 
+    /// <summary>
+    /// Constructs an editor bound to an already-started LSP client. Operations
+    /// that don't need the LSP (e.g. cache-hit symbol lookups + plain file
+    /// rewrites for replace/insert) still avoid touching it.
+    /// </summary>
     public LanguageServerCodeEditor(
         ISymbolRetriever symbolRetriever,
         LspClient lsp,
         string projectRoot,
         ILogger logger)
+        : this(symbolRetriever, _ => Task.FromResult(lsp), projectRoot, logger)
+    {
+        _resolvedLsp = lsp;
+    }
+
+    /// <summary>
+    /// Constructs an editor with a lazy LSP factory. The factory is invoked
+    /// only when an operation actually needs the language server (rename,
+    /// post-edit sync notification). Cache-first edit tools that can splice
+    /// text without semantic help avoid paying Roslyn startup cost on large
+    /// repos.
+    /// </summary>
+    public LanguageServerCodeEditor(
+        ISymbolRetriever symbolRetriever,
+        Func<CancellationToken, Task<LspClient>> lspFactory,
+        string projectRoot,
+        ILogger logger)
     {
         _symbolRetriever = symbolRetriever;
-        _lsp = lsp;
+        _lspFactory = lspFactory;
         _projectRoot = Path.GetFullPath(projectRoot);
         _logger = logger;
+    }
+
+    /// <summary>
+    /// Resolves the LSP client, invoking the factory on first use. Guarded so
+    /// concurrent first-use callers share a single startup.
+    /// </summary>
+    private async Task<LspClient> GetLspAsync(CancellationToken ct)
+    {
+        if (_resolvedLsp is not null)
+        {
+            return _resolvedLsp;
+        }
+        await _lspGate.WaitAsync(ct);
+        try
+        {
+            return _resolvedLsp ??= await _lspFactory(ct);
+        }
+        finally
+        {
+            _lspGate.Release();
+        }
     }
 
     public async Task<string> ReplaceSymbolBodyAsync(
@@ -282,8 +327,9 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
         int line = symbol.Raw.SelectionRange?.Start.Line ?? symbol.BodyLocation.StartLine;
         int character = symbol.Raw.SelectionRange?.Start.Character ?? symbol.BodyLocation.StartColumn;
 
-        await _lsp.OpenFileAsync(absolutePath);
-        var workspaceEdit = await _lsp.RequestRenameAsync(absolutePath, line, character, newName, ct: ct);
+        var lsp = await GetLspAsync(ct);
+        await lsp.OpenFileAsync(absolutePath);
+        var workspaceEdit = await lsp.RequestRenameAsync(absolutePath, line, character, newName, ct: ct);
 
         if (workspaceEdit is null)
         {
@@ -374,11 +420,21 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
 
     private async Task WriteAndSyncAsync(string absolutePath, string content, CancellationToken ct)
     {
-        await File.WriteAllTextAsync(absolutePath, content, ct);
+        await FileWriteGate.WriteAllTextAsync(absolutePath, content, ct);
+
+        // Only notify the LSP if it has already been started. Triggering a
+        // lazy startup purely to send a didChange notification would defeat
+        // the cache-first edit goal — the next semantic call will pick up
+        // the file from disk anyway.
+        var lsp = _resolvedLsp;
+        if (lsp is null)
+        {
+            return;
+        }
 
         try
         {
-            await _lsp.NotifyFileChangedAsync(absolutePath, content);
+            await lsp.NotifyFileChangedAsync(absolutePath, content);
         }
         catch (Exception ex)
         {

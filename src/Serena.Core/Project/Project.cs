@@ -8,6 +8,7 @@ using Microsoft.Extensions.Logging;
 using Serena.Core.Config;
 using Serena.Core.Tools;
 using Serena.Lsp;
+using Serena.Lsp.Project;
 
 namespace Serena.Core.Project;
 
@@ -437,4 +438,102 @@ public sealed class SerenaProject
     /// </summary>
     public bool IsIgnoredPath(string relativePath) =>
         IgnoreFilter.IsIgnored(relativePath);
+
+    /// <summary>
+    /// Environment variable that overrides the YAML-configured C# solution scope.
+    /// Value: semicolon-separated list of paths (absolute or relative to project root).
+    /// </summary>
+    public const string CSharpSolutionsEnvVar = "SERENA_CSHARP_SOLUTIONS";
+
+    /// <summary>
+    /// In-process override applied by tools like <c>set_active_solution</c>. Takes
+    /// precedence over both the env var and project YAML when set.
+    /// </summary>
+    private SolutionScope? _runtimeScopeOverride;
+
+    /// <summary>
+    /// Resolves the C# solution scope for this project. Precedence (highest first):
+    /// runtime override (set via <see cref="SetCSharpScope"/>) →
+    /// <c>SERENA_CSHARP_SOLUTIONS</c> env var → <c>csharp.scope.solutions</c>
+    /// in project.yml → <see cref="SolutionScope.Empty"/> (legacy whole-repo glob).
+    /// </summary>
+    public SolutionScope GetCSharpScope()
+    {
+        if (_runtimeScopeOverride is not null)
+        {
+            return _runtimeScopeOverride;
+        }
+
+        var fromEnv = LoadScopeFromEnvironment();
+        if (fromEnv is not null)
+        {
+            return fromEnv;
+        }
+
+        return LoadScopeFromYaml() ?? SolutionScope.Empty;
+    }
+
+    /// <summary>
+    /// Replaces the in-process scope. Pass <see cref="SolutionScope.Empty"/> to
+    /// fall back to env/YAML/default. The change is not persisted.
+    /// </summary>
+    public void SetCSharpScope(SolutionScope scope)
+    {
+        ArgumentNullException.ThrowIfNull(scope);
+        _runtimeScopeOverride = scope.IsEmpty ? null : scope;
+    }
+
+    /// <summary>
+    /// Persists the C# solution scope into project.yml under <c>csharp.scope.solutions</c>
+    /// AND sets the in-process runtime override so the change takes effect immediately
+    /// on the next language-server start. Pass null/empty to clear the scope.
+    /// Paths are stored as provided (caller controls absolute vs relative).
+    /// </summary>
+    public void UpdateAndPersistCSharpScope(IReadOnlyList<string>? solutionPaths)
+    {
+        var scope = solutionPaths is null || solutionPaths.Count == 0
+            ? SolutionScope.Empty
+            : SolutionScope.FromSolutions(solutionPaths);
+
+        SetCSharpScope(scope);
+
+        var newScopeConfig = scope.IsEmpty
+            ? null
+            : new CSharpScopeConfig { Solutions = solutionPaths!.ToList() };
+
+        var newCsharp = new CSharpProjectConfig { Scope = newScopeConfig };
+        _config = _config with { Csharp = newCsharp };
+        SaveConfig();
+    }
+
+    private SolutionScope? LoadScopeFromEnvironment()
+    {
+        var raw = Environment.GetEnvironmentVariable(CSharpSolutionsEnvVar);
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        var paths = raw
+            .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(ResolveScopePath)
+            .ToArray();
+
+        return paths.Length == 0 ? null : SolutionScope.FromSolutions(paths);
+    }
+
+    private SolutionScope? LoadScopeFromYaml()
+    {
+        var solutions = _config.Csharp?.Scope?.Solutions;
+        if (solutions is null || solutions.Count == 0)
+        {
+            return null;
+        }
+
+        var paths = solutions.Select(ResolveScopePath).ToArray();
+        return SolutionScope.FromSolutions(paths);
+    }
+
+    private string ResolveScopePath(string path) =>
+        Path.IsPathRooted(path) ? path : Path.GetFullPath(Path.Combine(_projectRoot, path));
 }

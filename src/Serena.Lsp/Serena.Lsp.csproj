@@ -18,6 +18,7 @@
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0-preview.*" />
     <PackageReference Include="Microsoft.Extensions.FileSystemGlobbing" Version="10.0.0-preview.*" />
     <PackageReference Include="CSharpFunctionalExtensions" Version="3.*" />
+    <PackageReference Include="Microsoft.VisualStudio.SolutionPersistence" Version="1.0.52" />
   </ItemGroup>
 
 </Project>

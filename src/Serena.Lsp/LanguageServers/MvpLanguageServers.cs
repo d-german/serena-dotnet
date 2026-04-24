@@ -3,6 +3,7 @@
 
 using Microsoft.Extensions.Logging;
 using Serena.Lsp.Client;
+using Serena.Lsp.Project;
 using Serena.Lsp.Protocol;
 using SysProcess = System.Diagnostics.Process;
 using SysProcessStartInfo = System.Diagnostics.ProcessStartInfo;
@@ -29,12 +30,15 @@ public sealed class CSharpLanguageServer : LanguageServerDefinition
         string[] extraArgs = passPid
             ? [$"--clientProcessId={Environment.ProcessId}"]
             : [];
+        // Polite mode is on by default; opt out via polite_mode: false
+        bool politeMode = !string.Equals(settings.GetSetting("polite_mode"), "false", StringComparison.OrdinalIgnoreCase);
         if (explicitPath is not null)
         {
             return new ProcessLaunchInfo
             {
                 Command = [explicitPath, "--stdio", .. extraArgs],
                 WorkingDirectory = projectRoot,
+                PoliteMode = politeMode,
             };
         }
 
@@ -53,6 +57,7 @@ public sealed class CSharpLanguageServer : LanguageServerDefinition
             {
                 Command = [roslynPath, "--stdio", .. extraArgs],
                 WorkingDirectory = projectRoot,
+                PoliteMode = politeMode,
             };
         }
 
@@ -65,6 +70,7 @@ public sealed class CSharpLanguageServer : LanguageServerDefinition
             {
                 Command = [csharpLs],
                 WorkingDirectory = projectRoot,
+                PoliteMode = politeMode,
             };
         }
 
@@ -109,7 +115,98 @@ public sealed class CSharpLanguageServer : LanguageServerDefinition
         }
     }
 
-    public override async Task PostStartAsync(LspClient client, string projectRoot, CancellationToken ct = default)
+    /// <summary>
+    /// Setting key carrying a semicolon-separated list of .sln/.slnx paths to scope Roslyn to.
+    /// Populated by Serena.Core when activating a project that has <c>csharp.scope.solutions</c>
+    /// set in its YAML config (or via the <c>set_active_solution</c> tool at runtime).
+    /// </summary>
+    public const string ScopeSolutionsSetting = "csharp_scope_solutions";
+
+    /// <summary>
+    /// Process-global env var that overrides the per-project YAML scope. Honored
+    /// when <see cref="ScopeSolutionsSetting"/> is not present in <see cref="CustomLsSettings"/>.
+    /// </summary>
+    public const string ScopeSolutionsEnvVar = "SERENA_CSHARP_SOLUTIONS";
+
+    public override async Task PostStartAsync(LspClient client, string projectRoot, CustomLsSettings settings, CancellationToken ct = default)
+    {
+        var scope = ResolveScope(settings);
+        var sink = settings.ReadyStateSink;
+        try
+        {
+            if (!scope.IsEmpty)
+            {
+                sink?.MarkLoading(Language.CSharp, scope.SolutionPaths.Count, $"{scope.SolutionPaths.Count} solution(s)");
+                await OpenScopedSolutionsAsync(client, scope, ct);
+            }
+            else
+            {
+                sink?.MarkLoading(Language.CSharp, scopeDescription: "whole repo");
+                await OpenAllInRepoAsync(client, projectRoot, ct);
+            }
+
+            await WaitForIndexingAsync(client, ct);
+            sink?.MarkReady(Language.CSharp);
+        }
+        catch
+        {
+            sink?.MarkFailed(Language.CSharp);
+            throw;
+        }
+    }
+
+    private SolutionScope ResolveScope(CustomLsSettings settings)
+    {
+        // settings (from project YAML) wins over env, since it represents the
+        // user's explicit per-project intent. Env var is the fallback for users
+        // running Serena outside the SerenaProject path (e.g., bare CLI smoke tests).
+        var fromSettings = ParseSolutionList(settings.GetSetting(ScopeSolutionsSetting));
+        if (fromSettings is not null)
+        {
+            return fromSettings;
+        }
+
+        var fromEnv = ParseSolutionList(Environment.GetEnvironmentVariable(ScopeSolutionsEnvVar));
+        return fromEnv ?? SolutionScope.Empty;
+    }
+
+    private static SolutionScope? ParseSolutionList(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        var paths = raw
+            .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToArray();
+
+        return paths.Length == 0 ? null : SolutionScope.FromSolutions(paths);
+    }
+
+    private async Task OpenScopedSolutionsAsync(LspClient client, SolutionScope scope, CancellationToken ct)
+    {
+        Logger.LogInformation("C# scope active: {Count} solution(s) (skipping recursive csproj glob)",
+            scope.SolutionPaths.Count);
+
+        for (int i = 0; i < scope.SolutionPaths.Count; i++)
+        {
+            string slnPath = scope.SolutionPaths[i];
+            if (!File.Exists(slnPath))
+            {
+                Logger.LogWarning("Scoped solution not found, skipping: {Path}", slnPath);
+                continue;
+            }
+            string solutionUri = LspClient.PathToUri(slnPath);
+            Logger.LogInformation("Opening scoped solution {Index}/{Total}: {Solution}",
+                i + 1, scope.SolutionPaths.Count, Path.GetFileName(slnPath));
+            await client.SendNotificationAsync("solution/open", new { solution = solutionUri });
+        }
+
+        ct.ThrowIfCancellationRequested();
+    }
+
+    private async Task OpenAllInRepoAsync(LspClient client, string projectRoot, CancellationToken ct)
     {
         // Discover all solution files (including subdirectories for mono-repos)
         var slnFiles = Directory.GetFiles(projectRoot, "*.sln", SearchOption.AllDirectories)
@@ -139,13 +236,16 @@ public sealed class CSharpLanguageServer : LanguageServerDefinition
             await client.SendNotificationAsync("project/open", new { projects = projectUris });
         }
 
-        // Only wait for indexing if we actually opened something
         if (slnFiles.Length == 0 && csprojFiles.Length == 0)
         {
             Logger.LogInformation("No solution or project files found — skipping indexing wait");
-            return;
         }
 
+        ct.ThrowIfCancellationRequested();
+    }
+
+    private async Task WaitForIndexingAsync(LspClient client, CancellationToken ct)
+    {
         // Wait for indexing: keep waiting as long as Roslyn is sending us activity ($/progress, diagnostics).
         // Give up after 30s of silence — works for any repo size.
         var inactivityTimeout = TimeSpan.FromSeconds(30);
@@ -160,6 +260,38 @@ public sealed class CSharpLanguageServer : LanguageServerDefinition
             Logger.LogWarning("C# project indexing stopped \u2014 no activity for {Timeout}s. Cross-file references may be incomplete",
                 (int)inactivityTimeout.TotalSeconds);
         }
+    }
+
+    /// <summary>
+    /// Returns "polite mode" workspace settings that disable Roslyn's
+    /// background analyzer diagnostics. Agent sessions never consume diagnostics,
+    /// so running them is pure waste — and on large solutions they dominate
+    /// cold-load CPU and steady-state idle CPU. Compiler diagnostics on open
+    /// files are kept (cheap, useful for parse-error visibility).
+    ///
+    /// Honors opt-out via <c>polite_mode: false</c> in CustomLsSettings.
+    /// Schema verified against dotnet/vscode-csharp/package.json (the
+    /// authoritative consumer of these keys). Delivered via
+    /// <c>workspace/didChangeConfiguration</c> in <see cref="LspClient.StartAsync"/>.
+    /// </summary>
+    public override object? GetWorkspaceSettings(string projectRoot, CustomLsSettings settings)
+    {
+        if (string.Equals(settings.GetSetting("polite_mode"), "false", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        return new
+        {
+            dotnet = new
+            {
+                backgroundAnalysis = new
+                {
+                    analyzerDiagnosticsScope = "none",
+                    compilerDiagnosticsScope = "openFiles",
+                },
+            },
+        };
     }
 }
 

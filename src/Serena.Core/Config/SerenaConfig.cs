@@ -130,6 +130,36 @@ public sealed record ProjectConfig
     public IReadOnlyList<string>? ShellCommandDenyPatterns { get; init; }
 
     public IReadOnlyDictionary<string, string>? SuggestedCommands { get; init; }
+
+    /// <summary>
+    /// C#-specific project settings (Roslyn solution scoping, etc.).
+    /// </summary>
+    public CSharpProjectConfig? Csharp { get; init; }
+}
+
+/// <summary>
+/// C#-specific project configuration. Maps to YAML key <c>csharp:</c>.
+/// </summary>
+public sealed record CSharpProjectConfig
+{
+    /// <summary>
+    /// Optional Roslyn workspace scope (which solutions to load).
+    /// Maps to YAML key <c>csharp.scope</c>.
+    /// </summary>
+    public CSharpScopeConfig? Scope { get; init; }
+}
+
+/// <summary>
+/// Defines the working set of C# projects for Roslyn. When unset, Serena falls
+/// back to the legacy whole-repo recursive glob.
+/// </summary>
+public sealed record CSharpScopeConfig
+{
+    /// <summary>
+    /// Paths (absolute or relative to the project root) to .sln/.slnx files.
+    /// Only the projects referenced by these solutions are loaded into Roslyn.
+    /// </summary>
+    public List<string>? Solutions { get; init; }
 }
 
 /// <summary>

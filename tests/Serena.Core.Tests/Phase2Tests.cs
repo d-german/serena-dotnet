@@ -148,7 +148,7 @@ public class DiFix_SingleAgentTests
 
         var registry = Serena.Mcp.Program.BuildToolRegistry(agent, loggerFactory);
 
-        Assert.Equal(33, registry.All.Count);
+        Assert.Equal(38, registry.All.Count);
     }
 
     [Fact]
@@ -163,7 +163,7 @@ public class DiFix_SingleAgentTests
         agent.SetToolRegistry(registry);
 
         // Agent.Tools should not throw (registry is set)
-        Assert.Equal(33, agent.Tools.All.Count);
+        Assert.Equal(38, agent.Tools.All.Count);
     }
 
     [Fact]

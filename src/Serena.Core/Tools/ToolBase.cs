@@ -343,7 +343,10 @@ public abstract class ToolBase : ITool
 
         var logger = Context.LoggerFactory.CreateLogger<LanguageServerSymbolRetriever>();
         var cache = Context.Agent.GetSymbolCache(lsp.Language);
-        return new LanguageServerSymbolRetriever(lsp, root, logger, cache);
+        var lspLanguage = lsp.Language;
+        return new LanguageServerSymbolRetriever(
+            lsp, root, logger, cache,
+            snapshotFactory: () => Context.Agent.GetLanguageServerReadyState(lspLanguage));
     }
 
     /// <summary>
@@ -390,7 +393,10 @@ public abstract class ToolBase : ITool
                     $"No language server available for '{relativePath}'. Ensure a language server is configured.");
         }
 
-        ISymbolRetriever retriever = new LanguageServerSymbolRetriever(LspFactory, root, logger, cache);
+        ISymbolRetriever retriever = new LanguageServerSymbolRetriever(
+            LspFactory, root, logger, cache,
+            snapshotFactory: () => Context.Agent.GetLanguageServerReadyState(language.Value),
+            language: language.Value);
         return Task.FromResult(retriever);
     }
 
@@ -419,9 +425,66 @@ public abstract class ToolBase : ITool
 
         var logger = Context.LoggerFactory.CreateLogger<LanguageServerCodeEditor>();
         var cache = Context.Agent.GetSymbolCache(lsp.Language);
+        var lspLanguage = lsp.Language;
         var retriever = new LanguageServerSymbolRetriever(lsp, root,
-            Context.LoggerFactory.CreateLogger<LanguageServerSymbolRetriever>(), cache);
+            Context.LoggerFactory.CreateLogger<LanguageServerSymbolRetriever>(), cache,
+            snapshotFactory: () => Context.Agent.GetLanguageServerReadyState(lspLanguage));
         return new LanguageServerCodeEditor(retriever, lsp, root, logger);
+    }
+
+    /// <summary>
+    /// Gets a cache-first <see cref="ICodeEditor"/> for symbol-edit operations
+    /// that can splice text using only the symbol cache (replace_symbol_body,
+    /// insert_before_symbol, insert_after_symbol). The language server is only
+    /// started if the underlying retriever has a true cache miss or the editor
+    /// genuinely needs the LSP (rename, post-edit didChange notification).
+    /// On large repos this avoids the 10+ minute Roslyn cold-load when the
+    /// symbol's range is already on disk.
+    /// </summary>
+    protected Task<ICodeEditor> RequireCodeEditorCacheFirstAsync(
+        string relativePath, CancellationToken ct = default)
+    {
+        string root = RequireProjectRoot();
+        string absPath = Path.GetFullPath(Path.Combine(root, relativePath));
+
+        // Determine language WITHOUT touching the LSP. If relativePath is a
+        // directory, probe it for the first analyzable file to pick a language;
+        // otherwise use the file's extension directly.
+        string languageProbePath = absPath;
+        if (Directory.Exists(absPath))
+        {
+            languageProbePath = Directory.EnumerateFiles(absPath, "*", SearchOption.AllDirectories)
+                .FirstOrDefault(LanguageServerSymbolRetriever.CanAnalyzeFile)
+                ?? absPath;
+        }
+
+        var language = Serena.Lsp.LanguageExtensions.FromFileExtension(Path.GetExtension(languageProbePath));
+        if (language is null)
+        {
+            // Unknown language: fall back to the eager LSP-starting editor so
+            // the error path stays consistent with pre-refactor behavior.
+            return RequireCodeEditorAsync(relativePath, ct);
+        }
+
+        var cache = Context.Agent.GetSymbolCache(language.Value);
+        var retrieverLogger = Context.LoggerFactory.CreateLogger<LanguageServerSymbolRetriever>();
+        var editorLogger = Context.LoggerFactory.CreateLogger<LanguageServerCodeEditor>();
+
+        // Lazy LSP closure: invoked at most once, only if the editor or its
+        // retriever genuinely needs the language server.
+        async Task<Serena.Lsp.Client.LspClient> LspFactory(CancellationToken factoryCt)
+        {
+            return await Context.Agent.GetLanguageServerForFileAsync(languageProbePath, factoryCt)
+                ?? throw new InvalidOperationException(
+                    $"No language server available for '{relativePath}'. Ensure a language server is configured.");
+        }
+
+        var retriever = new LanguageServerSymbolRetriever(
+            LspFactory, root, retrieverLogger, cache,
+            snapshotFactory: () => Context.Agent.GetLanguageServerReadyState(language.Value),
+            language: language.Value);
+        ICodeEditor editor = new LanguageServerCodeEditor(retriever, LspFactory, root, editorLogger);
+        return Task.FromResult(editor);
     }
 
     /// <summary>

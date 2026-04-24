@@ -107,7 +107,16 @@ public sealed class InitialInstructionsTool : ToolBase
 
     protected override Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
     {
-        var sb = new StringBuilder(InstructionsManual);
+        var sb = new StringBuilder();
+
+        string? scopeWarning = TryBuildScopeWarning();
+        if (scopeWarning is not null)
+        {
+            sb.AppendLine(scopeWarning);
+            sb.AppendLine();
+        }
+
+        sb.Append(InstructionsManual);
 
         // Append dynamic runtime context
         string dynamicContext = SystemPromptFactory.CreateSystemPrompt(Context.Agent);
@@ -121,6 +130,56 @@ public sealed class InitialInstructionsTool : ToolBase
         }
 
         return Task.FromResult(sb.ToString().TrimEnd());
+    }
+
+    /// <summary>
+    /// Builds a warning when the active project contains multiple .sln/.slnx files
+    /// and no C# scope is set. Returns null otherwise.
+    /// </summary>
+    private string? TryBuildScopeWarning()
+    {
+        var project = Context.ActiveProject;
+        if (project is null)
+        {
+            return null;
+        }
+
+        if (!project.GetCSharpScope().IsEmpty)
+        {
+            return null;
+        }
+
+        var solutions = DiscoverSolutionFiles(project.Root);
+        if (solutions.Count < 2)
+        {
+            return null;
+        }
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"⚠️ Multiple C# solutions detected ({solutions.Count} found). Without an active solution scope, semantic operations (find_referencing_symbols, rename_symbol) will load ALL projects into Roslyn — this can take 15-30+ minutes on large repos and may time out.");
+        sb.AppendLine();
+        sb.AppendLine("DO NOT enumerate or pick a solution blindly. Use this discovery workflow:");
+        sb.AppendLine("  1. search_for_pattern(\"<term from the user's question>\")  — pure ripgrep, zero Roslyn cost");
+        sb.AppendLine("  2. Note the directories of the hits");
+        sb.AppendLine("  3. find_file(\"*.sln*\", relative_path=\"<directory of hits>\")  — finds the nearest enclosing solution");
+        sb.AppendLine("  4. set_active_solution(solution_path=\"<that path>\")");
+        sb.AppendLine("  5. Only NOW use find_symbol / find_referencing_symbols / rename_symbol.");
+        sb.AppendLine();
+        sb.AppendLine("If the user already named a specific component (e.g. \"Forms\"), skip steps 1-3 and call set_active_solution directly.");
+        sb.AppendLine();
+        sb.AppendLine("After set_active_solution the C# language server requires workspace warmup (10-30 min on large solutions). RECOMMENDED FLOW: (1) call warm_language_server immediately to begin background warmup; (2) while it loads, use search_for_pattern, find_file, get_symbols_overview (file-scoped), and find_symbol WITH a relative_path — these all work without Roslyn; (3) poll get_language_server_status every 60-120s; (4) once state == Ready, use solution-wide find_symbol (no relative_path), find_referencing_symbols, and rename_symbol. If a symbol call returns a warming status, do NOT retry immediately — poll get_language_server_status first.");
+        sb.AppendLine();
+        sb.AppendLine("To clear scope later: clear_active_solution. To stop a runaway language server: kill_language_server.");
+        return sb.ToString().TrimEnd();
+    }
+
+    private static List<string> DiscoverSolutionFiles(string projectRoot)
+    {
+        return new[] { ".sln", ".slnx" }
+            .SelectMany(ext => Directory.EnumerateFiles(projectRoot, $"*{ext}", SearchOption.AllDirectories))
+            .Select(p => Path.GetRelativePath(projectRoot, p))
+            .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+            .ToList();
     }
 
     private static readonly string InstructionsManual = """

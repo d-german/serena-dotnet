@@ -7,6 +7,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 using Serena.Core.Project;
+using Serena.Lsp;
 using Serena.Lsp.Caching;
 using Serena.Lsp.Client;
 using Serena.Lsp.Protocol.Types;
@@ -322,6 +323,8 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
     private readonly string _projectRoot;
     private readonly ILogger _logger;
     private readonly SymbolCache<UnifiedSymbolInformation[]>? _symbolCache;
+    private readonly Func<ReadyStateSnapshot>? _snapshotFactory;
+    private readonly Language? _language;
     private SymbolCacheRefresher? _refresher;
 
     /// <summary>
@@ -339,8 +342,9 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
     /// </summary>
     public LanguageServerSymbolRetriever(
         LspClient lsp, string projectRoot, ILogger logger,
-        SymbolCache<UnifiedSymbolInformation[]>? symbolCache = null)
-        : this(_ => Task.FromResult(lsp), projectRoot, logger, symbolCache)
+        SymbolCache<UnifiedSymbolInformation[]>? symbolCache = null,
+        Func<ReadyStateSnapshot>? snapshotFactory = null)
+        : this(_ => Task.FromResult(lsp), projectRoot, logger, symbolCache, snapshotFactory, lsp.Language)
     {
         _resolvedLsp = lsp;
     }
@@ -354,12 +358,30 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
     public LanguageServerSymbolRetriever(
         Func<CancellationToken, Task<LspClient>> lspFactory,
         string projectRoot, ILogger logger,
-        SymbolCache<UnifiedSymbolInformation[]>? symbolCache = null)
+        SymbolCache<UnifiedSymbolInformation[]>? symbolCache = null,
+        Func<ReadyStateSnapshot>? snapshotFactory = null,
+        Language? language = null)
     {
         _lspFactory = lspFactory;
         _projectRoot = Path.GetFullPath(projectRoot);
         _logger = logger;
         _symbolCache = symbolCache;
+        _snapshotFactory = snapshotFactory;
+        _language = language;
+    }
+
+    /// <summary>
+    /// Wraps an LSP call with the per-request timeout when a snapshot factory
+    /// + language are wired in. Falls through unchanged when not (preserves
+    /// pre-v1.0.26 behavior for tests/contexts that don't supply readiness).
+    /// </summary>
+    private Task<T> WithLspTimeoutAsync<T>(Func<CancellationToken, Task<T>> op, CancellationToken ct)
+    {
+        if (_snapshotFactory is null || _language is null)
+        {
+            return op(ct);
+        }
+        return LspTimeout.WithTimeoutAsync(op, _snapshotFactory, _language.Value, _logger, ct);
     }
 
     /// <summary>
@@ -438,7 +460,9 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
         // Honor the caller's cancellation token so MCP-side cancel actually
         // stops the LSP request and frees CPU. StreamJsonRpc will send
         // $/cancelRequest to Roslyn when the token fires.
-        var symbols = await lsp.RequestDocumentSymbolsAsync(absolutePath, ct);
+        var symbols = await WithLspTimeoutAsync(
+            innerCt => lsp.RequestDocumentSymbolsAsync(absolutePath, innerCt),
+            ct);
 
         // Populate cache
         if (_symbolCache is not null)
@@ -600,7 +624,9 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
 
         var lsp = await GetLspAsync(ct);
         await lsp.OpenFileAsync(absolutePath);
-        var locations = await lsp.RequestReferencesAsync(absolutePath, line, character, ct: ct);
+        var locations = await WithLspTimeoutAsync(
+            innerCt => lsp.RequestReferencesAsync(absolutePath, line, character, ct: innerCt),
+            ct);
 
         // Cache document symbols per file to avoid redundant GetSymbolsAsync calls
         var symbolsByFile = new Dictionary<string, IReadOnlyList<LanguageServerSymbol>>();
@@ -806,7 +832,9 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
 
                 try
                 {
-                    var hover = await lsp.RequestHoverAsync(absolutePath, line, character, ct);
+                    var hover = await WithLspTimeoutAsync(
+                        innerCt => lsp.RequestHoverAsync(absolutePath, line, character, innerCt),
+                        ct);
                     result[symbol] = ExtractHoverText(hover);
                 }
                 catch (Exception ex)

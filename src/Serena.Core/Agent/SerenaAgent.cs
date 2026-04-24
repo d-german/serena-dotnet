@@ -234,7 +234,76 @@ public sealed class SerenaAgent : IAsyncDisposable
             return null;
         }
 
-        return await _lsManager.GetOrStartAsync(language.Value, ct: ct);
+        var settings = BuildLsSettings(language.Value);
+        return await _lsManager.GetOrStartAsync(language.Value, settings, ct: ct);
+    }
+
+    /// <summary>
+    /// Builds language-server-specific settings, injecting per-project context
+    /// (e.g., C# solution scope from <c>csharp.scope.solutions</c> in project.yml
+    /// or the <c>set_active_solution</c> tool).
+    /// </summary>
+    private CustomLsSettings? BuildLsSettings(Language language)
+    {
+        if (language != Language.CSharp || _activeProject is null)
+        {
+            return null;
+        }
+
+        var scope = _activeProject.GetCSharpScope();
+        if (scope.IsEmpty)
+        {
+            return null;
+        }
+
+        var dict = new Dictionary<string, object>
+        {
+            [CSharpLanguageServer.ScopeSolutionsSetting] = string.Join(';', scope.SolutionPaths),
+        };
+        return new CustomLsSettings(dict);
+    }
+
+    /// <summary>
+    /// Restarts the running language server for the given language so the next
+    /// request picks up updated startup-time settings (notably the C# solution
+    /// scope). No-op when the server isn't running. Symbol caches are flushed
+    /// to disk and reloaded on next start.
+    /// </summary>
+    public Task RestartLanguageServerAsync(Language language, CancellationToken ct = default)
+    {
+        if (_lsManager is null)
+        {
+            return Task.CompletedTask;
+        }
+        return _lsManager.RestartAsync(language, ct);
+    }
+
+    /// <summary>
+    /// Returns the workspace-load readiness state for the given language.
+    /// Returns a NotStarted snapshot if no project is active or the server
+    /// has not been started. Callers (notably symbol tools) use this to
+    /// translate timeout-on-warmup events into actionable status responses.
+    /// </summary>
+    public ReadyStateSnapshot GetLanguageServerReadyState(Language language) =>
+        _lsManager?.GetReadyState(language) ?? new ReadyStateSnapshot(WorkspaceReadyState.NotStarted);
+
+    /// <summary>
+    /// v1.0.27: Eagerly starts the language server for <paramref name="language"/>
+    /// and returns the immediate readiness snapshot. Workspace warmup
+    /// (Roslyn solution/open + indexing) continues in the background after
+    /// this method returns; callers should poll <see cref="GetLanguageServerReadyState"/>
+    /// until <see cref="WorkspaceReadyState.Ready"/>. No-op (returns NotStarted)
+    /// when no project is active.
+    /// </summary>
+    public async Task<ReadyStateSnapshot> WarmLanguageServerAsync(Language language, CancellationToken ct = default)
+    {
+        if (_lsManager is null)
+        {
+            return new ReadyStateSnapshot(WorkspaceReadyState.NotStarted);
+        }
+        var settings = BuildLsSettings(language);
+        await _lsManager.GetOrStartAsync(language, settings, ct).ConfigureAwait(false);
+        return _lsManager.GetReadyState(language);
     }
 
     /// <summary>

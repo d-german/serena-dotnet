@@ -53,6 +53,16 @@ public sealed record ProcessLaunchInfo
     /// The working directory for the process.
     /// </summary>
     public string WorkingDirectory { get; init; } = System.IO.Directory.GetCurrentDirectory();
+
+    /// <summary>
+    /// When true, the spawned process is launched with reduced OS scheduling
+    /// priority and a CPU affinity mask covering only half of the available
+    /// cores. Intended for long-running language servers (Roslyn) on developer
+    /// laptops so cold loads don't peg every core. Best-effort; failures are
+    /// logged but never propagate. Windows-only meaningful behavior; on Linux
+    /// and macOS the calls may throw and are simply ignored.
+    /// </summary>
+    public bool PoliteMode { get; init; }
 }
 
 /// <summary>

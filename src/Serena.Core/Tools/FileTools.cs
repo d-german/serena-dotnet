@@ -77,7 +77,7 @@ public sealed class CreateTextFileTool : ToolBase
             Directory.CreateDirectory(dir);
         }
 
-        await File.WriteAllTextAsync(fullPath, content, GetProjectEncoding(), ct);
+        await Serena.Core.Editor.FileWriteGate.WriteAllTextAsync(fullPath, content, GetProjectEncoding(), ct);
 
         string answer = $"File created: {relativePath}.";
         if (willOverwrite)
@@ -93,13 +93,15 @@ public sealed class ListDirTool : ToolBase
     public ListDirTool(IToolContext context) : base(context) { }
 
     public override string Description =>
-        "Lists files and directories in the given directory (optionally with recursion).";
+        "Lists files and directories in the given directory (optionally with recursion). " +
+        "When recursive=true, .gitignore'd paths (e.g. bin/, obj/, node_modules/) are skipped " +
+        "by default to keep output manageable; pass skip_ignored_files=false to include them.";
 
     protected override IReadOnlyList<ToolParameter> ExtractParameters() =>
     [
         new("relative_path", "The relative path to the directory to list; pass '.' for project root.", typeof(string), Required: true),
         new("recursive", "Whether to scan subdirectories recursively.", typeof(bool), Required: true),
-        new("skip_ignored_files", "Whether to skip files and directories that are ignored.", typeof(bool), Required: false, DefaultValue: false),
+        new("skip_ignored_files", "Whether to skip .gitignore'd files. Defaults to true when recursive=true (to skip bin/obj/etc), false when recursive=false.", typeof(bool), Required: false, DefaultValue: false),
         new("max_answer_chars", "Max characters for the result. -1 for default.", typeof(int), Required: false, DefaultValue: -1),
     ];
 
@@ -107,7 +109,13 @@ public sealed class ListDirTool : ToolBase
     {
         string relativePath = GetRequired<string>(arguments, "relative_path");
         bool recursive = GetOptional(arguments, "recursive", false);
-        bool skipIgnored = GetOptional(arguments, "skip_ignored_files", false);
+        // v1.0.28: when the caller does not explicitly pass skip_ignored_files,
+        // default to true on recursive walks so bin/, obj/, node_modules/, etc.
+        // don't blow past the output cap. Non-recursive walks default to false
+        // for back-compat — top-level output is bounded.
+        bool skipIgnored = arguments.ContainsKey("skip_ignored_files")
+            ? GetOptional(arguments, "skip_ignored_files", false)
+            : recursive;
         int maxChars = GetOptional(arguments, "max_answer_chars", -1);
 
         string fullPath = ResolvePath(relativePath);

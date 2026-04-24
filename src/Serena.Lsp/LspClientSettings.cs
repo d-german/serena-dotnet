@@ -72,6 +72,14 @@ public sealed class CustomLsSettings
         _logger = logger;
     }
 
+    /// <summary>
+    /// Optional sink that receives workspace-load lifecycle signals from a
+    /// language server definition. Set by LanguageServerManager so it can be
+    /// queried for readiness from the symbol-tool layer without taking a
+    /// reverse dependency on Serena.Core.
+    /// </summary>
+    public IServerReadyStateSink? ReadyStateSink { get; set; }
+
     public T Get<T>(string key, T defaultValue)
     {
         if (_settings is not null && _settings.TryGetValue(key, out var value))

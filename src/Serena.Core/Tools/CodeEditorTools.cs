@@ -26,7 +26,7 @@ public sealed class ReplaceSymbolBodyTool : ToolBase
         string relativePath = GetRequired<string>(arguments, "relative_path");
         string body = GetRequired<string>(arguments, "body");
 
-        var editor = await RequireCodeEditorAsync(relativePath, ct);
+        var editor = await RequireCodeEditorCacheFirstAsync(relativePath, ct);
         return await editor.ReplaceSymbolBodyAsync(namePath, relativePath, body, ct);
     }
 }
@@ -52,7 +52,7 @@ public sealed class InsertBeforeSymbolTool : ToolBase
         string relativePath = GetRequired<string>(arguments, "relative_path");
         string body = GetRequired<string>(arguments, "body");
 
-        var editor = await RequireCodeEditorAsync(relativePath, ct);
+        var editor = await RequireCodeEditorCacheFirstAsync(relativePath, ct);
         return await editor.InsertBeforeSymbolAsync(namePath, relativePath, body, ct);
     }
 }
@@ -78,7 +78,7 @@ public sealed class InsertAfterSymbolTool : ToolBase
         string relativePath = GetRequired<string>(arguments, "relative_path");
         string body = GetRequired<string>(arguments, "body");
 
-        var editor = await RequireCodeEditorAsync(relativePath, ct);
+        var editor = await RequireCodeEditorCacheFirstAsync(relativePath, ct);
         return await editor.InsertAfterSymbolAsync(namePath, relativePath, body, ct);
     }
 }
@@ -116,7 +116,7 @@ public sealed class ReplaceContentTool : ToolBase
             ? ReplaceWithRegex(content, needle, repl, allowMultiple, relativePath)
             : ReplaceWithLiteral(content, needle, repl, allowMultiple, relativePath);
 
-        await File.WriteAllTextAsync(absolutePath, newContent, encoding, ct);
+        await Serena.Core.Editor.FileWriteGate.WriteAllTextAsync(absolutePath, newContent, encoding, ct);
         await TryNotifyLspAsync(absolutePath, newContent, ct);
 
         return $"Replaced {count} occurrence(s) in {relativePath}";
@@ -175,7 +175,10 @@ public sealed class RenameSymbolTool : ToolBase
     public RenameSymbolTool(IToolContext context) : base(context) { }
 
     public override string Description =>
-        "Renames the symbol with the given name_path to new_name throughout the entire codebase.";
+        "Renames the symbol with the given name_path to new_name throughout the entire codebase. " +
+        "PERFORMANCE: ALWAYS requires Roslyn (full symbol graph). Returns a warming status until " +
+        "get_language_server_status reports Ready. Call warm_language_server after set_active_solution " +
+        "and wait for Ready before invoking this tool.";
 
     protected override IReadOnlyList<ToolParameter> ExtractParameters() =>
     [

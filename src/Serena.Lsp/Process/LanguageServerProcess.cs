@@ -24,6 +24,7 @@ public sealed class LanguageServerProcess : IAsyncDisposable
     private readonly Language _language;
     private readonly ILogger _logger;
     private readonly TimeSpan? _requestTimeout;
+    private readonly bool _politeMode;
 
     /// <summary>
     /// Tracks all live LSP child processes so we can force-kill them if our own
@@ -97,12 +98,46 @@ public sealed class LanguageServerProcess : IAsyncDisposable
         ProcessLaunchInfo launchInfo,
         Language language,
         ILogger logger,
-        TimeSpan? requestTimeout = null)
+        TimeSpan? requestTimeout = null,
+        bool politeMode = false)
     {
         _launchInfo = launchInfo;
         _language = language;
         _logger = logger;
         _requestTimeout = requestTimeout;
+        _politeMode = politeMode;
+    }
+
+    /// <summary>
+    /// Best-effort application of polite-mode OS scheduling: BelowNormal
+    /// priority and a CPU affinity mask covering only half the cores
+    /// (rounded down, minimum 1). Catches and logs any exception — these
+    /// APIs are Windows-meaningful but throw on Linux/macOS.
+    /// </summary>
+    private static void ApplyPoliteSettings(System.Diagnostics.Process p, ILogger logger)
+    {
+        try
+        {
+            p.PriorityClass = ProcessPriorityClass.BelowNormal;
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Polite mode: PriorityClass=BelowNormal not applied (likely non-Windows)");
+        }
+
+        try
+        {
+            if (!OperatingSystem.IsWindows() && !OperatingSystem.IsLinux())
+            {
+                return;
+            }
+            int capCores = Math.Max(1, Environment.ProcessorCount / 2);
+            p.ProcessorAffinity = (IntPtr)((1L << capCores) - 1);
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Polite mode: ProcessorAffinity cap not applied (likely non-Windows)");
+        }
     }
 
     /// <summary>
@@ -169,6 +204,11 @@ public sealed class LanguageServerProcess : IAsyncDisposable
         // Track this process for emergency cleanup if our process dies abruptly.
         EnsureExitHandlerInstalled();
         s_liveProcesses[_process.Id] = _process;
+
+        if (_politeMode)
+        {
+            ApplyPoliteSettings(_process, _logger);
+        }
 
         // Set up StreamJsonRpc over stdin/stdout with LSP Content-Length framing.
         // Use JsonMessageFormatter (Newtonsoft.Json) with camelCase for LSP compatibility.

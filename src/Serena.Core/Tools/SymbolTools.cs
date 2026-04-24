@@ -8,13 +8,30 @@ using Serena.Lsp.Protocol.Types;
 
 namespace Serena.Core.Tools;
 
+/// <summary>
+/// Renders a <see cref="LanguageServerWarmingException"/> as a deterministic
+/// JSON string so the agent can detect and react to a warming-state response
+/// uniformly across find_symbol, find_referencing_symbols, and
+/// get_symbols_overview. The shared formatter keeps wording consistent.
+/// </summary>
+internal static class SymbolToolWarmingResponse
+{
+    public static string Format(LanguageServerWarmingException ex) => ex.ToJson();
+}
+
 [SymbolicRead]
 public sealed class FindSymbolTool : ToolBase
 {
     public FindSymbolTool(IToolContext context) : base(context) { }
 
     public override string Description =>
-        "Retrieves information on all symbols/code entities based on the given name path pattern.";
+        "Retrieves information on all symbols/code entities based on the given name path pattern. " +
+        "PERFORMANCE: when called WITH a relative_path, this uses a lightweight per-file parser " +
+        "and does NOT require Roslyn (works during warmup). When called WITHOUT relative_path " +
+        "(solution-wide search) it requires Roslyn and may return a warming status while loading. " +
+        "On large solutions (>50 projects): call warm_language_server right after set_active_solution " +
+        "to start warmup, prefer search_for_pattern for initial exploration, and call " +
+        "get_language_server_status to check readiness before solution-wide symbol queries.";
 
     protected override IReadOnlyList<ToolParameter> ExtractParameters() =>
     [
@@ -32,6 +49,8 @@ public sealed class FindSymbolTool : ToolBase
 
     protected override async Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
     {
+        try
+        {
         string namePathPattern = GetRequired<string>(arguments, "name_path_pattern");
         string relativePath = GetOptional(arguments, "relative_path", "");
         int depth = GetOptional(arguments, "depth", 0);
@@ -72,6 +91,11 @@ public sealed class FindSymbolTool : ToolBase
         string result = ToolResultFormatter.FormatGroupedSymbols(grouped, maxChars: -1);
         return LimitLength(result, maxAnswerChars,
             () => string.Join("\n", filteredList.Select(s => s.NamePath)));
+        }
+        catch (LanguageServerWarmingException ex)
+        {
+            return SymbolToolWarmingResponse.Format(ex);
+        }
     }
 
     private static string FormatTooManyMatches(
@@ -133,7 +157,10 @@ public sealed class GetSymbolsOverviewTool : ToolBase
     public GetSymbolsOverviewTool(IToolContext context) : base(context) { }
 
     public override string Description =>
-        "Get a high-level understanding of the code symbols in a file.";
+        "Get a high-level understanding of the code symbols in a file. " +
+        "PERFORMANCE: file-scoped (uses the lightweight per-file parser, does NOT require Roslyn). " +
+        "Safe to call during warmup. Prefer this + search_for_pattern over solution-wide symbol " +
+        "queries while warm_language_server / get_language_server_status report Loading.";
 
     protected override IReadOnlyList<ToolParameter> ExtractParameters() =>
     [
@@ -144,6 +171,8 @@ public sealed class GetSymbolsOverviewTool : ToolBase
 
     protected override async Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
     {
+        try
+        {
         string relativePath = GetRequired<string>(arguments, "relative_path");
         int depth = GetOptional(arguments, "depth", 0);
         int maxAnswerChars = GetOptional(arguments, "max_answer_chars", -1);
@@ -192,6 +221,11 @@ public sealed class GetSymbolsOverviewTool : ToolBase
         return LimitLength(fileResult, maxAnswerChars,
             () => FormatOverviewDepthZero(overview),
             () => FormatKindCounts(overview));
+        }
+        catch (LanguageServerWarmingException ex)
+        {
+            return SymbolToolWarmingResponse.Format(ex);
+        }
     }
 
     private static string FormatOverviewDepthZero(
@@ -231,7 +265,12 @@ public sealed class FindReferencingSymbolsTool : ToolBase
     public FindReferencingSymbolsTool(IToolContext context) : base(context) { }
 
     public override string Description =>
-        "Finds references to the symbol at the given name_path.";
+        "Finds references to the symbol at the given name_path. " +
+        "PERFORMANCE: ALWAYS requires Roslyn — there is no file-scoped fallback. Will return a " +
+        "warming status until get_language_server_status reports Ready. On large solutions: " +
+        "call warm_language_server right after set_active_solution; use search_for_pattern for " +
+        "call-site discovery while waiting; only call this once Ready. Do not retry immediately " +
+        "on a warming response — poll get_language_server_status first.";
 
     protected override IReadOnlyList<ToolParameter> ExtractParameters() =>
     [
@@ -246,6 +285,8 @@ public sealed class FindReferencingSymbolsTool : ToolBase
 
     protected override async Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
     {
+        try
+        {
         string namePath = GetRequired<string>(arguments, "name_path");
         string relativePath = GetRequired<string>(arguments, "relative_path");
         List<int>? includeKinds = GetOptionalList<int>(arguments, "include_kinds");
@@ -302,6 +343,11 @@ public sealed class FindReferencingSymbolsTool : ToolBase
             () => FormatReferencesWithoutSnippets(refDicts),
             () => FormatReferenceFileCounts(refDicts),
             () => $"Total references: {refDicts.Count}");
+        }
+        catch (LanguageServerWarmingException ex)
+        {
+            return SymbolToolWarmingResponse.Format(ex);
+        }
     }
 
     private static string FormatReferencesWithoutSnippets(List<Dictionary<string, object?>> refDicts)

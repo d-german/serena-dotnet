@@ -113,7 +113,7 @@ public abstract class LanguageServerDefinition
     /// Hook called after the language server has been initialized.
     /// Override to perform post-initialization setup (e.g., opening solutions/projects).
     /// </summary>
-    public virtual Task PostStartAsync(LspClient client, string projectRoot, CancellationToken ct = default)
+    public virtual Task PostStartAsync(LspClient client, string projectRoot, CustomLsSettings settings, CancellationToken ct = default)
         => Task.CompletedTask;
 
     /// <summary>

@@ -161,6 +161,11 @@ public static class Program
         registry.Register(new InitialInstructionsTool(context));
         registry.Register(new RemoveProjectTool(context));
         registry.Register(new RestartLanguageServerTool(context));
+        registry.Register(new SetActiveSolutionTool(context));
+        registry.Register(new ClearActiveSolutionTool(context));
+        registry.Register(new KillLanguageServerTool(context));
+        registry.Register(new LanguageServerStatusTool(context));
+        registry.Register(new WarmLanguageServerTool(context));
         registry.Register(new ListQueryableProjectsTool(context));
         registry.Register(new QueryProjectTool(context));
         registry.Register(new DeleteLinesTool(context));
