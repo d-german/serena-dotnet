@@ -26,6 +26,7 @@ public sealed class FindSymbolTool : ToolBase
 
     public override string Description =>
         "Retrieves information on all symbols/code entities based on the given name path pattern. " +
+        "Accepts either `name_path_pattern` (canonical) or `name_path` (alias) for the pattern argument. " +
         "PERFORMANCE: when called WITH a relative_path, this uses a lightweight per-file parser " +
         "and does NOT require Roslyn (works during warmup). When called WITHOUT relative_path " +
         "(solution-wide search) it requires Roslyn and may return a warming status while loading. " +
@@ -35,15 +36,16 @@ public sealed class FindSymbolTool : ToolBase
 
     protected override IReadOnlyList<ToolParameter> ExtractParameters() =>
     [
-        new("name_path_pattern", "The name path matching pattern (e.g., 'MyClass/myMethod').", typeof(string), Required: true),
+        new("name_path_pattern", "The name path matching pattern (e.g., 'MyClass/myMethod'). Canonical name; alias `name_path` is also accepted.", typeof(string), Required: false, DefaultValue: ""),
+        new("name_path", "Alias for `name_path_pattern`. Provide either one.", typeof(string), Required: false, DefaultValue: ""),
         new("relative_path", "Restrict search to this file or directory.", typeof(string), Required: false, DefaultValue: ""),
         new("depth", "Depth up to which descendants shall be retrieved.", typeof(int), Required: false, DefaultValue: 0),
         new("include_body", "Whether to include the symbol's source code.", typeof(bool), Required: false, DefaultValue: false),
         new("include_info", "Whether to include hover/docstring info.", typeof(bool), Required: false, DefaultValue: false),
         new("substring_matching", "If true, use substring matching for the last element.", typeof(bool), Required: false, DefaultValue: false),
-        new("include_kinds", "List of LSP symbol kind integers to include. If not provided, all kinds are included.", typeof(List<int>), Required: false),
-        new("exclude_kinds", "List of LSP symbol kind integers to exclude. Takes precedence over include_kinds.", typeof(List<int>), Required: false),
-        new("max_matches", "Maximum permitted matches. -1 for no limit.", typeof(int), Required: false, DefaultValue: -1),
+        new("include_kinds", "List of LSP symbol kind integers (1..26 per LSP spec) to include. If not provided, all kinds are included.", typeof(List<int>), Required: false),
+        new("exclude_kinds", "List of LSP symbol kind integers (1..26 per LSP spec) to exclude. Takes precedence over include_kinds.", typeof(List<int>), Required: false),
+        new("max_matches", "Maximum permitted matches. -1 for no limit. Must be -1 or a positive integer.", typeof(int), Required: false, DefaultValue: -1),
         new("max_answer_chars", "Max characters for the result. -1 for default.", typeof(int), Required: false, DefaultValue: -1),
     ];
 
@@ -51,7 +53,11 @@ public sealed class FindSymbolTool : ToolBase
     {
         try
         {
-        string namePathPattern = GetRequired<string>(arguments, "name_path_pattern");
+        string namePathPattern = GetOptional(arguments, "name_path_pattern", "");
+        if (string.IsNullOrWhiteSpace(namePathPattern))
+        {
+            namePathPattern = GetOptional(arguments, "name_path", "");
+        }
         string relativePath = GetOptional(arguments, "relative_path", "");
         int depth = GetOptional(arguments, "depth", 0);
         bool includeBody = GetOptional(arguments, "include_body", false);
@@ -61,6 +67,12 @@ public sealed class FindSymbolTool : ToolBase
         List<int>? excludeKinds = GetOptionalList<int>(arguments, "exclude_kinds");
         int maxMatches = GetOptional(arguments, "max_matches", -1);
         int maxAnswerChars = GetOptional(arguments, "max_answer_chars", -1);
+
+        string? validationError = ValidateArguments(namePathPattern, substringMatching, includeKinds, excludeKinds, maxMatches);
+        if (validationError is not null)
+        {
+            return validationError;
+        }
 
         string searchPath = string.IsNullOrEmpty(relativePath) ? "." : relativePath;
         var retriever = await RequireReadOnlyRetrieverAsync(searchPath, ct);
@@ -105,6 +117,59 @@ public sealed class FindSymbolTool : ToolBase
         return $"Too many matches ({totalCount}). Showing first {maxMatches + 5}:\n" +
                string.Join("\n", names) +
                "\nRefine your pattern to narrow results.";
+    }
+
+    /// <summary>
+    /// Validates find_symbol arguments. Returns null on success, or an error string
+    /// describing the first violation. T5/T6/T7 reject empty patterns, unsupported
+    /// wildcards, out-of-range LSP SymbolKind values, and invalid max_matches.
+    /// </summary>
+    private static string? ValidateArguments(
+        string namePathPattern,
+        bool substringMatching,
+        IReadOnlyList<int>? includeKinds,
+        IReadOnlyList<int>? excludeKinds,
+        int maxMatches)
+    {
+        if (string.IsNullOrWhiteSpace(namePathPattern))
+        {
+            return "name_path_pattern is required";
+        }
+
+        if (!substringMatching && (namePathPattern.Contains('*') || namePathPattern.Contains('?')))
+        {
+            return "wildcards not supported in name_path_pattern; pass substring_matching: true for partial matches";
+        }
+
+        string? kindError = ValidateKindList(includeKinds, "include_kinds")
+                         ?? ValidateKindList(excludeKinds, "exclude_kinds");
+        if (kindError is not null)
+        {
+            return kindError;
+        }
+
+        if (maxMatches != -1 && maxMatches <= 0)
+        {
+            return "max_matches must be -1 (unlimited) or a positive integer";
+        }
+
+        return null;
+    }
+
+    private static string? ValidateKindList(IReadOnlyList<int>? kinds, string parameterName)
+    {
+        if (kinds is null)
+        {
+            return null;
+        }
+        foreach (int kind in kinds)
+        {
+            if (kind < 1 || kind > 26)
+            {
+                return $"{parameterName} contains invalid LSP SymbolKind value: {kind} (valid: 1-26)";
+            }
+        }
+        return null;
     }
 
     private static async Task<List<Dictionary<string, object?>>> BuildResultDictsAsync(
@@ -209,6 +274,11 @@ public sealed class GetSymbolsOverviewTool : ToolBase
         // the retriever consults the symbol cache before starting the LSP,
         // so `GetSymbolOverviewAsync` below is instant on cached files and
         // only falls through to Roslyn on a genuine cache miss.
+        if (!File.Exists(absPath))
+        {
+            return $"File not found: {relativePath}";
+        }
+
         var retriever = await RequireReadOnlyRetrieverAsync(relativePath, ct);
         var overview = await retriever.GetSymbolOverviewAsync(relativePath, depth, ct);
 

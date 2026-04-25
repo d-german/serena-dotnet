@@ -386,11 +386,9 @@ public sealed class ActivateProjectTool : ToolBase
             sb.AppendLine("Onboarding: NOT performed. No project memories found.");
             sb.AppendLine("Consider calling the 'onboarding' tool to learn about this project.");
         }
-        else
-        {
-            sb.AppendLine();
-            sb.AppendLine($"Onboarding: performed ({projectMemories.Count} project memories).");
-        }
+        // T11: when onboarding has already been performed, do NOT repeat
+        // "Onboarding: performed (N project memories)" on every activation —
+        // it's noise. Memories themselves still list below when present.
 
         if (allMemories.Count > 0)
         {

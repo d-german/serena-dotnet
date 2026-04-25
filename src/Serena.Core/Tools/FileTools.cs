@@ -4,6 +4,7 @@
 using System.Collections.Concurrent;
 using System.Text;
 using System.Text.RegularExpressions;
+using Microsoft.Extensions.Logging;
 using Serena.Core.Editor;
 
 namespace Serena.Core.Tools;
@@ -30,10 +31,25 @@ public sealed class ReadFileTool : ToolBase
         int endLine = GetOptional(arguments, "end_line", -1);
         int maxChars = GetOptional(arguments, "max_answer_chars", -1);
 
+        // T8: reject explicit negative line indices. The default-injected -1 for
+        // end_line (caller omitted it) means "to end of file" and is preserved.
+        if (arguments.ContainsKey("start_line") && startLine < 0)
+        {
+            return "start_line must be >= 0";
+        }
+        if (arguments.ContainsKey("end_line") && endLine < 0)
+        {
+            return "end_line must be >= 0";
+        }
+
         string fullPath = ResolvePath(relativePath);
+        if (Directory.Exists(fullPath))
+        {
+            return $"Path '{relativePath}' is a directory, expected a file.";
+        }
         if (!File.Exists(fullPath))
         {
-            throw new FileNotFoundException($"File not found: {relativePath}", relativePath);
+            return $"Path not found: {relativePath}";
         }
 
         string[] lines = await File.ReadAllLinesAsync(fullPath, GetProjectEncoding(), ct);
@@ -119,9 +135,13 @@ public sealed class ListDirTool : ToolBase
         int maxChars = GetOptional(arguments, "max_answer_chars", -1);
 
         string fullPath = ResolvePath(relativePath);
+        if (File.Exists(fullPath))
+        {
+            return Task.FromResult($"Path '{relativePath}' is a file, expected a directory.");
+        }
         if (!Directory.Exists(fullPath))
         {
-            throw new DirectoryNotFoundException($"Directory not found: {relativePath}");
+            return Task.FromResult($"Path not found: {relativePath}");
         }
 
         string projectRoot = RequireProjectRoot();
@@ -152,10 +172,26 @@ public sealed class FindFileTool : ToolBase
         string fileMask = GetRequired<string>(arguments, "file_mask");
         string relativePath = GetOptional(arguments, "relative_path", ".");
 
+        // T9: validate the glob compiles up-front so a bad pattern (e.g. unbalanced `[`)
+        // surfaces a clear error instead of an indistinguishable empty result list.
+        Regex compiledMask;
+        try
+        {
+            compiledMask = new Regex(FileSystemHelpers.GlobToRegex(fileMask), RegexOptions.IgnoreCase);
+        }
+        catch (RegexParseException ex)
+        {
+            return Task.FromResult($"invalid glob: {ex.Message}");
+        }
+
         string fullPath = ResolvePath(relativePath);
+        if (File.Exists(fullPath))
+        {
+            return Task.FromResult($"Path '{relativePath}' is a file, expected a directory.");
+        }
         if (!Directory.Exists(fullPath))
         {
-            throw new DirectoryNotFoundException($"Directory not found: {relativePath}");
+            return Task.FromResult($"Path not found: {relativePath}");
         }
 
         string projectRoot = RequireProjectRoot();
@@ -164,7 +200,7 @@ public sealed class FindFileTool : ToolBase
             isIgnored: IsPathIgnored);
 
         var matchingFiles = allFiles
-            .Where(f => FileSystemHelpers.MatchesGlob(Path.GetFileName(f), fileMask))
+            .Where(f => compiledMask.IsMatch(Path.GetFileName(f)))
             .ToList();
 
         return Task.FromResult(ToJson(new { files = matchingFiles }));
@@ -173,18 +209,23 @@ public sealed class FindFileTool : ToolBase
 
 public sealed class SearchForPatternTool : ToolBase
 {
+    public const int MaxContextLines = 500;
+    public const int DefaultMaxAnswerChars = 2_000_000;
+
     public SearchForPatternTool(IToolContext context) : base(context) { }
 
     public override string Description =>
-        "Searches for arbitrary patterns in the codebase using regex.";
+        "Searches for arbitrary patterns in the codebase using regex. " +
+        "context_lines_before/after are hard-capped at 500 each. " +
+        "max_answer_chars defaults to 2,000,000; pass -1 to disable the cap.";
 
     protected override IReadOnlyList<ToolParameter> ExtractParameters() =>
     [
         new("substring_pattern", "Regular expression pattern to search for.", typeof(string), Required: true),
         new("relative_path", "Restrict search to this file or directory.", typeof(string), Required: false, DefaultValue: ""),
-        new("context_lines_before", "Number of lines of context before each match.", typeof(int), Required: false, DefaultValue: 0),
-        new("context_lines_after", "Number of lines of context after each match.", typeof(int), Required: false, DefaultValue: 0),
-        new("max_answer_chars", "Max characters for the result. -1 for default.", typeof(int), Required: false, DefaultValue: -1),
+        new("context_lines_before", "Number of lines of context before each match. Hard-capped at 500.", typeof(int), Required: false, DefaultValue: 0),
+        new("context_lines_after", "Number of lines of context after each match. Hard-capped at 500.", typeof(int), Required: false, DefaultValue: 0),
+        new("max_answer_chars", "Max characters for the result. Default 2,000,000; pass -1 to disable.", typeof(int), Required: false, DefaultValue: DefaultMaxAnswerChars),
         new("paths_include_glob", "Only search files whose name matches this glob pattern (e.g. '*.cs').", typeof(string), Required: false, DefaultValue: ""),
         new("paths_exclude_glob", "Exclude files whose name matches this glob pattern (e.g. '*.min.js').", typeof(string), Required: false, DefaultValue: ""),
         new("restrict_search_to_code_files", "When true, only search files that the language server can analyze.", typeof(bool), Required: false, DefaultValue: false),
@@ -196,10 +237,21 @@ public sealed class SearchForPatternTool : ToolBase
         string relativePath = GetOptional(arguments, "relative_path", "");
         int contextBefore = GetOptional(arguments, "context_lines_before", 0);
         int contextAfter = GetOptional(arguments, "context_lines_after", 0);
-        int maxChars = GetOptional(arguments, "max_answer_chars", -1);
+        int maxChars = GetOptional(arguments, "max_answer_chars", DefaultMaxAnswerChars);
         string includeGlob = GetOptional(arguments, "paths_include_glob", "");
         string excludeGlob = GetOptional(arguments, "paths_exclude_glob", "");
         bool codeFilesOnly = GetOptional(arguments, "restrict_search_to_code_files", false);
+
+        if (contextBefore > MaxContextLines)
+        {
+            Logger.LogWarning("context_lines_before clamped from {Requested} to {Clamped}", contextBefore, MaxContextLines);
+            contextBefore = MaxContextLines;
+        }
+        if (contextAfter > MaxContextLines)
+        {
+            Logger.LogWarning("context_lines_after clamped from {Requested} to {Clamped}", contextAfter, MaxContextLines);
+            contextAfter = MaxContextLines;
+        }
 
         string projectRoot = RequireProjectRoot();
         string searchRoot = string.IsNullOrEmpty(relativePath)
@@ -395,9 +447,33 @@ internal static class FileSystemHelpers
 
     public static bool MatchesGlob(string fileName, string pattern)
     {
-        string regexPattern = "^" + Regex.Escape(pattern)
-            .Replace("\\*", ".*")
-            .Replace("\\?", ".") + "$";
-        return Regex.IsMatch(fileName, regexPattern, RegexOptions.IgnoreCase);
+        return Regex.IsMatch(fileName, GlobToRegex(pattern), RegexOptions.IgnoreCase);
+    }
+
+    /// <summary>
+    /// Translates a glob pattern (`*`, `?`, `[seq]` character classes) to a regex
+    /// anchored on both ends. Throws <see cref="RegexParseException"/> if the
+    /// translated pattern is not a valid regex (e.g. unbalanced `[`).
+    /// </summary>
+    public static string GlobToRegex(string pattern)
+    {
+        var sb = new StringBuilder("^");
+        foreach (char c in pattern)
+        {
+            switch (c)
+            {
+                case '*': sb.Append(".*"); break;
+                case '?': sb.Append('.'); break;
+                case '[':
+                case ']':
+                    sb.Append(c);
+                    break;
+                default:
+                    sb.Append(Regex.Escape(c.ToString()));
+                    break;
+            }
+        }
+        sb.Append('$');
+        return sb.ToString();
     }
 }
