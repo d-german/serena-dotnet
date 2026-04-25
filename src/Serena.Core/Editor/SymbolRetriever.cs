@@ -46,8 +46,24 @@ public sealed class LanguageServerSymbol
     /// <summary>
     /// Wraps a <see cref="UnifiedSymbolInformation"/> tree into <see cref="LanguageServerSymbol"/> tree.
     /// </summary>
+    /// <remarks>
+    /// v1.0.30: re-links <see cref="UnifiedSymbolInformation.Parent"/> on each
+    /// child as we recurse. Parent is <c>[JsonIgnore]</c>, so it is lost when
+    /// the symbol cache (.serena/cache/&lt;lang&gt;/symbols.json) is deserialized.
+    /// Without this, <see cref="UnifiedSymbolInformation.NamePath"/> returns
+    /// only the leaf name (e.g. "GetPageThumbnail") instead of the qualified
+    /// path ("ThumbnailController/GetPageThumbnail"), which broke
+    /// <c>find_symbol</c> for any class-qualified <c>name_path_pattern</c>
+    /// on a file-scoped call. Idempotent for in-memory trees where Parent is
+    /// already set.
+    /// </remarks>
     public static LanguageServerSymbol FromUnified(UnifiedSymbolInformation unified, string relativePath)
     {
+        foreach (var child in unified.Children)
+        {
+            child.Parent = unified;
+        }
+
         var children = unified.Children
             .Select(c => FromUnified(c, relativePath))
             .ToList();

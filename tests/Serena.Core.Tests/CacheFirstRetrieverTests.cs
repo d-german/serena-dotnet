@@ -134,4 +134,59 @@ public class CacheFirstRetrieverTests
         factoryCalled.Should().BeFalse("directory-scoped find_symbol on a populated cache must not start LSP");
         matches.Should().ContainSingle(s => s.Name == "C");
     }
+
+    /// <summary>
+    /// Regression for v1.0.30 bug: cache deserialization loses Parent links
+    /// because <c>UnifiedSymbolInformation.Parent</c> is <c>[JsonIgnore]</c>.
+    /// Class-qualified patterns like "ThumbnailController/GetPageThumbnail"
+    /// must still match a method nested under that class on a file-scoped
+    /// cache hit. <see cref="LanguageServerSymbol.FromUnified"/> relinks
+    /// Parent on each child as it walks; this test verifies that.
+    /// </summary>
+    [Fact]
+    public async Task FindSymbolsByNamePathAsync_FileScoped_MatchesClassQualifiedPattern_AfterParentLinksLost()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "serena-root-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        string relPath = "ThumbnailController.cs";
+        string absPath = Path.Combine(root, relPath);
+        File.WriteAllText(absPath, "class C {}");
+
+        // Build a class-with-method tree, then strip Parent links to simulate
+        // what happens after JSON round-trip through the on-disk cache.
+        var range = new LspRange(new Position(0, 0), new Position(0, 0));
+        var method = new UnifiedSymbolInformation
+        {
+            Name = "GetPageThumbnail",
+            Kind = SymbolKind.Method,
+            BodyRange = range,
+            SelectionRange = range,
+            Location = new Location("file:///test.cs", range),
+        };
+        var cls = new UnifiedSymbolInformation
+        {
+            Name = "ThumbnailController",
+            Kind = SymbolKind.Class,
+            BodyRange = range,
+            SelectionRange = range,
+            Location = new Location("file:///test.cs", range),
+            Children = [method],
+        };
+        // DELIBERATELY do NOT set method.Parent = cls. This mirrors the
+        // post-deserialization state that broke find_symbol pre-v1.0.30.
+
+        var cache = NewEmptyCache();
+        string fingerprint = CacheFingerprint.ForFile(absPath);
+        cache.Set(absPath, fingerprint, [cls]);
+
+        var retriever = new LanguageServerSymbolRetriever(
+            _ => throw new InvalidOperationException("LSP must not be started"),
+            root, NullLogger.Instance, cache);
+
+        var matches = await retriever.FindSymbolsByNamePathAsync(
+            "ThumbnailController/GetPageThumbnail", relPath);
+
+        matches.Should().ContainSingle(s => s.Name == "GetPageThumbnail",
+            "class-qualified pattern must match nested method even when Parent links were lost in cache");
+    }
 }

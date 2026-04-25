@@ -242,6 +242,58 @@ public sealed class InitialInstructionsTool : ToolBase
         - `onboarding` — Get instructions for project exploration
         - `initial_instructions` — This manual
 
+        ## Working with the C# Language Server (Roslyn)
+
+        For C# projects, symbol-graph tools are split into two categories with very different
+        cost and readiness requirements. Knowing the difference avoids the most common failure
+        mode (hung calls, empty results, timeouts).
+
+        ### Tools that DO NOT require Roslyn — work immediately, even during warmup
+        - `search_for_pattern` — text/regex search
+        - `find_file` — filename glob
+        - `read_file`
+        - `list_dir`
+        - `get_symbols_overview` — file-scoped lightweight parser
+        - `find_symbol` **WHEN you pass `relative_path`** — file-scoped lightweight parser
+
+        ### Tools that REQUIRE Roslyn (state == Ready)
+        - `find_symbol` **WITHOUT `relative_path`** — solution-wide
+        - `find_referencing_symbols` — needs the full symbol graph
+        - `rename_symbol` — needs the full symbol graph
+        - `replace_symbol_body`, `insert_before_symbol`, `insert_after_symbol`,
+          `safe_delete_symbol` — symbol-targeting edits
+
+        ### Recommended workflow for any C# task
+        1. **Scope first.** If multiple solutions exist, call `set_active_solution` with the
+           narrowest solution that contains the code you'll touch. Roslyn only loads projects
+           in scope, so a tight scope means a fast warmup.
+        2. **Kick off warmup immediately.** Call `warm_language_server` once. It returns in
+           seconds and starts Roslyn loading in the background. Do NOT wait for it.
+        3. **Work while it loads.** Use the no-Roslyn tools above for exploration:
+           `search_for_pattern` to find candidates, `read_file` and `get_symbols_overview` to
+           read them, `find_symbol` with `relative_path` for file-scoped symbol lookups.
+        4. **Poll, don't retry.** Call `get_language_server_status` every 60–120 seconds to
+           check progress. On large solutions warmup takes 10–30 minutes.
+        5. **Use Roslyn-only tools once Ready.** When `state == Ready`, switch to solution-wide
+           `find_symbol`, `find_referencing_symbols`, and `rename_symbol` for the questions
+           that actually need the full symbol graph (find every caller, resolve overloads,
+           rename across the solution).
+
+        ### Critical rules
+        - **Never retry a Roslyn-bound symbol call immediately after a `language_server_warming`
+          response.** Poll `get_language_server_status` first. The warming response is
+          structured JSON, not a transient error.
+        - **A `find_referencing_symbols` empty result during warmup is meaningless.** It does
+          not mean "no callers" — it means "Roslyn isn't ready." Wait for Ready, then re-ask.
+        - **File-scoped `find_symbol` (with `relative_path`) returning empty IS meaningful** —
+          that path uses the lightweight parser and does not depend on Roslyn.
+
+        ### When to choose grep vs. Roslyn
+        - **Grep wins (use the no-Roslyn tools):** forward pipeline traces, finding files,
+          named-symbol lookups in known files, architectural exploration.
+        - **Roslyn wins (wait for Ready):** "find every caller of method X" across overloads,
+          finding all implementations of an interface, renaming a symbol, impact analysis.
+
         ## Best Practices
 
         1. **Start with overview**: Use `get_symbols_overview` before `find_symbol`
