@@ -57,9 +57,16 @@ public sealed class LanguageServerWarmingException : LspClientException
 
     public string ToJson()
     {
+        // v1.0.32: when the workspace IS Ready but the per-request timeout
+        // fired (slow request, not warmup), surface a distinct status so the
+        // agent doesn't think "warmup is taking forever" — it's the request
+        // itself that took too long.
+        bool requestTimeoutWhileReady = Snapshot.State == WorkspaceReadyState.Ready;
         var payload = new Dictionary<string, object?>
         {
-            ["status"] = "language_server_warming",
+            ["status"] = requestTimeoutWhileReady
+                ? "language_server_request_timeout"
+                : "language_server_warming",
             ["language"] = WarmingLanguage.ToString().ToLowerInvariant(),
             ["state"] = Snapshot.State.ToString(),
             ["projects_loaded"] = Snapshot.ProjectsLoaded,
@@ -73,6 +80,16 @@ public sealed class LanguageServerWarmingException : LspClientException
 
     private static string BuildMessage(Language language, ReadyStateSnapshot snapshot, string advice)
     {
+        // v1.0.32: "is still Ready after Xs" is self-contradictory. When State
+        // is Ready the workspace finished loading and the per-request timeout
+        // is what fired; report that distinctly. Snapshot.ElapsedSeconds is
+        // workspace uptime, not request duration — phrase accordingly.
+        if (snapshot.State == WorkspaceReadyState.Ready)
+        {
+            return $"{language} language server request timed out (workspace state: Ready, " +
+                   $"uptime {Math.Round(snapshot.ElapsedSeconds, 1)}s). {advice}";
+        }
+
         string progress = snapshot.ProjectsTotal is int total
             ? $" ({snapshot.ProjectsLoaded ?? 0}/{total} projects)"
             : "";

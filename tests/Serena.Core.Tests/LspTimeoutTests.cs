@@ -89,4 +89,28 @@ public class LspTimeoutTests
         json.Should().Contain("\"projects_total\": 185");
         json.Should().Contain("Use search_for_pattern");
     }
+
+    /// <summary>
+    /// v1.0.32 regression: when the per-request timeout fires while the
+    /// workspace is already Ready, the message must NOT say "is still Ready"
+    /// (self-contradictory) and the JSON status must distinguish a slow
+    /// request from a warming workspace.
+    /// </summary>
+    [Fact]
+    public void WarmingException_StateReady_DoesNotSayStillReady_AndUsesRequestTimeoutStatus()
+    {
+        var ex = new LanguageServerWarmingException(
+            Language.CSharp,
+            new ReadyStateSnapshot(WorkspaceReadyState.Ready, 185, 185, 837.9, "1 solution(s)"),
+            "Try scoping the request or raise SERENA_LSP_REQUEST_TIMEOUT_SECONDS.");
+
+        ex.Message.Should().NotContain("is still Ready");
+        ex.Message.Should().Contain("request timed out");
+        ex.Message.Should().Contain("workspace state: Ready");
+        ex.Message.Should().Contain("uptime 837.9s");
+
+        string json = ex.ToJson();
+        json.Should().Contain("language_server_request_timeout");
+        json.Should().NotContain("language_server_warming");
+    }
 }

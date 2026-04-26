@@ -78,8 +78,17 @@ public static class LspTimeout
         {
             // Inner timeout fired — convert to a warming signal the tool layer can act on.
             var snapshot = snapshotFactory();
-            string advice = "Use search_for_pattern for exploration. Call get_language_server_status " +
-                            "to check readiness, then retry this request.";
+            // v1.0.32: tailor advice. If state is still Loading/NotStarted, the
+            // request raced workspace warmup and the agent should poll readiness.
+            // If state is Ready, warmup is DONE — the request itself was slow
+            // (e.g. heavy semantic edit on a large file). Different remediation.
+            string advice = snapshot.State == WorkspaceReadyState.Ready
+                ? $"The workspace is loaded but this individual request exceeded " +
+                  $"{RequestTimeout.TotalSeconds:0}s (SERENA_LSP_REQUEST_TIMEOUT_SECONDS). " +
+                  $"Try: (1) scope the operation to a smaller file/symbol, (2) raise " +
+                  $"SERENA_LSP_REQUEST_TIMEOUT_SECONDS, or (3) restart_language_server if Roslyn is stuck."
+                : "Use search_for_pattern for exploration. Call get_language_server_status " +
+                  "to check readiness, then retry this request.";
             logger?.LogInformation(
                 "LSP request for {Language} timed out after {Timeout}s while server state is {State}",
                 language, RequestTimeout.TotalSeconds, snapshot.State);
