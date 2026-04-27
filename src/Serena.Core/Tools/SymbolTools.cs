@@ -43,6 +43,7 @@ public sealed class FindSymbolTool : ToolBase
         new("include_body", "Whether to include the symbol's source code.", typeof(bool), Required: false, DefaultValue: false),
         new("include_info", "Whether to include hover/docstring info.", typeof(bool), Required: false, DefaultValue: false),
         new("substring_matching", "If true, use substring matching for the last element.", typeof(bool), Required: false, DefaultValue: false),
+        new("match_overloads", "If true, ignore parent path and match all symbols whose leaf name equals the pattern's last segment. Mutually exclusive with substring_matching.", typeof(bool), Required: false, DefaultValue: false),
         new("include_kinds", "List of LSP symbol kind integers (1..26 per LSP spec) to include. If not provided, all kinds are included.", typeof(List<int>), Required: false),
         new("exclude_kinds", "List of LSP symbol kind integers (1..26 per LSP spec) to exclude. Takes precedence over include_kinds.", typeof(List<int>), Required: false),
         new("max_matches", "Maximum permitted matches. -1 for no limit. Must be -1 or a positive integer.", typeof(int), Required: false, DefaultValue: -1),
@@ -63,12 +64,13 @@ public sealed class FindSymbolTool : ToolBase
         bool includeBody = GetOptional(arguments, "include_body", false);
         bool includeInfo = GetOptional(arguments, "include_info", false);
         bool substringMatching = GetOptional(arguments, "substring_matching", false);
+        bool matchOverloads = GetOptional(arguments, "match_overloads", false);
         List<int>? includeKinds = GetOptionalList<int>(arguments, "include_kinds");
         List<int>? excludeKinds = GetOptionalList<int>(arguments, "exclude_kinds");
         int maxMatches = GetOptional(arguments, "max_matches", -1);
         int maxAnswerChars = GetOptional(arguments, "max_answer_chars", -1);
 
-        string? validationError = ValidateArguments(namePathPattern, substringMatching, includeKinds, excludeKinds, maxMatches);
+        string? validationError = ValidateArguments(namePathPattern, substringMatching, matchOverloads, includeKinds, excludeKinds, maxMatches);
         if (validationError is not null)
         {
             return validationError;
@@ -77,11 +79,23 @@ public sealed class FindSymbolTool : ToolBase
         string searchPath = string.IsNullOrEmpty(relativePath) ? "." : relativePath;
         var retriever = await RequireReadOnlyRetrieverAsync(searchPath, ct);
 
-        var symbols = await retriever.FindSymbolsByNamePathAsync(
-            namePathPattern,
-            string.IsNullOrEmpty(relativePath) ? null : relativePath,
-            substringMatching,
-            ct);
+        IReadOnlyList<LanguageServerSymbol> symbols;
+        if (matchOverloads)
+        {
+            string leaf = namePathPattern.Split('/').Last();
+            symbols = await retriever.FindByLeafNameAsync(
+                leaf,
+                string.IsNullOrEmpty(relativePath) ? null : relativePath,
+                ct);
+        }
+        else
+        {
+            symbols = await retriever.FindSymbolsByNamePathAsync(
+                namePathPattern,
+                string.IsNullOrEmpty(relativePath) ? null : relativePath,
+                substringMatching,
+                ct);
+        }
 
         var filtered = SymbolKindFilter.FilterByKind(symbols, includeKinds, excludeKinds, s => (int)s.Kind);
         var filteredList = filtered.ToList();
@@ -93,11 +107,55 @@ public sealed class FindSymbolTool : ToolBase
 
         if (filteredList.Count == 0)
         {
+            // v1.0.34: leaf-name fallback. If the exact path returned nothing,
+            // try a case-insensitive leaf-name match across the same scope so
+            // the agent gets a useful "did you mean…" list instead of a flat
+            // "not found" reply.
+            string leaf = namePathPattern.Split('/').Last();
+            if (!string.IsNullOrEmpty(leaf))
+            {
+                var leafMatches = await retriever.FindByLeafNameAsync(
+                    leaf,
+                    string.IsNullOrEmpty(relativePath) ? null : relativePath,
+                    ct);
+                var leafFiltered = SymbolKindFilter.FilterByKind(
+                    leafMatches, includeKinds, excludeKinds, s => (int)s.Kind).ToList();
+                if (leafFiltered.Count > 0)
+                {
+                    var sb = new System.Text.StringBuilder();
+                    sb.AppendLine(
+                        $"No exact match for '{namePathPattern}'. Found {leafFiltered.Count} symbols with leaf name '{leaf}':");
+                    foreach (var s in leafFiltered)
+                    {
+                        int startLine = s.BodyLocation?.StartLine ?? 0;
+                        int endLine = s.BodyLocation?.EndLine ?? 0;
+                        sb.AppendLine(
+                            $"- {s.NamePath} ({s.Kind}, {s.RelativePath}:{startLine + 1}-{endLine + 1})");
+                    }
+                    return sb.ToString().TrimEnd();
+                }
+            }
+
             return $"No symbols found matching '{namePathPattern}'" +
                    (string.IsNullOrEmpty(relativePath) ? "" : $" in {relativePath}");
         }
 
         var resultDicts = await BuildResultDictsAsync(filteredList, retriever, includeBody, includeInfo, depth, ct);
+
+        // v1.0.34: outline-first rendering when bodies are requested. Keeps the
+        // outline visible up front so the agent can cheaply see kind, name path,
+        // location, and body size for every match before any body bytes are
+        // streamed; bodies past per-symbol or cumulative caps are replaced with
+        // a deterministic re-fetch hint instead of being silently truncated.
+        if (includeBody)
+        {
+            int perBody = GetMaxInlineBodyBytes();
+            int totalBody = perBody * 4;
+            string outlineFirst = ToolResultFormatter.FormatSymbolsOutlineFirst(
+                resultDicts, perBody, totalBody);
+            return LimitLength(outlineFirst, maxAnswerChars,
+                () => string.Join("\n", filteredList.Select(s => s.NamePath)));
+        }
 
         var grouped = SymbolDictGrouper.GroupByMultiple(resultDicts, ["relative_path", "kind"]);
         string result = ToolResultFormatter.FormatGroupedSymbols(grouped, maxChars: -1);
@@ -108,6 +166,21 @@ public sealed class FindSymbolTool : ToolBase
         {
             return SymbolToolWarmingResponse.Format(ex);
         }
+    }
+
+    /// <summary>
+    /// v1.0.34: per-symbol body inline cap for outline-first rendering.
+    /// Configurable via SERENA_MAX_INLINE_BODY_BYTES, clamped to [512, 1_048_576].
+    /// Total cap (across all matches) is 4× the per-symbol cap.
+    /// </summary>
+    private static int GetMaxInlineBodyBytes()
+    {
+        string? raw = Environment.GetEnvironmentVariable("SERENA_MAX_INLINE_BODY_BYTES");
+        if (int.TryParse(raw, out int v))
+        {
+            return Math.Clamp(v, 512, 1_048_576);
+        }
+        return 8192;
     }
 
     private static string FormatTooManyMatches(
@@ -123,10 +196,12 @@ public sealed class FindSymbolTool : ToolBase
     /// Validates find_symbol arguments. Returns null on success, or an error string
     /// describing the first violation. T5/T6/T7 reject empty patterns, unsupported
     /// wildcards, out-of-range LSP SymbolKind values, and invalid max_matches.
+    /// v1.0.34 adds match_overloads and rejects combination with substring_matching.
     /// </summary>
     private static string? ValidateArguments(
         string namePathPattern,
         bool substringMatching,
+        bool matchOverloads,
         IReadOnlyList<int>? includeKinds,
         IReadOnlyList<int>? excludeKinds,
         int maxMatches)
@@ -134,6 +209,11 @@ public sealed class FindSymbolTool : ToolBase
         if (string.IsNullOrWhiteSpace(namePathPattern))
         {
             return "name_path_pattern is required";
+        }
+
+        if (matchOverloads && substringMatching)
+        {
+            return "match_overloads and substring_matching are mutually exclusive";
         }
 
         if (!substringMatching && (namePathPattern.Contains('*') || namePathPattern.Contains('?')))
@@ -232,6 +312,7 @@ public sealed class GetSymbolsOverviewTool : ToolBase
         new("relative_path", "The relative path to the file to get the overview of.", typeof(string), Required: true),
         new("depth", "Depth up to which descendants of top-level symbols shall be retrieved.", typeof(int), Required: false, DefaultValue: 0),
         new("max_answer_chars", "Max characters for the result. -1 for default.", typeof(int), Required: false, DefaultValue: -1),
+        new("auto_descend_containers", "v1.0.34: when depth=0 and the overview only contains namespace/module/package containers, automatically re-fetch with depth=2 so callers see actual types/methods. Default true.", typeof(bool), Required: false, DefaultValue: true),
     ];
 
     protected override async Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
@@ -241,6 +322,7 @@ public sealed class GetSymbolsOverviewTool : ToolBase
         string relativePath = GetRequired<string>(arguments, "relative_path");
         int depth = GetOptional(arguments, "depth", 0);
         int maxAnswerChars = GetOptional(arguments, "max_answer_chars", -1);
+        bool autoDescend = GetOptional(arguments, "auto_descend_containers", true);
 
         string root = RequireProjectRoot();
         string absPath = Path.GetFullPath(Path.Combine(root, relativePath));
@@ -264,6 +346,15 @@ public sealed class GetSymbolsOverviewTool : ToolBase
                 return $"No symbols found in {relativePath}";
             }
 
+            // v1.0.34: auto-descend when every file in the directory only exposes
+            // namespace/module/package containers at depth 0. Re-fetch with depth=2
+            // so callers see the actual types and members instead of an empty shell.
+            if (depth == 0 && autoDescend &&
+                dirOverview.Values.All(IsOnlyContainers))
+            {
+                dirOverview = await dirRetriever.GetDirectoryOverviewAsync(relativePath, depth: 2, ct);
+            }
+
             string dirResult = ToolResultFormatter.FormatDirectoryOverview(dirOverview, maxChars: -1);
             return LimitLength(dirResult, maxAnswerChars,
                 () => FormatOverviewDepthZero(dirOverview.Values.SelectMany(o => o).ToDictionary(kv => kv.Key, kv => kv.Value)),
@@ -285,6 +376,12 @@ public sealed class GetSymbolsOverviewTool : ToolBase
         if (overview.Count == 0)
         {
             return $"No symbols found in {relativePath}";
+        }
+
+        // v1.0.34: auto-descend when depth=0 returns only namespace-like containers.
+        if (depth == 0 && autoDescend && IsOnlyContainers(overview))
+        {
+            overview = await retriever.GetSymbolOverviewAsync(relativePath, depth: 2, ct);
         }
 
         string fileResult = ToolResultFormatter.FormatSymbolOverview(overview, maxChars: -1);
@@ -316,6 +413,23 @@ public sealed class GetSymbolsOverviewTool : ToolBase
         Dictionary<string, List<Dictionary<string, object?>>> overview)
     {
         return string.Join(", ", overview.Select(kv => $"{kv.Key}: {kv.Value.Count}"));
+    }
+
+    /// <summary>
+    /// v1.0.34: returns true when the overview's only kinds are namespace-style
+    /// containers (Namespace, Module, Package). Used by auto_descend_containers
+    /// to detect when depth=0 produced an effectively empty shell that should be
+    /// re-fetched at depth=2.
+    /// </summary>
+    internal static bool IsOnlyContainers(
+        Dictionary<string, List<Dictionary<string, object?>>> overview)
+    {
+        if (overview.Count == 0)
+        {
+            return false;
+        }
+        return overview.Keys.All(k =>
+            k == "Namespace" || k == "Module" || k == "Package");
     }
 
     /// <summary>

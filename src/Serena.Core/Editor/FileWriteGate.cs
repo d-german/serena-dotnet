@@ -34,14 +34,12 @@ public static class FileWriteGate
 
         try
         {
-            if (encoding is null)
-            {
-                await File.WriteAllTextAsync(absolutePath, content, ct).ConfigureAwait(false);
-            }
-            else
-            {
-                await File.WriteAllTextAsync(absolutePath, content, encoding, ct).ConfigureAwait(false);
-            }
+            // v1.0.34: Always route through BomPreservingEncoding so an existing
+            // UTF-8 BOM is preserved on rewrite (and absent BOMs stay absent).
+            Encoding resolved = await BomPreservingEncoding
+                .ResolveAsync(absolutePath, encoding, ct)
+                .ConfigureAwait(false);
+            await File.WriteAllTextAsync(absolutePath, content, resolved, ct).ConfigureAwait(false);
         }
         finally
         {

@@ -19,3 +19,4 @@ Thumbs.db
 
 # VS Code local config (contains credentials)
 .vscode/
+blob.bin

@@ -235,6 +235,92 @@ public static class ToolResultFormatter
     }
 
     /// <summary>
+    /// v1.0.34: outline-first symbol rendering. Produces an outline of every
+    /// match (kind + name_path + location + body size) followed by the bodies,
+    /// inlining each body up to <paramref name="maxBodyBytes"/>. Bodies that
+    /// exceed the per-symbol cap, or that would push cumulative inlined bytes
+    /// past <paramref name="maxTotalBodyBytes"/>, are replaced with a deterministic
+    /// hint telling the caller exactly how to fetch the body via a follow-up
+    /// find_symbol call. The outline section is always present.
+    /// </summary>
+    public static string FormatSymbolsOutlineFirst(
+        IList<Dictionary<string, object?>> symbols,
+        int maxBodyBytes,
+        int maxTotalBodyBytes)
+    {
+        var outline = new StringBuilder();
+        var bodies = new StringBuilder();
+
+        outline.Append("=== Outline ===\n");
+        bodies.Append("=== Bodies ===\n");
+
+        long inlinedTotal = 0;
+        foreach (var sym in symbols)
+        {
+            string namePath = GetString(sym, "name_path") ?? "?";
+            string kind = GetString(sym, "kind") ?? "?";
+            string relPath = GetString(sym, "relative_path") ?? "?";
+            (int startLine, int endLine) = GetBodyLines(sym);
+            string body = GetString(sym, "body") ?? string.Empty;
+            int bodyChars = body.Length;
+
+            outline.Append(
+                $"{kind} {namePath} {relPath}:{startLine + 1}-{endLine + 1} ({bodyChars} chars)\n");
+
+            bodies.Append($"--- {kind} {namePath} {relPath}:{startLine + 1}-{endLine + 1} ---\n");
+            bool overPer = bodyChars > maxBodyBytes;
+            bool overTotal = !overPer && (inlinedTotal + bodyChars) > maxTotalBodyBytes;
+            if (overPer || overTotal)
+            {
+                bodies.Append(
+                    $"<body omitted: {bodyChars} chars; re-call find_symbol with relative_path=\"{relPath}\", name_path=\"{namePath}\", include_body=true to fetch>\n");
+            }
+            else
+            {
+                bodies.Append(body);
+                if (!body.EndsWith('\n'))
+                {
+                    bodies.Append('\n');
+                }
+                inlinedTotal += bodyChars;
+            }
+        }
+
+        var sb = new StringBuilder(outline.Length + bodies.Length + 2);
+        sb.Append(outline);
+        sb.Append('\n');
+        sb.Append(bodies);
+        return sb.ToString();
+    }
+
+    private static string? GetString(Dictionary<string, object?> dict, string key)
+    {
+        return dict.TryGetValue(key, out var v) ? v?.ToString() : null;
+    }
+
+    private static (int StartLine, int EndLine) GetBodyLines(Dictionary<string, object?> dict)
+    {
+        if (!dict.TryGetValue("body_location", out var loc) || loc is null)
+        {
+            return (0, 0);
+        }
+
+        // body_location may be an anonymous type {start_line, end_line} or a
+        // dictionary-like value depending on the producer.
+        if (loc is IDictionary<string, object?> mapDict)
+        {
+            int s = mapDict.TryGetValue("start_line", out var sv) ? Convert.ToInt32(sv ?? 0) : 0;
+            int e = mapDict.TryGetValue("end_line", out var ev) ? Convert.ToInt32(ev ?? 0) : 0;
+            return (s, e);
+        }
+
+        Type t = loc.GetType();
+        int start = (int?)t.GetProperty("start_line")?.GetValue(loc) ?? 0;
+        int end = (int?)t.GetProperty("end_line")?.GetValue(loc) ?? 0;
+        return (start, end);
+    }
+
+    /// <summary>
     /// Limits a string to the specified maximum length, appending a truncation message.
     /// </summary>
     public static string LimitLength(string text, int maxChars)

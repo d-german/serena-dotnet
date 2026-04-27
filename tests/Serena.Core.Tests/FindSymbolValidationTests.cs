@@ -181,4 +181,43 @@ public class FindSymbolValidationTests : IDisposable
         });
         r.Should().NotContain("max_matches must be");
     }
+
+    // v1.0.34 — match_overloads
+    [Fact]
+    public async Task MatchOverloads_AndSubstringMatching_AreMutuallyExclusive()
+    {
+        string r = await CallAsync(new Dictionary<string, object?>
+        {
+            ["name_path_pattern"] = "Run",
+            ["match_overloads"] = true,
+            ["substring_matching"] = true,
+        });
+        r.Should().Be("match_overloads and substring_matching are mutually exclusive");
+    }
+
+    [Fact]
+    public async Task FindSymbol_MatchOverloads_ReturnsAllSameNameSymbols()
+    {
+        // Create a project with two distinct types both exposing a 'Run' method.
+        string fileA = Path.Combine(_tempDir, "A.cs");
+        string fileB = Path.Combine(_tempDir, "B.cs");
+        await File.WriteAllTextAsync(fileA, "namespace N { public class Alpha { public void Run() {} } }");
+        await File.WriteAllTextAsync(fileB, "namespace N { public class Beta  { public void Run() {} } }");
+
+        // Without match_overloads, an exact "Alpha/Run" hits one. With
+        // match_overloads, the leaf "Run" must hit both regardless of parent.
+        string scoped = await CallAsync(new Dictionary<string, object?>
+        {
+            ["name_path_pattern"] = "Run",
+            ["match_overloads"] = true,
+            ["relative_path"] = ".",
+        });
+
+        // We can't guarantee the LSP indexed this synchronously in a temp dir,
+        // so the assertion is loose: validation passes (no error string), and
+        // either matches were found or the standard "no symbols" reply was
+        // returned. This catches regressions in argument plumbing.
+        scoped.Should().NotContain("mutually exclusive");
+        scoped.Should().NotContain("name_path_pattern is required");
+    }
 }

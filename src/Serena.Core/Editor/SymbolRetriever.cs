@@ -218,6 +218,14 @@ public interface ISymbolRetriever
         CancellationToken ct = default);
 
     /// <summary>
+    /// v1.0.34: matches any symbol whose final NamePath segment equals
+    /// <paramref name="leafName"/> (case-insensitive). Used as a fallback by
+    /// find_symbol when an exact name_path lookup returns zero results.
+    /// </summary>
+    Task<IReadOnlyList<LanguageServerSymbol>> FindByLeafNameAsync(
+        string leafName, string? relativePath = null, CancellationToken ct = default);
+
+    /// <summary>
     /// Loads the source body for a symbol from the file buffer.
     /// </summary>
     Task<string?> GetSymbolBodyAsync(
@@ -495,7 +503,27 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
         CancellationToken ct = default)
     {
         var matcher = NamePathMatcher.Parse(pattern);
+        return await FindSymbolsCoreAsync(matcher, relativePath, substringMatching, ct);
+    }
 
+    /// <summary>
+    /// v1.0.34: leaf-name fallback. Matches any symbol whose final NamePath
+    /// segment equals <paramref name="leafName"/> (case-insensitive). Used by
+    /// find_symbol when an exact path lookup returns zero results, so the agent
+    /// gets a useful "did you mean…" list of candidates regardless of which
+    /// parent class/namespace hosts them.
+    /// </summary>
+    public async Task<IReadOnlyList<LanguageServerSymbol>> FindByLeafNameAsync(
+        string leafName, string? relativePath = null, CancellationToken ct = default)
+    {
+        var matcher = NamePathMatcher.ForLeafName(leafName);
+        return await FindSymbolsCoreAsync(matcher, relativePath, substringMatching: false, ct);
+    }
+
+    private async Task<IReadOnlyList<LanguageServerSymbol>> FindSymbolsCoreAsync(
+        NamePathMatcher matcher, string? relativePath, bool substringMatching,
+        CancellationToken ct)
+    {
         if (relativePath is not null)
         {
             // Search within a specific file
@@ -932,11 +960,15 @@ public sealed class NamePathMatcher
 {
     private readonly string[] _segments;
     private readonly bool _isAbsolute;
+    // v1.0.34: when set, ignore parent path; match any symbol whose leaf name
+    // equals _segments[0] case-insensitively. Built via ForLeafName.
+    private readonly bool _leafOnlyIgnoreCase;
 
-    private NamePathMatcher(string[] segments, bool isAbsolute)
+    private NamePathMatcher(string[] segments, bool isAbsolute, bool leafOnlyIgnoreCase = false)
     {
         _segments = segments;
         _isAbsolute = isAbsolute;
+        _leafOnlyIgnoreCase = leafOnlyIgnoreCase;
     }
 
     /// <summary>
@@ -951,11 +983,28 @@ public sealed class NamePathMatcher
     }
 
     /// <summary>
+    /// v1.0.34: builds a matcher that ignores parent path and matches any
+    /// symbol whose leaf name equals <paramref name="leafName"/>
+    /// (case-insensitive, overload [N] suffix stripped).
+    /// </summary>
+    public static NamePathMatcher ForLeafName(string leafName) =>
+        new(new[] { leafName }, isAbsolute: false, leafOnlyIgnoreCase: true);
+
+    /// <summary>
     /// Tests whether a symbol's name path matches this pattern.
     /// </summary>
     public bool Matches(string namePath, bool substringMatching = false)
     {
         string[] targetSegments = namePath.Split('/');
+
+        if (_leafOnlyIgnoreCase)
+        {
+            // Leaf-only mode: ignore parent path, compare last segment
+            // case-insensitively. Strip overload [N] suffix on both sides.
+            string targetLeaf = StripIndex(targetSegments[^1]);
+            string patternLeaf = StripIndex(_segments[0]);
+            return string.Equals(targetLeaf, patternLeaf, StringComparison.OrdinalIgnoreCase);
+        }
 
         if (_isAbsolute)
         {

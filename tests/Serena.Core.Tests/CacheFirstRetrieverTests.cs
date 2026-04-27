@@ -189,4 +189,59 @@ public class CacheFirstRetrieverTests
         matches.Should().ContainSingle(s => s.Name == "GetPageThumbnail",
             "class-qualified pattern must match nested method even when Parent links were lost in cache");
     }
+
+    /// <summary>
+    /// v1.0.34: leaf-name fallback. Two distinct symbols with the same leaf
+    /// name in different parents must both be returned by FindByLeafNameAsync,
+    /// case-insensitively.
+    /// </summary>
+    [Fact]
+    public async Task FindByLeafNameAsync_TwoSymbolsSameLeaf_BothReturned_CaseInsensitive()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "serena-root-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        string relPath = "Both.cs";
+        string absPath = Path.Combine(root, relPath);
+        File.WriteAllText(absPath, "class X {}");
+
+        var range = new LspRange(new Position(0, 0), new Position(0, 0));
+        UnifiedSymbolInformation MakeMethod(string name) => new()
+        {
+            Name = name,
+            Kind = SymbolKind.Method,
+            BodyRange = range,
+            SelectionRange = range,
+            Location = new Location("file:///test.cs", range),
+        };
+
+        var clsA = new UnifiedSymbolInformation
+        {
+            Name = "Alpha",
+            Kind = SymbolKind.Class,
+            BodyRange = range, SelectionRange = range,
+            Location = new Location("file:///test.cs", range),
+            Children = [MakeMethod("Run")],
+        };
+        var clsB = new UnifiedSymbolInformation
+        {
+            Name = "Beta",
+            Kind = SymbolKind.Class,
+            BodyRange = range, SelectionRange = range,
+            Location = new Location("file:///test.cs", range),
+            Children = [MakeMethod("Run")],
+        };
+
+        var cache = NewEmptyCache();
+        string fingerprint = CacheFingerprint.ForFile(absPath);
+        cache.Set(absPath, fingerprint, [clsA, clsB]);
+
+        var retriever = new LanguageServerSymbolRetriever(
+            _ => throw new InvalidOperationException("LSP must not be started"),
+            root, NullLogger.Instance, cache);
+
+        var matches = await retriever.FindByLeafNameAsync("run", relPath);
+
+        matches.Should().HaveCount(2);
+        matches.Should().OnlyContain(s => s.Name == "Run");
+    }
 }
