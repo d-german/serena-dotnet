@@ -10,14 +10,22 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>serena-dotnet</ToolCommandName>
     <PackageId>Serena.DotNet</PackageId>
-    <Version>1.0.34</Version>
+    <Version>0.1.0</Version>
     <Authors>dgerman</Authors>
-    <PackageDescription>Serena is a code-aware MCP (Model Context Protocol) coding agent that provides 26 tools for navigating, understanding, and editing code using language server protocol integration.</PackageDescription>
-    <PackageTags>mcp;coding-agent;lsp;serena;ai-tools</PackageTags>
+    <PackageDescription>A .NET / C#-focused MCP (Model Context Protocol) coding agent inspired by oraios/serena. Ships as a self-contained .NET global tool with 38 tools for navigating, understanding, and editing C# code via Roslyn LSP integration. Features a human-readable on-disk symbol cache, outline-first responses for large symbol bodies, lazy LSP startup, and BOM-preserving file edits.</PackageDescription>
+    <PackageTags>mcp;coding-agent;lsp;roslyn;csharp;ai-tools;serena;dotnet-tool</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <RepositoryUrl>https://github.com/dgerman/serena-dotnet</RepositoryUrl>
+    <RepositoryUrl>https://github.com/d-german/serena-dotnet</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/d-german/serena-dotnet</PackageProjectUrl>
+    <PackageReleaseNotes>https://github.com/d-german/serena-dotnet/blob/main/CHANGELOG.md</PackageReleaseNotes>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
   </PropertyGroup>
 
   <ItemGroup>
@@ -32,6 +40,7 @@
   <ItemGroup>
     <PackageReference Include="System.CommandLine" Version="2.*" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0-preview.*" />
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
   </ItemGroup>
 
 </Project>

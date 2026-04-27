@@ -371,19 +371,15 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
     }
 
     /// <summary>
-    /// Returns the per-LSP-request timeout. Reads SERENA_LSP_REQUEST_TIMEOUT_SECONDS
-    /// env var (clamped to 10..3600). Default: 300 seconds (5 min).
-    /// Protects against truly hung Roslyn calls while allowing slow uncached
-    /// symbol requests on very large repos to complete.
+    /// Returns the per-LSP-request timeout. Single source of truth is
+    /// <see cref="LspTimeout.RequestTimeout"/>, which reads
+    /// SERENA_LSP_REQUEST_TIMEOUT_SECONDS (clamped 5..1800, default 60s).
+    /// Both the per-call wrapper and the underlying JSON-RPC infrastructure
+    /// honor the same value so behavior is predictable.
     /// </summary>
     private static TimeSpan GetLspRequestTimeout()
     {
-        string? raw = Environment.GetEnvironmentVariable("SERENA_LSP_REQUEST_TIMEOUT_SECONDS");
-        if (int.TryParse(raw, out int value))
-        {
-            return TimeSpan.FromSeconds(Math.Clamp(value, 10, 3600));
-        }
-        return TimeSpan.FromSeconds(300);
+        return Serena.Core.Editor.LspTimeout.RequestTimeout;
     }
     private void EnsureSymbolCache(Language language)
     {
