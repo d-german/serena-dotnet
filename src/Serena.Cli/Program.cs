@@ -466,16 +466,59 @@ public static class Program
         return command;
     }
 
+    // v1.0.33: when stdout is redirected/piped, '\r' is a literal character, not
+    // a cursor reset — every progress write concatenates onto the previous one
+    // (produces an unreadable smear). Detect once and downshift to periodic
+    // WriteLine in that case. Also truncate paths so interactive output doesn't
+    // leak prior content when a longer path is followed by a shorter one.
+    private static readonly bool s_progressInteractive = !Console.IsOutputRedirected;
+    private const int ProgressMaxPathChars = 80;
+    private static int s_lastReportedPercent = -1;
+
     private static void ReportIndexProgress(IndexProgress progress)
     {
         string status = progress.Success ? "✓" : "✗";
-        int pct = (int)(100.0 * progress.CurrentFile / progress.TotalFiles);
-        Console.Write($"\r  [{pct,3}%] {progress.CurrentFile}/{progress.TotalFiles} {status} {progress.FilePath}");
+        int pct = progress.TotalFiles > 0
+            ? (int)(100.0 * progress.CurrentFile / progress.TotalFiles)
+            : 0;
+        string path = TruncatePath(progress.FilePath, ProgressMaxPathChars);
+
+        if (s_progressInteractive)
+        {
+            // Pad to a fixed width so a shorter path doesn't leave trailing
+            // characters from the previous (longer) one visible after \r.
+            string line = $"  [{pct,3}%] {progress.CurrentFile}/{progress.TotalFiles} {status} {path}";
+            Console.Write($"\r{line.PadRight(110)}");
+        }
+        else
+        {
+            // Redirected stdout: emit one line per percent change so logs stay
+            // readable. Always emit failures.
+            if (pct != s_lastReportedPercent || !progress.Success)
+            {
+                s_lastReportedPercent = pct;
+                Console.WriteLine($"  [{pct,3}%] {progress.CurrentFile}/{progress.TotalFiles} {status} {path}");
+            }
+        }
+
         if (!progress.Success)
         {
-            Console.WriteLine();
+            if (s_progressInteractive)
+            {
+                Console.WriteLine();
+            }
             Console.Error.WriteLine($"    Error: {progress.Error}");
         }
+    }
+
+    private static string TruncatePath(string path, int maxChars)
+    {
+        if (path.Length <= maxChars)
+        {
+            return path;
+        }
+        // Keep the tail (filename + parent directories) — most informative.
+        return "…" + path[^(maxChars - 1)..];
     }
 
     private static async Task ReportIndexResultAsync(
