@@ -10,7 +10,7 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>serena-dotnet</ToolCommandName>
     <PackageId>Serena.DotNet</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.1.1</Version>
     <Authors>dgerman</Authors>
     <PackageDescription>A .NET / C#-focused MCP (Model Context Protocol) coding agent inspired by oraios/serena. Ships as a self-contained .NET global tool with 38 tools for navigating, understanding, and editing C# code via Roslyn LSP integration. Features a human-readable on-disk symbol cache, outline-first responses for large symbol bodies, lazy LSP startup, and BOM-preserving file edits.</PackageDescription>
     <PackageTags>mcp;coding-agent;lsp;roslyn;csharp;ai-tools;serena;dotnet-tool</PackageTags>

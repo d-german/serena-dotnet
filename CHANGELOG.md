@@ -2,6 +2,10 @@
 
 All notable changes to **Serena.DotNet** are recorded here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org/).
 
+## [0.1.1] — Docs
+
+- **Docs only.** Fixed the MCP client configuration example in `README.md` to drop the hardcoded `cwd`. The MCP host already launches the server with the workspace folder as cwd, and Serena auto-activates whatever project is at that path — so the same config works in every workspace, no per-repo edits.
+
 ## [0.1.0] — Public preview
 
 First public release. Reset from internal `1.0.x` series to signal preview status.
