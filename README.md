@@ -73,7 +73,6 @@ Minimal stdio entry for VS Code (`.vscode/mcp.json`) or any MCP client:
       "type": "stdio",
       "command": "serena-dotnet",
       "args": ["serve"],
-      "cwd": "C:\\path\\to\\your\\repo",
       "env": {
         "SERENA_TOOL_TIMEOUT_SECONDS": "600",
         "SERENA_LSP_REQUEST_TIMEOUT_SECONDS": "600",
@@ -84,7 +83,7 @@ Minimal stdio entry for VS Code (`.vscode/mcp.json`) or any MCP client:
 }
 ```
 
-`cwd` controls which repo Serena treats as the active project. The env vars are optional but recommended for large solutions where Roslyn warmup or per-request work can exceed the lower defaults.
+The MCP client launches `serena-dotnet serve` with the workspace folder as its working directory, and Serena auto-activates whatever repo is at that path — so the same config works in every workspace, no per-repo edits. The env vars are optional but recommended for large solutions where Roslyn warmup or per-request work can exceed the lower defaults.
 
 ## Tools (38)
 
