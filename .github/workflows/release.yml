@@ -43,7 +43,15 @@ jobs:
         env:
           NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
         run: |
-          dotnet nuget push "nupkg/*.nupkg" `
-            --api-key "$env:NUGET_API_KEY" `
-            --source https://api.nuget.org/v3/index.json `
-            --skip-duplicate
+          # pwsh does not glob-expand arguments, so enumerate explicitly.
+          # Quoting the pattern made dotnet receive it literally and fail with
+          # "File does not exist (nupkg/*.nupkg)".
+          $packages = Get-ChildItem -Path nupkg -Filter *.nupkg
+          if (-not $packages) { throw 'No .nupkg found in nupkg/' }
+          foreach ($p in $packages) {
+            dotnet nuget push $p.FullName `
+              --api-key "$env:NUGET_API_KEY" `
+              --source https://api.nuget.org/v3/index.json `
+              --skip-duplicate
+            if ($LASTEXITCODE -ne 0) { throw "push failed for $($p.Name)" }
+          }
