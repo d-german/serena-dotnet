@@ -6,6 +6,8 @@
 
 using Microsoft.VisualStudio.SolutionPersistence.Model;
 using Microsoft.VisualStudio.SolutionPersistence.Serializer;
+using System.Xml;
+using System.Xml.Linq;
 
 namespace Serena.Lsp.Project;
 
@@ -72,6 +74,87 @@ public static class SolutionParser
             result.AddRange(paths);
         }
         return result.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    /// <summary>
+    /// Returns the C# projects listed by the supplied solutions plus every
+    /// resolvable transitive ProjectReference. This is used by focused cache
+    /// indexing so a dependency outside both the application directory and
+    /// the solution file is still available to cache-backed symbol queries.
+    /// MSBuild-property and wildcard Includes cannot be resolved without a
+    /// full MSBuild evaluation and are left for Roslyn.
+    /// </summary>
+    public static async Task<IReadOnlyList<string>> GetCSharpProjectClosureAsync(
+        IEnumerable<string> solutionFilePaths,
+        CancellationToken cancellationToken = default)
+    {
+        var directProjects = await GetCSharpProjectPathsAsync(
+            solutionFilePaths, cancellationToken).ConfigureAwait(false);
+        var seen = new HashSet<string>(directProjects, StringComparer.OrdinalIgnoreCase);
+        var pending = new Queue<string>(directProjects);
+
+        while (pending.TryDequeue(out string? projectPath))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            foreach (string reference in await ReadProjectReferencesAsync(
+                         projectPath, cancellationToken).ConfigureAwait(false))
+            {
+                if (seen.Add(reference))
+                {
+                    pending.Enqueue(reference);
+                }
+            }
+        }
+
+        return seen.Order(StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    private static async Task<IReadOnlyList<string>> ReadProjectReferencesAsync(
+        string projectPath,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var stream = new FileStream(
+                projectPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite,
+                bufferSize: 4096, useAsync: true);
+            XDocument document = await XDocument.LoadAsync(
+                stream, LoadOptions.None, cancellationToken).ConfigureAwait(false);
+            string projectDirectory = Path.GetDirectoryName(projectPath)!;
+            var references = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (XElement element in document.Descendants()
+                         .Where(e => e.Name.LocalName == "ProjectReference"))
+            {
+                string? include = element.Attribute("Include")?.Value;
+                if (string.IsNullOrWhiteSpace(include))
+                {
+                    continue;
+                }
+
+                foreach (string candidate in include.Split(
+                             ';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                {
+                    if (candidate.Contains("$(", StringComparison.Ordinal)
+                        || candidate.IndexOfAny(['*', '?']) >= 0)
+                    {
+                        continue;
+                    }
+
+                    string resolved = Path.GetFullPath(Path.Combine(projectDirectory, candidate));
+                    if (resolved.EndsWith(CSharpProjectExtension, StringComparison.OrdinalIgnoreCase)
+                        && File.Exists(resolved))
+                    {
+                        references.Add(resolved);
+                    }
+                }
+            }
+            return references.ToList();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or XmlException)
+        {
+            return [];
+        }
     }
 
     private static List<string> ExtractCSharpProjects(SolutionModel model, string solutionDir)

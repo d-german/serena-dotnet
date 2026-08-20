@@ -133,6 +133,24 @@ public sealed class SymbolCacheRefresher
         }
     }
 
+    /// <summary>
+    /// Reindexes one known-changed file immediately, bypassing debounce and
+    /// broad stale-file scans. Intended for edit tools that already know the
+    /// file they changed.
+    /// </summary>
+    public async Task<bool> RefreshFileAsync(string absolutePath, CancellationToken ct)
+    {
+        try
+        {
+            return await ReindexFileAsync(absolutePath, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Auto-reindex failed for {Path}", absolutePath);
+            return false;
+        }
+    }
+
     private bool IsDebounced()
     {
         long last = Interlocked.Read(ref _lastScanTicks);

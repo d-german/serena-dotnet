@@ -18,6 +18,11 @@ public enum WorkspaceReadyState
     Loading,
     /// <summary>Initial workspace load has completed; semantic queries are viable.</summary>
     Ready,
+    /// <summary>
+    /// The server is accepting semantic queries, but workspace loading either
+    /// timed out or completed with project-load warnings. Results may be incomplete.
+    /// </summary>
+    Partial,
     /// <summary>Server process or workspace load failed.</summary>
     Failed,
 }
@@ -33,7 +38,8 @@ public sealed record ReadyStateSnapshot(
     int? ProjectsLoaded = null,
     int? ProjectsTotal = null,
     double ElapsedSeconds = 0,
-    string? ScopeDescription = null);
+    string? ScopeDescription = null,
+    IReadOnlyList<string>? Warnings = null);
 
 /// <summary>
 /// Thrown by LSP-touching call sites when the per-request timeout elapses
@@ -61,7 +67,8 @@ public sealed class LanguageServerWarmingException : LspClientException
         // fired (slow request, not warmup), surface a distinct status so the
         // agent doesn't think "warmup is taking forever" — it's the request
         // itself that took too long.
-        bool requestTimeoutWhileReady = Snapshot.State == WorkspaceReadyState.Ready;
+        bool requestTimeoutWhileReady = Snapshot.State is
+            WorkspaceReadyState.Ready or WorkspaceReadyState.Partial;
         var payload = new Dictionary<string, object?>
         {
             ["status"] = requestTimeoutWhileReady
@@ -73,6 +80,7 @@ public sealed class LanguageServerWarmingException : LspClientException
             ["projects_total"] = Snapshot.ProjectsTotal,
             ["elapsed_seconds"] = Math.Round(Snapshot.ElapsedSeconds, 1),
             ["scope"] = Snapshot.ScopeDescription,
+            ["warnings"] = Snapshot.Warnings,
             ["advice"] = Advice,
         };
         return JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true });
@@ -84,9 +92,9 @@ public sealed class LanguageServerWarmingException : LspClientException
         // is Ready the workspace finished loading and the per-request timeout
         // is what fired; report that distinctly. Snapshot.ElapsedSeconds is
         // workspace uptime, not request duration — phrase accordingly.
-        if (snapshot.State == WorkspaceReadyState.Ready)
+        if (snapshot.State is WorkspaceReadyState.Ready or WorkspaceReadyState.Partial)
         {
-            return $"{language} language server request timed out (workspace state: Ready, " +
+            return $"{language} language server request timed out (workspace state: {snapshot.State}, " +
                    $"uptime {Math.Round(snapshot.ElapsedSeconds, 1)}s). {advice}";
         }
 

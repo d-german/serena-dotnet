@@ -19,15 +19,29 @@ public interface IServerReadyStateSink
     void MarkLoading(Language language, int? projectsTotal = null, string? scopeDescription = null);
 
     /// <summary>
-    /// Called when the initial workspace load has completed (or stopped
-    /// receiving activity). After this, semantic queries should be viable.
+    /// Called when the initial workspace load has explicitly completed.
+    /// After this, semantic queries should be viable.
     /// </summary>
-    void MarkReady(Language language);
+    void MarkReady(
+        Language language,
+        int? projectsLoaded = null,
+        IReadOnlyList<string>? warnings = null);
+
+    /// <summary>
+    /// Called when the server can answer semantic queries but the initial
+    /// workspace load timed out or reported project-load warnings. Callers may
+    /// proceed, but must not describe the result set as known-complete.
+    /// </summary>
+    void MarkPartial(
+        Language language,
+        string warning,
+        int? projectsLoaded = null,
+        IReadOnlyList<string>? warnings = null);
 
     /// <summary>
     /// Called when the workspace load failed unrecoverably.
     /// </summary>
-    void MarkFailed(Language language);
+    void MarkFailed(Language language, string? warning = null);
 
     /// <summary>
     /// Returns the current snapshot for the given language, or NotStarted if

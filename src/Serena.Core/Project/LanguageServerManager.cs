@@ -45,11 +45,10 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
     private sealed class ReadyStateRecord
     {
         public WorkspaceReadyState State;
-#pragma warning disable CS0649 // Reserved for future progress reporting once Roslyn exposes per-project load events.
         public int? ProjectsLoaded;
-#pragma warning restore CS0649
         public int? ProjectsTotal;
         public string? ScopeDescription;
+        public IReadOnlyList<string>? Warnings;
         public long StartedAtTicks;
     }
 
@@ -145,7 +144,7 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Background warmup for {Language} failed", language);
-                    MarkFailed(language);
+                    MarkFailed(language, ex.Message);
                 }
             }, warmupCts.Token);
 
@@ -187,6 +186,65 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
             return null;
         }
         return cache;
+    }
+
+    /// <summary>
+    /// Records that a source file was changed by an edit tool without starting
+    /// a language server. Stale cache entries are removed from the in-memory
+    /// cache immediately so later cache-backed searches do not return old
+    /// symbols; persistence is handled by the normal cache-save lifecycle.
+    /// If the language server is already running and ready, the changed file
+    /// is reindexed in place.
+    /// </summary>
+    public async Task UpdateSymbolCacheForWrittenFileAsync(
+        Language language,
+        string absolutePath,
+        string content,
+        CancellationToken ct = default)
+    {
+        EnsureSymbolCache(language);
+        var cache = _caches[language];
+
+        cache.Remove(absolutePath);
+
+        if (!_clients.TryGetValue(language, out var client) || !client.IsRunning)
+        {
+            return;
+        }
+
+        await TryNotifyRunningLanguageServerAsync(client, absolutePath, content).ConfigureAwait(false);
+
+        if (GetReadyState(language).State != WorkspaceReadyState.Ready)
+        {
+            return;
+        }
+
+        if (!File.Exists(absolutePath))
+        {
+            return;
+        }
+
+        var refresher = SymbolCacheRefresher.ForLspClient(_projectRoot, cache, client, _logger);
+        await refresher.RefreshFileAsync(absolutePath, ct).ConfigureAwait(false);
+    }
+
+    private async Task TryNotifyRunningLanguageServerAsync(
+        LspClient client,
+        string absolutePath,
+        string content)
+    {
+        try
+        {
+            if (client.FileBuffers.GetBuffer(LspClient.PathToUri(absolutePath)) is null)
+            {
+                return;
+            }
+            await client.NotifyFileChangedAsync(absolutePath, content).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Best-effort LSP write notification failed for {Path}", absolutePath);
+        }
     }
 
     /// <summary>
@@ -276,21 +334,77 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
     }
 
     /// <inheritdoc />
-    public void MarkReady(Language language)
+    public void MarkReady(
+        Language language,
+        int? projectsLoaded = null,
+        IReadOnlyList<string>? warnings = null)
     {
         _readyStates.AddOrUpdate(
             language,
-            _ => new ReadyStateRecord { State = WorkspaceReadyState.Ready, StartedAtTicks = Stopwatch.GetTimestamp() },
-            (_, existing) => { existing.State = WorkspaceReadyState.Ready; return existing; });
+            _ => new ReadyStateRecord
+            {
+                State = WorkspaceReadyState.Ready,
+                ProjectsLoaded = projectsLoaded,
+                Warnings = warnings,
+                StartedAtTicks = Stopwatch.GetTimestamp(),
+            },
+            (_, existing) =>
+            {
+                existing.State = WorkspaceReadyState.Ready;
+                existing.ProjectsLoaded = projectsLoaded ?? existing.ProjectsLoaded;
+                existing.Warnings = warnings;
+                return existing;
+            });
     }
 
     /// <inheritdoc />
-    public void MarkFailed(Language language)
+    public void MarkPartial(
+        Language language,
+        string warning,
+        int? projectsLoaded = null,
+        IReadOnlyList<string>? warnings = null)
+    {
+        var combinedWarnings = new[] { warning }
+            .Concat(warnings ?? [])
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        _readyStates.AddOrUpdate(
+            language,
+            _ => new ReadyStateRecord
+            {
+                State = WorkspaceReadyState.Partial,
+                ProjectsLoaded = projectsLoaded,
+                Warnings = combinedWarnings,
+                StartedAtTicks = Stopwatch.GetTimestamp(),
+            },
+            (_, existing) =>
+            {
+                existing.State = WorkspaceReadyState.Partial;
+                existing.ProjectsLoaded = projectsLoaded ?? existing.ProjectsLoaded;
+                existing.Warnings = combinedWarnings;
+                return existing;
+            });
+    }
+
+    /// <inheritdoc />
+    public void MarkFailed(Language language, string? warning = null)
     {
         _readyStates.AddOrUpdate(
             language,
-            _ => new ReadyStateRecord { State = WorkspaceReadyState.Failed, StartedAtTicks = Stopwatch.GetTimestamp() },
-            (_, existing) => { existing.State = WorkspaceReadyState.Failed; return existing; });
+            _ => new ReadyStateRecord
+            {
+                State = WorkspaceReadyState.Failed,
+                Warnings = warning is null ? null : [warning],
+                StartedAtTicks = Stopwatch.GetTimestamp()
+            },
+            (_, existing) =>
+            {
+                existing.State = WorkspaceReadyState.Failed;
+                existing.Warnings = warning is null ? existing.Warnings : [warning];
+                return existing;
+            });
     }
 
     /// <inheritdoc />
@@ -308,7 +422,8 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
             record.ProjectsLoaded,
             record.ProjectsTotal,
             elapsed,
-            record.ScopeDescription);
+            record.ScopeDescription,
+            record.Warnings);
     }
 
     /// <summary>

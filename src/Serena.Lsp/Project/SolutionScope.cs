@@ -13,7 +13,7 @@ namespace Serena.Lsp.Project;
 /// the working set of C# projects. May be empty.</param>
 public sealed record SolutionScope(IReadOnlyList<string> SolutionPaths)
 {
-    /// <summary>A scope with no solutions — signals "use the default whole-repo glob".</summary>
+    /// <summary>A scope with no solutions. Small repositories use automatic discovery; large repositories require an explicit solution.</summary>
     public static SolutionScope Empty { get; } = new(Array.Empty<string>());
 
     /// <summary>True when no solutions are in scope.</summary>

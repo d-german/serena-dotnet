@@ -20,3 +20,6 @@ Thumbs.db
 # VS Code local config (contains credentials)
 .vscode/
 blob.bin
+
+# Local MCP task state (not used; do not track)
+.mcp-tasks/

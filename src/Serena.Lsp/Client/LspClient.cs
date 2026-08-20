@@ -1,6 +1,7 @@
 ﻿// Core LSP Client - Ported from solidlsp/ls.py SolidLanguageServer
 // Phase 3A: The main language server client for symbol operations
 
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
@@ -33,6 +34,12 @@ public sealed class LspClient : IAsyncDisposable
     private ServerCapabilities? _serverCapabilities;
     private bool _serverStarted;
     private readonly TaskCompletionSource<bool> _projectInitComplete = new();
+    private const int MaxWorkspaceWarnings = 25;
+    private const int MaxWorkspaceWarningsLoggedAtWarning = 3;
+    private readonly ConcurrentQueue<string> _workspaceWarnings = new();
+    private readonly ConcurrentDictionary<string, byte> _workspaceWarningKeys =
+        new(StringComparer.Ordinal);
+    private int _omittedWorkspaceWarningCount;
     private long _lastActivityTicks = Stopwatch.GetTimestamp();
     private int _crossFileRefsReady; // 0 = not ready, 1 = ready; use Interlocked for thread safety
 
@@ -41,6 +48,23 @@ public sealed class LspClient : IAsyncDisposable
     public bool IsRunning => _process.IsRunning;
     public ServerCapabilities? ServerCapabilities => _serverCapabilities;
     public FileBufferManager FileBuffers => _fileBuffers;
+    public bool ProjectInitializationCompleted => _projectInitComplete.Task.IsCompleted;
+
+    /// <summary>
+    /// Bounded warnings/errors reported by the language server while loading
+    /// the workspace. These are exposed through get_language_server_status so
+    /// a completed warmup is not mistaken for a completely loaded solution.
+    /// </summary>
+    public IReadOnlyList<string> GetWorkspaceWarnings()
+    {
+        var warnings = _workspaceWarnings.ToList();
+        int omitted = Volatile.Read(ref _omittedWorkspaceWarningCount);
+        if (omitted > 0)
+        {
+            warnings.Add($"{omitted} additional unique workspace warning(s) omitted");
+        }
+        return warnings;
+    }
 
     public LspClient(
         LanguageServerProcess process,
@@ -133,6 +157,17 @@ public sealed class LspClient : IAsyncDisposable
         rpc.AddLocalRpcMethod("client/registerCapability",
             (JToken? token) => { RecordActivity(); _logger.LogDebug("client/registerCapability: {Token}", token?.ToString(Newtonsoft.Json.Formatting.None)); return (object?)null; });
 
+        rpc.AddLocalRpcMethod("window/logMessage",
+            (JToken? token) => { RecordActivity(); CaptureWorkspaceWarning(token); return (object?)null; });
+
+        rpc.AddLocalRpcMethod("window/showMessage",
+            (JToken? token) => { RecordActivity(); CaptureWorkspaceWarning(token); return (object?)null; });
+
+        // Roslyn uses this request for the project-load failure toast. Returning
+        // null means "dismissed" while still retaining the warning in status.
+        rpc.AddLocalRpcMethod("window/showMessageRequest",
+            (JToken? token) => { RecordActivity(); CaptureWorkspaceWarning(token); return (object?)null; });
+
         rpc.AddLocalRpcMethod("workspace/projectInitializationComplete",
             (JToken? _) => { RecordActivity(); _projectInitComplete.TrySetResult(true); return (object?)null; });
 
@@ -143,6 +178,56 @@ public sealed class LspClient : IAsyncDisposable
 
         rpc.AddLocalRpcMethod("textDocument/publishDiagnostics",
             (JToken? _) => { RecordActivity(); return (object?)null; });
+    }
+
+    private void CaptureWorkspaceWarning(JToken? token)
+    {
+        if (token is not JObject message)
+        {
+            return;
+        }
+
+        // LSP MessageType: Error=1, Warning=2, Info=3, Log=4, Debug=5.
+        int type = message.Value<int?>("type") ?? 4;
+        string? text = message.Value<string>("message");
+        if (type > 2 || string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+
+        string normalized = string.Join(' ', text
+            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        if (normalized.Length > 1000)
+        {
+            normalized = normalized[..1000] + "…";
+        }
+
+        // Roslyn commonly reports the same legacy-project load error many
+        // times. Retain a bounded, de-duplicated diagnostic sample for status
+        // without turning CLI/MCP output into hundreds of warning lines.
+        if (!_workspaceWarningKeys.TryAdd(normalized, 0))
+        {
+            return;
+        }
+
+        int uniqueCount = _workspaceWarningKeys.Count;
+        if (uniqueCount <= MaxWorkspaceWarnings)
+        {
+            _workspaceWarnings.Enqueue(normalized);
+        }
+        else
+        {
+            Interlocked.Increment(ref _omittedWorkspaceWarningCount);
+        }
+
+        if (uniqueCount <= MaxWorkspaceWarningsLoggedAtWarning)
+        {
+            _logger.LogWarning("Language server workspace warning: {Warning}", normalized);
+        }
+        else
+        {
+            _logger.LogDebug("Additional language server workspace warning: {Warning}", normalized);
+        }
     }
 
     /// <summary>

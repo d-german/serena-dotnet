@@ -72,8 +72,35 @@ public class SolutionParserTests : IDisposable
         Assert.Equal(3, projects.Count);
     }
 
+    [Fact]
+    public async Task GetCSharpProjectClosureAsync_FollowsTransitiveProjectReferences()
+    {
+        WriteCsproj("Leaf");
+        WriteProjectWithReference("Middle", "../Leaf/Leaf.csproj");
+        WriteProjectWithReference("App", "../Middle/Middle.csproj");
+        var solution = WriteSlnx("App.slnx", "<Project Path=\"App/App.csproj\" />");
+
+        var projects = await SolutionParser.GetCSharpProjectClosureAsync([solution]);
+
+        Assert.Equal(3, projects.Count);
+        Assert.Contains(projects, path => path.EndsWith("App.csproj", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(projects, path => path.EndsWith("Middle.csproj", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(projects, path => path.EndsWith("Leaf.csproj", StringComparison.OrdinalIgnoreCase));
+    }
+
     private void WriteCsproj(string name) => WriteProject(name, ".csproj");
     private void WriteVbproj(string name) => WriteProject(name, ".vbproj");
+
+    private void WriteProjectWithReference(string name, string reference)
+    {
+        var dir = Path.Combine(_tempDir, name);
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, name + ".csproj"), $"""
+            <Project Sdk="Microsoft.NET.Sdk">
+              <ItemGroup><ProjectReference Include="{reference}" /></ItemGroup>
+            </Project>
+            """);
+    }
 
     private void WriteProject(string name, string ext)
     {

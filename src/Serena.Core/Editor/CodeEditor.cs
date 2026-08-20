@@ -67,6 +67,7 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
     private readonly SemaphoreSlim _lspGate = new(1, 1);
     private readonly string _projectRoot;
     private readonly ILogger _logger;
+    private readonly Func<string, string, CancellationToken, Task>? _afterWriteAsync;
 
     /// <summary>
     /// Constructs an editor bound to an already-started LSP client. Operations
@@ -77,8 +78,9 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
         ISymbolRetriever symbolRetriever,
         LspClient lsp,
         string projectRoot,
-        ILogger logger)
-        : this(symbolRetriever, _ => Task.FromResult(lsp), projectRoot, logger)
+        ILogger logger,
+        Func<string, string, CancellationToken, Task>? afterWriteAsync = null)
+        : this(symbolRetriever, _ => Task.FromResult(lsp), projectRoot, logger, afterWriteAsync)
     {
         _resolvedLsp = lsp;
     }
@@ -94,12 +96,14 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
         ISymbolRetriever symbolRetriever,
         Func<CancellationToken, Task<LspClient>> lspFactory,
         string projectRoot,
-        ILogger logger)
+        ILogger logger,
+        Func<string, string, CancellationToken, Task>? afterWriteAsync = null)
     {
         _symbolRetriever = symbolRetriever;
         _lspFactory = lspFactory;
         _projectRoot = Path.GetFullPath(projectRoot);
         _logger = logger;
+        _afterWriteAsync = afterWriteAsync;
     }
 
     /// <summary>
@@ -421,6 +425,19 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
     private async Task WriteAndSyncAsync(string absolutePath, string content, CancellationToken ct)
     {
         await FileWriteGate.WriteAllTextAsync(absolutePath, content, ct);
+
+        if (_afterWriteAsync is not null)
+        {
+            try
+            {
+                await _afterWriteAsync(absolutePath, content, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Post-write cache/LSP update failed for {Path} (best-effort)", absolutePath);
+            }
+            return;
+        }
 
         // Only notify the LSP if it has already been started. Triggering a
         // lazy startup purely to send a didChange notification would defeat

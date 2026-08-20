@@ -69,6 +69,12 @@ public sealed record RegisteredProject
 public sealed record ProjectConfig
 {
     /// <summary>
+    /// Python-Serena-compatible ordered language list from project.yml.
+    /// The first entry is the default/preferred language.
+    /// </summary>
+    public List<string>? Languages { get; init; }
+
+    /// <summary>
     /// The main programming language of the project.
     /// </summary>
     public string? MainLanguage { get; init; }
@@ -86,7 +92,7 @@ public sealed record ProjectConfig
     /// <summary>
     /// Language-server-specific settings overrides.
     /// </summary>
-    public IReadOnlyDictionary<string, object>? LsSpecificSettings { get; init; }
+    public Dictionary<string, Dictionary<string, object>>? LsSpecificSettings { get; init; }
 
     /// <summary>
     /// The source file encoding to use.

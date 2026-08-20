@@ -42,13 +42,15 @@ public static class LspTimeout
         ILogger? logger,
         CancellationToken ct)
     {
-        // v1.0.27: pre-flight readiness gate. If the workspace isn't Ready,
+        // v1.0.27: pre-flight readiness gate. Partial is queryable by design:
+        // it means Roslyn is responsive but completeness is not guaranteed.
+        // If the workspace isn't Ready/Partial,
         // throw the warming exception immediately without ever invoking the
         // op delegate. This protects the agent from interpreting empty
         // mid-load LSP responses as 'symbol not found' and avoids burning
         // the full RequestTimeout window per call while warmup is in flight.
         var preflight = snapshotFactory();
-        if (preflight.State != WorkspaceReadyState.Ready)
+        if (preflight.State is not (WorkspaceReadyState.Ready or WorkspaceReadyState.Partial))
         {
             string preflightAdvice = preflight.State switch
             {
@@ -82,7 +84,7 @@ public static class LspTimeout
             // request raced workspace warmup and the agent should poll readiness.
             // If state is Ready, warmup is DONE — the request itself was slow
             // (e.g. heavy semantic edit on a large file). Different remediation.
-            string advice = snapshot.State == WorkspaceReadyState.Ready
+            string advice = snapshot.State is WorkspaceReadyState.Ready or WorkspaceReadyState.Partial
                 ? $"The workspace is loaded but this individual request exceeded " +
                   $"{RequestTimeout.TotalSeconds:0}s (SERENA_LSP_REQUEST_TIMEOUT_SECONDS). " +
                   $"Try: (1) scope the operation to a smaller file/symbol, (2) raise " +

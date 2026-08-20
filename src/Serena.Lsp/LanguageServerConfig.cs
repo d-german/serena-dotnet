@@ -173,13 +173,31 @@ public static class LanguageExtensions
     /// </summary>
     public static Language? FromFileExtension(string extension)
     {
-        string pattern = "*" + (extension.StartsWith('.') ? extension : "." + extension);
+        if (string.IsNullOrWhiteSpace(extension))
+        {
+            return null;
+        }
 
-        return Enum.GetValues<Language>()
+        string normalized = extension.StartsWith('.') ? extension : "." + extension;
+        if (normalized == ".")
+        {
+            return null;
+        }
+
+        string pattern = "*" + normalized;
+
+        foreach (var language in Enum.GetValues<Language>()
             .Where(lang => !lang.IsExperimental())
-            .OrderByDescending(lang => lang.GetPriority())
-            .FirstOrDefault(lang => lang.GetSourceFilePatterns()
-                .Any(p => string.Equals(p, pattern, StringComparison.OrdinalIgnoreCase)));
+            .OrderByDescending(lang => lang.GetPriority()))
+        {
+            if (language.GetSourceFilePatterns()
+                .Any(p => string.Equals(p, pattern, StringComparison.OrdinalIgnoreCase)))
+            {
+                return language;
+            }
+        }
+
+        return null;
     }
 
     public static bool IsExperimental(this Language language) =>

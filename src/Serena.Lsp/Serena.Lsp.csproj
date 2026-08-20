@@ -17,6 +17,9 @@
     <PackageReference Include="StreamJsonRpc" Version="2.*" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0-preview.*" />
     <PackageReference Include="Microsoft.Extensions.FileSystemGlobbing" Version="10.0.0-preview.*" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.10" />
+    <!-- Pin the patched native SQLite bundle; 2.1.11 is affected by GHSA-2m69-gcr7-jv3q. -->
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.12" />
     <PackageReference Include="CSharpFunctionalExtensions" Version="3.*" />
     <PackageReference Include="Microsoft.VisualStudio.SolutionPersistence" Version="1.0.52" />
   </ItemGroup>

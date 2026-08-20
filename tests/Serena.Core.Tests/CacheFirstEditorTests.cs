@@ -59,7 +59,8 @@ public class CacheFirstEditorTests
 
     private static (LanguageServerCodeEditor editor, Func<bool> wasFactoryCalled) BuildExplodingEditor(
         string root,
-        SymbolCache<UnifiedSymbolInformation[]> cache)
+        SymbolCache<UnifiedSymbolInformation[]> cache,
+        Func<string, string, CancellationToken, Task>? afterWriteAsync = null)
     {
         bool factoryCalled = false;
         Task<LspClient> ExplodingFactory(CancellationToken _)
@@ -71,7 +72,7 @@ public class CacheFirstEditorTests
         var retriever = new LanguageServerSymbolRetriever(
             ExplodingFactory, root, NullLogger.Instance, cache);
         var editor = new LanguageServerCodeEditor(
-            retriever, ExplodingFactory, root, NullLogger.Instance);
+            retriever, ExplodingFactory, root, NullLogger.Instance, afterWriteAsync);
 
         return (editor, () => factoryCalled);
     }
@@ -110,5 +111,24 @@ public class CacheFirstEditorTests
 
         wasCalled().Should().BeFalse("cache-hit insert_after_symbol must not start LSP");
         result.Should().Contain("Inserted content after");
+    }
+
+    [Fact]
+    public async Task ReplaceSymbolBody_CacheHit_InvalidatesCacheWithoutStartingLsp()
+    {
+        var (root, relPath, absPath, cache) = BuildPopulatedCache("A");
+        Task AfterWrite(string path, string _, CancellationToken __)
+        {
+            cache.Remove(path);
+            cache.Save();
+            return Task.CompletedTask;
+        }
+        var (editor, wasCalled) = BuildExplodingEditor(root, cache, AfterWrite);
+
+        var result = await editor.ReplaceSymbolBodyAsync("A", relPath, "new body", CancellationToken.None);
+
+        result.Should().Contain("Replaced body");
+        wasCalled().Should().BeFalse("cache invalidation must not require LSP startup");
+        cache.TryGetUnchecked(absPath).Should().BeNull("the edited file's old symbol entry is stale after a write");
     }
 }

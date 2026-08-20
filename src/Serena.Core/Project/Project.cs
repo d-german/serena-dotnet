@@ -291,6 +291,13 @@ public sealed class SerenaProject
     public ProjectConfig Config => _config;
 
     /// <summary>
+    /// True when project.yml explicitly selected one or more languages.
+    /// Supports both Python Serena's <c>languages:</c> list and this port's
+    /// older <c>main_language</c>/<c>additional_languages</c> shape.
+    /// </summary>
+    public bool HasConfiguredLanguages => GetConfiguredLanguageIdentifiers().Count > 0;
+
+    /// <summary>
     /// The registration config from config.yml, if this project was registered.
     /// </summary>
     public RegisteredProject? Registration { get; }
@@ -342,6 +349,95 @@ public sealed class SerenaProject
             }
         }
         return new ProjectConfig();
+    }
+
+    /// <summary>
+    /// Returns the explicit project languages in configured priority order.
+    /// Invalid entries are ignored with a warning. An empty result means the
+    /// project did not configure languages, so callers may use legacy
+    /// extension-based auto-detection.
+    /// </summary>
+    public IReadOnlyList<Language> GetConfiguredLanguages()
+    {
+        var result = new List<Language>();
+        var seen = new HashSet<Language>();
+
+        foreach (string identifier in GetConfiguredLanguageIdentifiers())
+        {
+            var language = LanguageExtensions.FromIdentifier(identifier);
+            if (language is null)
+            {
+                _logger.LogWarning("Ignoring unknown language '{Language}' in {Path}", identifier, ProjectYmlPath);
+                continue;
+            }
+
+            if (seen.Add(language.Value))
+            {
+                result.Add(language.Value);
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Returns the <c>ls_specific_settings.&lt;language&gt;</c> map from
+    /// project.yml. This is used for overrides such as <c>server_path</c> and
+    /// <c>polite_mode</c> for every registered backend, not only C#.
+    /// </summary>
+    public IReadOnlyDictionary<string, object> GetLanguageServerSettings(Language language)
+    {
+        if (_config.LsSpecificSettings is null)
+        {
+            return new Dictionary<string, object>();
+        }
+
+        string identifier = language.ToIdentifier();
+        var entry = _config.LsSpecificSettings.FirstOrDefault(pair =>
+            string.Equals(pair.Key, identifier, StringComparison.OrdinalIgnoreCase));
+        if (entry.Key is null || entry.Value is null)
+        {
+            return new Dictionary<string, object>();
+        }
+        return new Dictionary<string, object>(entry.Value, StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Returns true when <paramref name="language"/> is allowed for this project.
+    /// With no explicit language configuration, all known languages remain
+    /// allowed for backward-compatible auto-detection.
+    /// </summary>
+    public bool IsLanguageEnabled(Language language)
+    {
+        var configured = GetConfiguredLanguages();
+        return configured.Count == 0 || configured.Contains(language);
+    }
+
+    private IReadOnlyList<string> GetConfiguredLanguageIdentifiers()
+    {
+        var identifiers = new List<string>();
+
+        if (_config.Languages is { Count: > 0 })
+        {
+            identifiers.AddRange(_config.Languages);
+        }
+        else
+        {
+            if (!string.IsNullOrWhiteSpace(_config.MainLanguage))
+            {
+                identifiers.Add(_config.MainLanguage);
+            }
+
+            if (_config.AdditionalLanguages is { Count: > 0 })
+            {
+                identifiers.AddRange(_config.AdditionalLanguages);
+            }
+        }
+
+        return identifiers
+            .Where(s => !string.IsNullOrWhiteSpace(s))
+            .Select(s => s.Trim())
+            .ToList();
     }
 
     public void SaveConfig()
@@ -419,11 +515,72 @@ public sealed class SerenaProject
             matcher.AddExclude(excludePattern);
         }
 
-        var result = matcher.Execute(
-            new Microsoft.Extensions.FileSystemGlobbing.Abstractions.DirectoryInfoWrapper(
-                new DirectoryInfo(_projectRoot)));
+        var files = new List<string>();
+        GatherSourceFilesRecursive(_projectRoot, matcher, files);
+        return files;
+    }
 
-        return result.Files.Select(f => f.Path).ToList();
+    private void GatherSourceFilesRecursive(string directory, Matcher matcher, List<string> files)
+    {
+        foreach (string subdirectory in SafeEnumerateDirectories(directory))
+        {
+            string relativeDirectory = ToProjectRelativePath(subdirectory);
+            if (IsIgnoredPath(relativeDirectory))
+            {
+                continue;
+            }
+
+            GatherSourceFilesRecursive(subdirectory, matcher, files);
+        }
+
+        foreach (string file in SafeEnumerateFiles(directory))
+        {
+            string relativeFile = ToProjectRelativePath(file);
+            if (IsIgnoredPath(relativeFile))
+            {
+                continue;
+            }
+
+            if (matcher.Match(relativeFile).HasMatches)
+            {
+                files.Add(relativeFile);
+            }
+        }
+    }
+
+    private string ToProjectRelativePath(string fullPath) =>
+        Path.GetRelativePath(_projectRoot, fullPath).Replace('\\', '/');
+
+    private static IEnumerable<string> SafeEnumerateDirectories(string directory)
+    {
+        try
+        {
+            return Directory.EnumerateDirectories(directory).ToArray();
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return [];
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return [];
+        }
+    }
+
+    private static IEnumerable<string> SafeEnumerateFiles(string directory)
+    {
+        try
+        {
+            return Directory.EnumerateFiles(directory).ToArray();
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return [];
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return [];
+        }
     }
 
     /// <summary>
@@ -455,7 +612,7 @@ public sealed class SerenaProject
     /// Resolves the C# solution scope for this project. Precedence (highest first):
     /// runtime override (set via <see cref="SetCSharpScope"/>) →
     /// <c>SERENA_CSHARP_SOLUTIONS</c> env var → <c>csharp.scope.solutions</c>
-    /// in project.yml → <see cref="SolutionScope.Empty"/> (legacy whole-repo glob).
+    /// in project.yml → <see cref="SolutionScope.Empty"/> (automatic discovery for small repositories only).
     /// </summary>
     public SolutionScope GetCSharpScope()
     {

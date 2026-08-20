@@ -49,7 +49,7 @@ public sealed class LanguageServerSymbol
     /// <remarks>
     /// v1.0.30: re-links <see cref="UnifiedSymbolInformation.Parent"/> on each
     /// child as we recurse. Parent is <c>[JsonIgnore]</c>, so it is lost when
-    /// the symbol cache (.serena/cache/&lt;lang&gt;/symbols.json) is deserialized.
+    /// the symbol cache (.serena/cache/&lt;lang&gt;/symbols.db) entry is deserialized.
     /// Without this, <see cref="UnifiedSymbolInformation.NamePath"/> returns
     /// only the leaf name (e.g. "GetPageThumbnail") instead of the qualified
     /// path ("ThumbnailController/GetPageThumbnail"), which broke
@@ -601,11 +601,16 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
         var results = new List<LanguageServerSymbol>();
         // Cache keys live in canonical (forward-slash) form; normalize scope the same way.
         string? scopeNormalized = scopeAbsPath is null ? null : SymbolCacheKeys.Normalize(scopeAbsPath);
-        foreach (string absPath in _symbolCache!.Keys)
+        IReadOnlyCollection<string> candidatePaths = _symbolCache!.TryGetCandidatePaths(
+            matcher.LeafName, substringMatching, scopeNormalized, out var indexedCandidates)
+            ? indexedCandidates
+            : _symbolCache.Keys;
+
+        foreach (string absPath in candidatePaths)
         {
             // Filter to scoped directory when caller passed one
             if (scopeNormalized is not null &&
-                !absPath.StartsWith(scopeNormalized, StringComparison.OrdinalIgnoreCase))
+                !IsWithinPath(absPath, scopeNormalized))
             {
                 continue;
             }
@@ -623,6 +628,16 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
             results.AddRange(MatchSymbols(symbols, matcher, substringMatching));
         }
         return results;
+    }
+
+    private static bool IsWithinPath(string candidate, string scope)
+    {
+        if (candidate.Equals(scope, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        string prefix = scope.EndsWith('/') ? scope : scope + "/";
+        return candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
     }
 
     public Task<string?> GetSymbolBodyAsync(
@@ -970,6 +985,12 @@ public sealed class NamePathMatcher
         _isAbsolute = isAbsolute;
         _leafOnlyIgnoreCase = leafOnlyIgnoreCase;
     }
+
+    /// <summary>
+    /// The declaration name used by the persistent symbol-name index to find
+    /// candidate files before full name-path matching.
+    /// </summary>
+    public string LeafName => StripIndex(_segments[^1]);
 
     /// <summary>
     /// Parses a name path pattern.

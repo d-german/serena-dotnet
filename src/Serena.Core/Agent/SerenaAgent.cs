@@ -233,6 +233,14 @@ public sealed class SerenaAgent : IAsyncDisposable
         {
             return null;
         }
+        if (_activeProject is not null && !_activeProject.IsLanguageEnabled(language.Value))
+        {
+            _logger.LogDebug(
+                "Language {Language} is not enabled for active project {Project}",
+                language.Value,
+                _activeProject.Root);
+            return null;
+        }
 
         var settings = BuildLsSettings(language.Value);
         return await _lsManager.GetOrStartAsync(language.Value, settings, ct: ct);
@@ -245,22 +253,26 @@ public sealed class SerenaAgent : IAsyncDisposable
     /// </summary>
     private CustomLsSettings? BuildLsSettings(Language language)
     {
-        if (language != Language.CSharp || _activeProject is null)
+        if (_activeProject is null)
         {
             return null;
         }
 
-        var scope = _activeProject.GetCSharpScope();
-        if (scope.IsEmpty)
+        var dict = new Dictionary<string, object>(
+            _activeProject.GetLanguageServerSettings(language),
+            StringComparer.OrdinalIgnoreCase);
+
+        if (language == Language.CSharp)
         {
-            return null;
+            var scope = _activeProject.GetCSharpScope();
+            if (!scope.IsEmpty)
+            {
+                dict[CSharpLanguageServer.ScopeSolutionsSetting] =
+                    string.Join(';', scope.SolutionPaths);
+            }
         }
 
-        var dict = new Dictionary<string, object>
-        {
-            [CSharpLanguageServer.ScopeSolutionsSetting] = string.Join(';', scope.SolutionPaths),
-        };
-        return new CustomLsSettings(dict);
+        return dict.Count == 0 ? null : new CustomLsSettings(dict);
     }
 
     /// <summary>
@@ -314,6 +326,35 @@ public sealed class SerenaAgent : IAsyncDisposable
     /// </summary>
     public SymbolCache<UnifiedSymbolInformation[]>? GetSymbolCache(Language language) =>
         _lsManager?.GetOrLoadSymbolCache(language);
+
+    /// <summary>
+    /// Records a file write without starting a language server. The active
+    /// project's symbol cache is invalidated for the file immediately, and
+    /// refreshed only when the matching language server is already warm.
+    /// </summary>
+    public Task UpdateSymbolCacheForWrittenFileAsync(
+        string absolutePath,
+        string content,
+        CancellationToken ct = default)
+    {
+        if (_lsManager is null)
+        {
+            return Task.CompletedTask;
+        }
+
+        var language = LanguageExtensions.FromFileExtension(Path.GetExtension(absolutePath));
+        if (language is null)
+        {
+            return Task.CompletedTask;
+        }
+
+        if (_activeProject is not null && !_activeProject.IsLanguageEnabled(language.Value))
+        {
+            return Task.CompletedTask;
+        }
+
+        return _lsManager.UpdateSymbolCacheForWrittenFileAsync(language.Value, absolutePath, content, ct);
+    }
 
     /// <summary>
     /// Project root for the active project, or null if none activated.

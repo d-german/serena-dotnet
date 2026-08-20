@@ -393,8 +393,10 @@ public sealed class LanguageServerProcess : IAsyncDisposable
             _logger.LogWarning(ex, "Error during LSP shutdown sequence for [{Language}]", _language);
         }
 
-        // Wait briefly for graceful exit, then force kill
-        await WaitForExitOrKillAsync(TimeSpan.FromSeconds(5));
+        // Wait for graceful exit, then force kill. Roslyn can take longer than
+        // smaller language servers to drain on Windows after receiving "exit",
+        // so keep the default practical instead of warning on normal CLI use.
+        await WaitForExitOrKillAsync(GetShutdownExitTimeout());
     }
 
     /// <summary>
@@ -521,6 +523,16 @@ public sealed class LanguageServerProcess : IAsyncDisposable
             _logger.LogWarning("Language server [{Language}] didn't exit in time, killing", _language);
             KillProcessTree(_process);
         }
+    }
+
+    private static TimeSpan GetShutdownExitTimeout()
+    {
+        string? raw = Environment.GetEnvironmentVariable("SERENA_LSP_SHUTDOWN_TIMEOUT_SECONDS");
+        if (int.TryParse(raw, out int seconds))
+        {
+            return TimeSpan.FromSeconds(Math.Clamp(seconds, 1, 120));
+        }
+        return TimeSpan.FromSeconds(15);
     }
 
     private static void KillProcessTree(System.Diagnostics.Process process)

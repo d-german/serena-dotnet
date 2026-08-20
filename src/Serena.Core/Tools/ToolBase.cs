@@ -11,6 +11,7 @@ using Serena.Core.Agent;
 using Serena.Core.Editor;
 using Serena.Core.Hooks;
 using Serena.Core.Project;
+using Serena.Lsp;
 
 namespace Serena.Core.Tools;
 
@@ -240,21 +241,19 @@ public abstract class ToolBase : ITool
     }
 
     /// <summary>
-    /// Best-effort LSP notification when a file's content changes.
+    /// Best-effort post-write hook. This must not start a language server:
+    /// it invalidates the written file's cache entry immediately and refreshes
+    /// it only when a matching language server is already warm.
     /// </summary>
     protected async Task TryNotifyLspAsync(string absolutePath, string content, CancellationToken ct)
     {
         try
         {
-            var lsp = await Context.Agent.GetLanguageServerForFileAsync(absolutePath, ct);
-            if (lsp is not null)
-            {
-                await lsp.NotifyFileChangedAsync(absolutePath, content);
-            }
+            await Context.Agent.UpdateSymbolCacheForWrittenFileAsync(absolutePath, content, ct);
         }
         catch (Exception ex)
         {
-            Logger.LogDebug(ex, "LSP notification failed for {Path} (best-effort)", absolutePath);
+            Logger.LogDebug(ex, "Post-write cache/LSP update failed for {Path} (best-effort)", absolutePath);
         }
     }
 
@@ -327,15 +326,7 @@ public abstract class ToolBase : ITool
     {
         string root = RequireProjectRoot();
         string absPath = Path.GetFullPath(Path.Combine(root, relativePath));
-
-        // When the path is a directory, find a representative source file to determine the language
-        string lspLookupPath = absPath;
-        if (Directory.Exists(absPath))
-        {
-            lspLookupPath = Directory.EnumerateFiles(absPath, "*", SearchOption.AllDirectories)
-                .FirstOrDefault(LanguageServerSymbolRetriever.CanAnalyzeFile)
-                ?? absPath;
-        }
+        string lspLookupPath = ResolveLanguageProbePath(absPath);
 
         var lsp = await Context.Agent.GetLanguageServerForFileAsync(lspLookupPath, ct)
             ?? throw new InvalidOperationException(
@@ -362,24 +353,12 @@ public abstract class ToolBase : ITool
     {
         string root = RequireProjectRoot();
         string absPath = Path.GetFullPath(Path.Combine(root, relativePath));
-
-        // Determine language WITHOUT touching the LSP. If relativePath is a
-        // directory, probe it for the first analyzable file to pick a language;
-        // otherwise use the file's extension directly.
-        string languageProbePath = absPath;
-        if (Directory.Exists(absPath))
-        {
-            languageProbePath = Directory.EnumerateFiles(absPath, "*", SearchOption.AllDirectories)
-                .FirstOrDefault(LanguageServerSymbolRetriever.CanAnalyzeFile)
-                ?? absPath;
-        }
-
-        var language = Serena.Lsp.LanguageExtensions.FromFileExtension(Path.GetExtension(languageProbePath));
+        string languageProbePath = ResolveLanguageProbePath(absPath);
+        var language = ResolveEnabledLanguage(languageProbePath);
         if (language is null)
         {
-            // Unknown language: fall back to the LSP-starting retriever so the
-            // error path is consistent with the pre-refactor behavior.
-            return RequireSymbolRetrieverAsync(relativePath, ct);
+            throw new InvalidOperationException(
+                $"No enabled language server available for '{relativePath}'. Check .serena/project.yml languages.");
         }
 
         var cache = Context.Agent.GetSymbolCache(language.Value);
@@ -409,15 +388,7 @@ public abstract class ToolBase : ITool
     {
         string root = RequireProjectRoot();
         string absPath = Path.GetFullPath(Path.Combine(root, relativePath));
-
-        // When the path is a directory, find a representative source file to determine the language
-        string lspLookupPath = absPath;
-        if (Directory.Exists(absPath))
-        {
-            lspLookupPath = Directory.EnumerateFiles(absPath, "*", SearchOption.AllDirectories)
-                .FirstOrDefault(LanguageServerSymbolRetriever.CanAnalyzeFile)
-                ?? absPath;
-        }
+        string lspLookupPath = ResolveLanguageProbePath(absPath);
 
         var lsp = await Context.Agent.GetLanguageServerForFileAsync(lspLookupPath, ct)
             ?? throw new InvalidOperationException(
@@ -429,7 +400,12 @@ public abstract class ToolBase : ITool
         var retriever = new LanguageServerSymbolRetriever(lsp, root,
             Context.LoggerFactory.CreateLogger<LanguageServerSymbolRetriever>(), cache,
             snapshotFactory: () => Context.Agent.GetLanguageServerReadyState(lspLanguage));
-        return new LanguageServerCodeEditor(retriever, lsp, root, logger);
+        return new LanguageServerCodeEditor(
+            retriever,
+            lsp,
+            root,
+            logger,
+            (path, content, token) => Context.Agent.UpdateSymbolCacheForWrittenFileAsync(path, content, token));
     }
 
     /// <summary>
@@ -446,24 +422,12 @@ public abstract class ToolBase : ITool
     {
         string root = RequireProjectRoot();
         string absPath = Path.GetFullPath(Path.Combine(root, relativePath));
-
-        // Determine language WITHOUT touching the LSP. If relativePath is a
-        // directory, probe it for the first analyzable file to pick a language;
-        // otherwise use the file's extension directly.
-        string languageProbePath = absPath;
-        if (Directory.Exists(absPath))
-        {
-            languageProbePath = Directory.EnumerateFiles(absPath, "*", SearchOption.AllDirectories)
-                .FirstOrDefault(LanguageServerSymbolRetriever.CanAnalyzeFile)
-                ?? absPath;
-        }
-
-        var language = Serena.Lsp.LanguageExtensions.FromFileExtension(Path.GetExtension(languageProbePath));
+        string languageProbePath = ResolveLanguageProbePath(absPath);
+        var language = ResolveEnabledLanguage(languageProbePath);
         if (language is null)
         {
-            // Unknown language: fall back to the eager LSP-starting editor so
-            // the error path stays consistent with pre-refactor behavior.
-            return RequireCodeEditorAsync(relativePath, ct);
+            throw new InvalidOperationException(
+                $"No enabled language server available for '{relativePath}'. Check .serena/project.yml languages.");
         }
 
         var cache = Context.Agent.GetSymbolCache(language.Value);
@@ -483,8 +447,86 @@ public abstract class ToolBase : ITool
             LspFactory, root, retrieverLogger, cache,
             snapshotFactory: () => Context.Agent.GetLanguageServerReadyState(language.Value),
             language: language.Value);
-        ICodeEditor editor = new LanguageServerCodeEditor(retriever, LspFactory, root, editorLogger);
+        ICodeEditor editor = new LanguageServerCodeEditor(
+            retriever,
+            LspFactory,
+            root,
+            editorLogger,
+            (path, content, token) => Context.Agent.UpdateSymbolCacheForWrittenFileAsync(path, content, token));
         return Task.FromResult(editor);
+    }
+
+    private string ResolveLanguageProbePath(string absolutePath)
+    {
+        if (File.Exists(absolutePath))
+        {
+            return absolutePath;
+        }
+
+        var configuredLanguages = Context.ActiveProject?.GetConfiguredLanguages() ?? [];
+        if (Directory.Exists(absolutePath))
+        {
+            if (configuredLanguages.Count > 0)
+            {
+                foreach (var language in configuredLanguages)
+                {
+                    string? match = FindFirstSourceFileForLanguage(absolutePath, language);
+                    if (match is not null)
+                    {
+                        return match;
+                    }
+                }
+
+                return Path.Combine(absolutePath, "__serena_language_probe" + GetProbeExtension(configuredLanguages[0]));
+            }
+
+            return Directory.EnumerateFiles(absolutePath, "*", SearchOption.AllDirectories)
+                .FirstOrDefault(LanguageServerSymbolRetriever.CanAnalyzeFile)
+                ?? absolutePath;
+        }
+
+        return absolutePath;
+    }
+
+    private Language? ResolveEnabledLanguage(string languageProbePath)
+    {
+        var language = LanguageExtensions.FromFileExtension(Path.GetExtension(languageProbePath));
+        if (language is null)
+        {
+            return null;
+        }
+
+        var project = Context.ActiveProject;
+        if (project is not null && !project.IsLanguageEnabled(language.Value))
+        {
+            return null;
+        }
+
+        return language.Value;
+    }
+
+    private static string? FindFirstSourceFileForLanguage(string root, Language language)
+    {
+        foreach (string pattern in language.GetSourceFilePatterns())
+        {
+            string searchPattern = pattern.StartsWith("*.", StringComparison.Ordinal)
+                ? pattern[1..]
+                : pattern;
+            string? match = Directory.EnumerateFiles(root, "*" + searchPattern, SearchOption.AllDirectories)
+                .FirstOrDefault();
+            if (match is not null)
+            {
+                return match;
+            }
+        }
+
+        return null;
+    }
+
+    private static string GetProbeExtension(Language language)
+    {
+        string pattern = language.GetSourceFilePatterns().FirstOrDefault() ?? ".txt";
+        return pattern.StartsWith("*.", StringComparison.Ordinal) ? pattern[1..] : Path.GetExtension(pattern);
     }
 
     /// <summary>

@@ -12,8 +12,12 @@ public class GitIgnoreFilterTests
         var filter = GitIgnoreFilter.FromContent("");
         filter.IsIgnored(".git").Should().BeTrue();
         filter.IsIgnored(".git/config").Should().BeTrue();
+        filter.IsIgnored("nested/.git/objects/51/hash").Should().BeTrue();
         filter.IsIgnored(".serena").Should().BeTrue();
         filter.IsIgnored(".serena/memories/test.md").Should().BeTrue();
+        filter.IsIgnored("src/bin/Debug/App.dll").Should().BeTrue();
+        filter.IsIgnored("tests/obj/project.assets.json").Should().BeTrue();
+        filter.IsIgnored("ui/node_modules/package/index.js").Should().BeTrue();
     }
 
     [Fact]
@@ -34,6 +38,15 @@ public class GitIgnoreFilterTests
         filter.IsIgnored("obj/project.assets.json").Should().BeTrue();
         filter.IsIgnored("node_modules/lodash/index.js").Should().BeTrue();
         filter.IsIgnored("src/bin.cs").Should().BeFalse();
+    }
+
+    [Fact]
+    public void DirectoryPattern_WithCharacterClass_MatchesCaseVariants()
+    {
+        var filter = GitIgnoreFilter.FromContent("[Bb]in/\n[Oo]bj/");
+        filter.IsIgnored("bin/Debug/net10.0/App.dll").Should().BeTrue();
+        filter.IsIgnored("Obj/project.assets.json").Should().BeTrue();
+        filter.IsIgnored("src/Object.cs").Should().BeFalse();
     }
 
     [Fact]

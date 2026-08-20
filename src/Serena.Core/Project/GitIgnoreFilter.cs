@@ -30,7 +30,7 @@ public sealed class GitIgnoreFilter : IIgnoreFilter
     /// </summary>
     private static readonly string[] BuiltInIgnored =
     [
-        ".git", ".serena",
+        ".git", ".hg", ".svn", ".serena", ".vs", ".idea", "bin", "obj", "node_modules",
     ];
 
     private GitIgnoreFilter() { }
@@ -76,9 +76,9 @@ public sealed class GitIgnoreFilter : IIgnoreFilter
         // Normalize to forward slashes
         string normalized = relativePath.Replace('\\', '/').TrimEnd('/');
 
-        // Check built-in ignores
-        string topDir = normalized.Split('/')[0];
-        if (BuiltInIgnored.Any(d => string.Equals(d, topDir, StringComparison.OrdinalIgnoreCase)))
+        // Check built-in ignores anywhere in the path, including nested repos.
+        var segments = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Any(s => BuiltInIgnored.Any(d => string.Equals(d, s, StringComparison.OrdinalIgnoreCase))))
         {
             return true;
         }

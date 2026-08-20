@@ -65,10 +65,10 @@ public class SearchForPatternLimitsTests : IDisposable
     }
 
     [Fact]
-    public async Task MaxAnswerChars_DefaultsToTwoMillion()
+    public async Task MaxAnswerChars_DefaultsToOneHundredThousand()
     {
         // Confirm the constant is wired into the parameter default.
-        SearchForPatternTool.DefaultMaxAnswerChars.Should().Be(2_000_000);
+        SearchForPatternTool.DefaultMaxAnswerChars.Should().Be(100_000);
         SearchForPatternTool.MaxContextLines.Should().Be(500);
     }
 
@@ -76,7 +76,7 @@ public class SearchForPatternLimitsTests : IDisposable
     public async Task MaxAnswerChars_DefaultCap_TruncatesHugeResult()
     {
         // Generate a small file but request padding via context so the JSON result
-        // grows well past 2 MB. We synthesize ~3 MB of unique line content and search
+        // grows well past the 100 KB default. We synthesize ~3 MB of unique line content and search
         // for a single sentinel with a moderate context window so the formatter only
         // walks a few matches (avoiding O(n²) match-line counting).
         var sb = new StringBuilder(3_500_000);
@@ -94,10 +94,10 @@ public class SearchForPatternLimitsTests : IDisposable
             {
                 ["substring_pattern"] = "UNIQUE_SENTINEL_TOKEN",
                 ["context_lines_before"] = 99999, // clamped to 500 -> still a lot of context
-                // No max_answer_chars passed -> default 2_000_000.
+                // No max_answer_chars passed -> default 100_000.
             },
             CancellationToken.None);
 
-        capped.Length.Should().BeLessThanOrEqualTo(2_000_000 + 1024);
+        capped.Length.Should().BeLessThanOrEqualTo(100_000 + 1024);
     }
 }

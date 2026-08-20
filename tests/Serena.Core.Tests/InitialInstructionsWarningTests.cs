@@ -39,7 +39,7 @@ public class InitialInstructionsWarningTests : IDisposable
     {
         var tool = new InitialInstructionsTool(NullToolContext.Instance);
         var result = await tool.ExecuteAsync(new Dictionary<string, object?>(), CancellationToken.None);
-        Assert.DoesNotContain("Multiple C# solutions detected", result);
+        Assert.DoesNotContain("Multiple top-level C# solutions detected", result);
     }
 
     [Fact]
@@ -50,7 +50,7 @@ public class InitialInstructionsWarningTests : IDisposable
         var tool = new InitialInstructionsTool(ctx);
 
         var result = await tool.ExecuteAsync(new Dictionary<string, object?>(), CancellationToken.None);
-        Assert.DoesNotContain("Multiple C# solutions detected", result);
+        Assert.DoesNotContain("Multiple top-level C# solutions detected", result);
     }
 
     [Fact]
@@ -64,9 +64,9 @@ public class InitialInstructionsWarningTests : IDisposable
 
         var result = await tool.ExecuteAsync(new Dictionary<string, object?>(), CancellationToken.None);
 
-        Assert.Contains("Multiple C# solutions detected", result);
-        Assert.Contains("(2 found)", result);
+        Assert.Contains("Multiple top-level C# solutions detected", result);
         Assert.Contains("set_active_solution", result);
+        Assert.Contains("cached find_symbol", result);
         Assert.Contains("search_for_pattern", result);
         // Warning must NOT enumerate solutions blindly — that defeats the discovery workflow.
         Assert.DoesNotContain("A.sln", result);
@@ -85,7 +85,7 @@ public class InitialInstructionsWarningTests : IDisposable
 
         var tool = new InitialInstructionsTool(ctx);
         var result = await tool.ExecuteAsync(new Dictionary<string, object?>(), CancellationToken.None);
-        Assert.DoesNotContain("Multiple C# solutions detected", result);
+        Assert.DoesNotContain("Multiple top-level C# solutions detected", result);
     }
 
     private FakeToolContext BuildContextWithProject()

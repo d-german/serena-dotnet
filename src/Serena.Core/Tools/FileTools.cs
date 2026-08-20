@@ -94,6 +94,7 @@ public sealed class CreateTextFileTool : ToolBase
         }
 
         await Serena.Core.Editor.FileWriteGate.WriteAllTextAsync(fullPath, content, GetProjectEncoding(), ct);
+        await TryNotifyLspAsync(fullPath, content, ct);
 
         string answer = $"File created: {relativePath}.";
         if (willOverwrite)
@@ -210,14 +211,15 @@ public sealed class FindFileTool : ToolBase
 public sealed class SearchForPatternTool : ToolBase
 {
     public const int MaxContextLines = 500;
-    public const int DefaultMaxAnswerChars = 2_000_000;
+    public const int DefaultMaxAnswerChars = 100_000;
 
     public SearchForPatternTool(IToolContext context) : base(context) { }
 
     public override string Description =>
         "Searches for arbitrary patterns in the codebase using regex. " +
         "context_lines_before/after are hard-capped at 500 each. " +
-        "max_answer_chars defaults to 2,000,000; pass -1 to disable the cap.";
+        "Overlapping context is merged to avoid repeated lines. " +
+        "max_answer_chars defaults to 100,000; pass -1 to disable the cap.";
 
     protected override IReadOnlyList<ToolParameter> ExtractParameters() =>
     [
@@ -225,7 +227,7 @@ public sealed class SearchForPatternTool : ToolBase
         new("relative_path", "Restrict search to this file or directory.", typeof(string), Required: false, DefaultValue: ""),
         new("context_lines_before", "Number of lines of context before each match. Hard-capped at 500.", typeof(int), Required: false, DefaultValue: 0),
         new("context_lines_after", "Number of lines of context after each match. Hard-capped at 500.", typeof(int), Required: false, DefaultValue: 0),
-        new("max_answer_chars", "Max characters for the result. Default 2,000,000; pass -1 to disable.", typeof(int), Required: false, DefaultValue: DefaultMaxAnswerChars),
+        new("max_answer_chars", "Max characters for the result. Default 100,000; pass -1 to disable.", typeof(int), Required: false, DefaultValue: DefaultMaxAnswerChars),
         new("paths_include_glob", "Only search files whose name matches this glob pattern (e.g. '*.cs').", typeof(string), Required: false, DefaultValue: ""),
         new("paths_exclude_glob", "Exclude files whose name matches this glob pattern (e.g. '*.min.js').", typeof(string), Required: false, DefaultValue: ""),
         new("restrict_search_to_code_files", "When true, only search files that the language server can analyze.", typeof(bool), Required: false, DefaultValue: false),
@@ -271,8 +273,7 @@ public sealed class SearchForPatternTool : ToolBase
     {
         IEnumerable<string> files = File.Exists(searchRoot)
             ? [searchRoot]
-            : Directory.EnumerateFiles(searchRoot, "*", SearchOption.AllDirectories)
-                .Where(f => !IsPathIgnored(Path.GetRelativePath(projectRoot, f)));
+            : EnumerateSearchTree(searchRoot, projectRoot);
 
         if (!string.IsNullOrEmpty(includeGlob))
         {
@@ -292,6 +293,48 @@ public sealed class SearchForPatternTool : ToolBase
         }
 
         return files;
+    }
+
+    private IEnumerable<string> EnumerateSearchTree(string searchRoot, string projectRoot)
+    {
+        var pending = new Stack<string>();
+        pending.Push(searchRoot);
+        while (pending.Count > 0)
+        {
+            string directory = pending.Pop();
+            IEnumerable<string> directories;
+            IEnumerable<string> files;
+            try
+            {
+                directories = Directory.EnumerateDirectories(directory).ToArray();
+                files = Directory.EnumerateFiles(directory).ToArray();
+            }
+            catch (UnauthorizedAccessException)
+            {
+                continue;
+            }
+            catch (IOException)
+            {
+                continue;
+            }
+
+            foreach (string childDirectory in directories)
+            {
+                string relative = Path.GetRelativePath(projectRoot, childDirectory);
+                if (!IsPathIgnored(relative))
+                {
+                    pending.Push(childDirectory);
+                }
+            }
+
+            foreach (string file in files)
+            {
+                if (!IsPathIgnored(Path.GetRelativePath(projectRoot, file)))
+                {
+                    yield return file;
+                }
+            }
+        }
     }
 
     private async Task<Dictionary<string, List<string>>> CollectMatchesAsync(
@@ -343,14 +386,20 @@ public sealed class SearchForPatternTool : ToolBase
             }
 
             string[] lines = content.Split('\n');
-            var fileMatches = new List<string>();
+            int[] lineStarts = BuildLineStarts(content);
+            var matchRanges = matches
+                .Select(match =>
+                {
+                    int matchStart = FindLine(lineStarts, match.Index);
+                    int matchEnd = FindLine(
+                        lineStarts, match.Index + Math.Max(0, match.Length - 1));
+                    return (MatchStart: matchStart, MatchEnd: matchEnd);
+                })
+                .ToList();
 
-            foreach (Match match in matches)
-            {
-                fileMatches.Add(FormatMatchContext(content, lines, match, contextBefore, contextAfter));
-            }
-
-            return fileMatches;
+            return MergeContextRanges(matchRanges, lines.Length, contextBefore, contextAfter)
+                .Select(range => FormatMatchContext(lines, range, matchRanges))
+                .ToList();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -358,22 +407,72 @@ public sealed class SearchForPatternTool : ToolBase
         }
     }
 
-    private static string FormatMatchContext(
-        string content, string[] lines, Match match, int contextBefore, int contextAfter)
+    private static int[] BuildLineStarts(string content)
     {
-        int matchLine = content[..match.Index].Count(c => c == '\n');
-        int matchEndLine = matchLine + match.Value.Count(c => c == '\n');
+        var starts = new List<int> { 0 };
+        for (int i = 0; i < content.Length; i++)
+        {
+            if (content[i] == '\n')
+            {
+                starts.Add(i + 1);
+            }
+        }
+        return starts.ToArray();
+    }
 
-        int startLine = Math.Max(0, matchLine - contextBefore);
-        int endLine = Math.Min(lines.Length - 1, matchEndLine + contextAfter);
+    private static int FindLine(int[] lineStarts, int offset)
+    {
+        int index = Array.BinarySearch(lineStarts, offset);
+        return index >= 0 ? index : ~index - 1;
+    }
+
+    private static List<(int Start, int End)> MergeContextRanges(
+        IReadOnlyList<(int MatchStart, int MatchEnd)> matches,
+        int lineCount,
+        int contextBefore,
+        int contextAfter)
+    {
+        var merged = new List<(int Start, int End)>();
+        foreach (var match in matches)
+        {
+            var next = (
+                Start: Math.Max(0, match.MatchStart - contextBefore),
+                End: Math.Min(lineCount - 1, match.MatchEnd + contextAfter));
+            if (merged.Count == 0 || next.Start > merged[^1].End + 1)
+            {
+                merged.Add(next);
+            }
+            else
+            {
+                merged[^1] = (merged[^1].Start, Math.Max(merged[^1].End, next.End));
+            }
+        }
+        return merged;
+    }
+
+    private static string FormatMatchContext(
+        string[] lines,
+        (int Start, int End) context,
+        IReadOnlyList<(int MatchStart, int MatchEnd)> matches)
+    {
 
         var sb = new StringBuilder();
-        for (int i = startLine; i <= endLine; i++)
+        for (int i = context.Start; i <= context.End; i++)
         {
-            string prefix = (i >= matchLine && i <= matchEndLine) ? "  > " : "    ";
-            sb.AppendLine($"{prefix}{i + 1,4}:{lines[i]}");
+            bool isMatch = matches.Any(match => i >= match.MatchStart && i <= match.MatchEnd);
+            sb.AppendLine(RenderMatchLine(i + 1, lines[i], isMatch));
         }
         return sb.ToString().TrimEnd();
+    }
+
+    // v0.1.2: Strip trailing CR so CRLF-terminated source files do not yield
+    // "\r\r\n" in rendered output (StringBuilder.AppendLine appends Environment.NewLine,
+    // which is "\r\n" on Windows; without the trim, the line itself already ends in "\r").
+    private static string RenderMatchLine(int lineNumber1Based, string rawLine, bool isMatch)
+    {
+        string prefix = isMatch ? "  > " : "    ";
+        string trimmed = (rawLine.Length > 0 && rawLine[rawLine.Length - 1] == '\r') ? rawLine.Substring(0, rawLine.Length - 1) : rawLine;
+        return $"{prefix}{lineNumber1Based,4}:{trimmed}";
     }
 }
 

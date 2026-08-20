@@ -149,37 +149,32 @@ public sealed class InitialInstructionsTool : ToolBase
             return null;
         }
 
-        var solutions = DiscoverSolutionFiles(project.Root);
-        if (solutions.Count < 2)
+        if (!HasMultipleTopLevelSolutions(project.Root))
         {
             return null;
         }
 
         var sb = new StringBuilder();
-        sb.AppendLine($"⚠️ Multiple C# solutions detected ({solutions.Count} found). Without an active solution scope, semantic operations (find_referencing_symbols, rename_symbol) will load ALL projects into Roslyn — this can take 15-30+ minutes on large repos and may time out.");
+        sb.AppendLine("⚠️ Multiple top-level C# solutions detected. Serena will not open an unbounded multi-solution Roslyn workspace; select the solution relevant to the task.");
         sb.AppendLine();
-        sb.AppendLine("DO NOT enumerate or pick a solution blindly. Use this discovery workflow:");
-        sb.AppendLine("  1. search_for_pattern(\"<term from the user's question>\")  — pure ripgrep, zero Roslyn cost");
-        sb.AppendLine("  2. Note the directories of the hits");
-        sb.AppendLine("  3. find_file(\"*.sln*\", relative_path=\"<directory of hits>\")  — finds the nearest enclosing solution");
-        sb.AppendLine("  4. set_active_solution(solution_path=\"<that path>\")");
-        sb.AppendLine("  5. Only NOW use find_symbol / find_referencing_symbols / rename_symbol.");
+        sb.AppendLine("If the user named a solution, call set_active_solution with it directly. Otherwise:");
+        sb.AppendLine("  1. Use cached find_symbol when the question names a declaration; use search_for_pattern for arbitrary text or a cache miss");
+        sb.AppendLine("  2. Note the directories of relevant hits");
+        sb.AppendLine("  3. find_file(\"*.sln*\", relative_path=\"<near the hits>\")");
+        sb.AppendLine("  4. set_active_solution(solution_path=\"<that path>\") before Roslyn-bound operations");
         sb.AppendLine();
-        sb.AppendLine("If the user already named a specific component (e.g. \"Forms\"), skip steps 1-3 and call set_active_solution directly.");
-        sb.AppendLine();
-        sb.AppendLine("After set_active_solution the C# language server requires workspace warmup (10-30 min on large solutions). RECOMMENDED FLOW: (1) call warm_language_server immediately to begin background warmup; (2) while it loads, use search_for_pattern, find_file, get_symbols_overview (file-scoped), and find_symbol WITH a relative_path — these all work without Roslyn; (3) poll get_language_server_status every 60-120s; (4) once state == Ready, use solution-wide find_symbol (no relative_path), find_referencing_symbols, and rename_symbol. If a symbol call returns a warming status, do NOT retry immediately — poll get_language_server_status first.");
+        sb.AppendLine("After scoping, call warm_language_server. While it loads, cached find_symbol/get_symbols_overview remain available and search_for_pattern handles non-symbol text. Poll get_language_server_status. Ready is complete; Partial permits read-only semantic queries but negative cross-project results are not guaranteed. Rename and safe delete require Ready.");
         sb.AppendLine();
         sb.AppendLine("To clear scope later: clear_active_solution. To stop a runaway language server: kill_language_server.");
         return sb.ToString().TrimEnd();
     }
 
-    private static List<string> DiscoverSolutionFiles(string projectRoot)
+    private static bool HasMultipleTopLevelSolutions(string projectRoot)
     {
         return new[] { ".sln", ".slnx" }
-            .SelectMany(ext => Directory.EnumerateFiles(projectRoot, $"*{ext}", SearchOption.AllDirectories))
-            .Select(p => Path.GetRelativePath(projectRoot, p))
-            .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
-            .ToList();
+            .SelectMany(ext => Directory.EnumerateFiles(projectRoot, $"*{ext}", SearchOption.TopDirectoryOnly))
+            .Take(2)
+            .Count() > 1;
     }
 
     private static readonly string InstructionsManual = """
@@ -211,7 +206,7 @@ public sealed class InitialInstructionsTool : ToolBase
         - `find_file` — Find files by glob pattern
         - `search_for_pattern` — Regex search across codebase
 
-        ### Symbol Navigation (requires LSP)
+        ### Symbol Navigation
         - `find_symbol` — Find symbols by name path pattern
         - `get_symbols_overview` — High-level view of symbols in a file
         - `find_referencing_symbols` — Find all references to a symbol
@@ -248,51 +243,56 @@ public sealed class InitialInstructionsTool : ToolBase
         cost and readiness requirements. Knowing the difference avoids the most common failure
         mode (hung calls, empty results, timeouts).
 
-        ### Tools that DO NOT require Roslyn — work immediately, even during warmup
+        ### Tools that never require Roslyn
         - `search_for_pattern` — text/regex search
         - `find_file` — filename glob
         - `read_file`
         - `list_dir`
-        - `get_symbols_overview` — file-scoped lightweight parser
-        - `find_symbol` **WHEN you pass `relative_path`** — file-scoped lightweight parser
 
-        ### Tools that REQUIRE Roslyn (state == Ready)
-        - `find_symbol` **WITHOUT `relative_path`** — solution-wide
-        - `find_referencing_symbols` — needs the full symbol graph
-        - `rename_symbol` — needs the full symbol graph
-        - `replace_symbol_body`, `insert_before_symbol`, `insert_after_symbol`,
-          `safe_delete_symbol` — symbol-targeting edits
+        ### Cache-first symbol tools
+        - `get_symbols_overview` — returns cached document symbols without Roslyn; a true cache
+          miss starts the language server
+        - `find_symbol` — searches a populated symbol cache without Roslyn, including when
+          `relative_path` is supplied; a true cache miss may start the language server
+
+        ### Tools that require Roslyn
+        - `find_referencing_symbols` — needs the resolved symbol graph; it may run in `Partial`
+          state, but its result explicitly says completeness is not guaranteed
+        - `rename_symbol` and `safe_delete_symbol` — require `Ready`; Serena blocks them in
+          `Partial` because an incomplete graph cannot prove all usages are covered
 
         ### Recommended workflow for any C# task
-        1. **Scope first.** If multiple solutions exist, call `set_active_solution` with the
-           narrowest solution that contains the code you'll touch. Roslyn only loads projects
-           in scope, so a tight scope means a fast warmup.
-        2. **Kick off warmup immediately.** Call `warm_language_server` once. It returns in
-           seconds and starts Roslyn loading in the background. Do NOT wait for it.
-        3. **Work while it loads.** Use the no-Roslyn tools above for exploration:
-           `search_for_pattern` to find candidates, `read_file` and `get_symbols_overview` to
-           read them, `find_symbol` with `relative_path` for file-scoped symbol lookups.
+        1. **Use the symbol cache first.** `find_symbol` is for declarations and
+           `get_symbols_overview` is for file structure. Use `search_for_pattern` for arbitrary
+           text, configuration, UI strings, or when the cache has no relevant declaration.
+        2. **Scope before Roslyn.** If multiple solutions exist, call `set_active_solution` with
+           the narrowest relevant solution. Roslyn loads the solution's complete project graph,
+           including dependencies outside the application's directory.
+        3. **Kick off warmup when semantic relationships are needed.** Call
+           `warm_language_server` once. Cached symbol tools remain available while it loads.
         4. **Poll, don't retry.** Call `get_language_server_status` every 60–120 seconds to
            check progress. On large solutions warmup takes 10–30 minutes.
-        5. **Use Roslyn-only tools once Ready.** When `state == Ready`, switch to solution-wide
-           `find_symbol`, `find_referencing_symbols`, and `rename_symbol` for the questions
-           that actually need the full symbol graph (find every caller, resolve overloads,
-           rename across the solution).
+        5. **Interpret readiness honestly.** `Ready` means initialization completed without
+           captured warnings. `Partial` allows read-only reference queries but their completeness
+           is not guaranteed. Mutating graph operations require `Ready`.
 
         ### Critical rules
         - **Never retry a Roslyn-bound symbol call immediately after a `language_server_warming`
           response.** Poll `get_language_server_status` first. The warming response is
           structured JSON, not a transient error.
-        - **A `find_referencing_symbols` empty result during warmup is meaningless.** It does
-          not mean "no callers" — it means "Roslyn isn't ready." Wait for Ready, then re-ask.
-        - **File-scoped `find_symbol` (with `relative_path`) returning empty IS meaningful** —
-          that path uses the lightweight parser and does not depend on Roslyn.
+        - **A `find_referencing_symbols` empty result during warmup is meaningless.** In `Partial`,
+          inspect warnings and do not treat a negative result as proof that there are no callers.
+        - **A cache-backed `find_symbol` result can be used while Roslyn is stopped or loading.**
+          On a true cache miss, wait for the language server instead of treating an empty or
+          warming result as a definitive answer.
 
-        ### When to choose grep vs. Roslyn
-        - **Grep wins (use the no-Roslyn tools):** forward pipeline traces, finding files,
-          named-symbol lookups in known files, architectural exploration.
-        - **Roslyn wins (wait for Ready):** "find every caller of method X" across overloads,
-          finding all implementations of an interface, renaming a symbol, impact analysis.
+        ### When to choose text search vs. symbol tools
+        - **Cache-backed symbols win:** declaration lookup, qualified name paths, class/member
+          structure, exact body ranges, and avoiding comment/string false positives.
+        - **Text search wins:** arbitrary strings, configuration keys, generated markup, and
+          discovering a term when no declaration name is known.
+        - **Roslyn wins:** resolved callers across overloads, implementations, rename, and impact
+          analysis across the selected solution's project graph.
 
         ## Best Practices
 

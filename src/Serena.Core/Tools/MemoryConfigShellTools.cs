@@ -636,14 +636,14 @@ public sealed class SetActiveSolutionTool : ToolBase
         "mono-repos to dramatically reduce C# language server cold-load time.\n\n" +
         "DISCOVERY WORKFLOW (MANDATORY when the user hasn't named a specific solution): " +
         "DO NOT enumerate solutions yourself — large repos can have hundreds. Instead: " +
-        "(1) use 'search_for_pattern' (pure ripgrep, zero Roslyn cost) to grep for terms from the " +
+        "(1) use 'search_for_pattern' (file scan, zero Roslyn cost) to locate terms from the " +
         "user's question; " +
         "(2) inspect the file paths of the hits; " +
         "(3) use 'find_file' with pattern '*.sln*' relative_path=<directory of hits> to find the " +
         "nearest enclosing solution; " +
-        "(4) call this tool with that solution_path. Only AFTER scoping should you use " +
-        "find_symbol / find_referencing_symbols / rename_symbol — those force Roslyn to load " +
-        "every project in scope.";
+        "(4) call this tool with that solution_path. Cached find_symbol remains safe before scoping; " +
+        "scope before find_referencing_symbols, rename_symbol, or any other operation that requires " +
+        "the resolved Roslyn project graph.";
 
     protected override IReadOnlyList<ToolParameter> ExtractParameters() =>
     [
@@ -741,7 +741,7 @@ public sealed class SetActiveSolutionTool : ToolBase
     /// <summary>
     /// Threshold above which the success message prepends a warning that the
     /// first symbol call may time out while Roslyn loads the workspace.
-    /// Calibrated against OnBase (185 projects \u2192 10\u201330 min cold load).
+    /// Calibrated against a large solution (185 projects \u2192 10\u201330 min cold load).
     /// </summary>
     private const int LargeScopeProjectThreshold = 50;
 
@@ -750,8 +750,8 @@ public sealed class SetActiveSolutionTool : ToolBase
         var sb = new StringBuilder();
         if (projectCount > LargeScopeProjectThreshold)
         {
-            sb.AppendLine($"\u26a0\ufe0f Large scope ({projectCount} projects). First symbol call may take 5\u201315 min while Roslyn loads.");
-            sb.AppendLine("Prefer search_for_pattern for initial exploration; call get_language_server_status to check readiness; use kill_language_server if it stalls.");
+            sb.AppendLine($"\u26a0\ufe0f Large scope ({projectCount} projects). Roslyn-bound calls may take several minutes while the workspace loads.");
+            sb.AppendLine("Use cached find_symbol/get_symbols_overview for declarations while loading; call get_language_server_status to check readiness; use kill_language_server if it stalls.");
             sb.AppendLine();
         }
         sb.AppendLine($"C# scope set to {solutionPaths.Count} solution(s) ({projectCount} C# project(s)):");
@@ -773,9 +773,9 @@ public sealed class ClearActiveSolutionTool : ToolBase
 
     public override string Description =>
         "Clear the C# Roslyn scope previously set by 'set_active_solution'. Removes " +
-        "csharp.scope.solutions from .serena/project.yml and stops the running C# language server " +
-        "(it will be re-started lazily on the next semantic request, with NO scope — i.e., the " +
-        "legacy whole-repo glob). Use this to undo a scope choice or to free Roslyn memory. On " +
+        "csharp.scope.solutions from .serena/project.yml and stops the running C# language server. " +
+        "In a large multi-solution repository, the next semantic request will require a new scope " +
+        "instead of opening every solution automatically. Use this to undo a scope choice or free Roslyn memory. On " +
         "very large repos, prefer to set a new narrower scope instead of clearing entirely.";
 
     protected override IReadOnlyList<ToolParameter> ExtractParameters() => [];
@@ -790,7 +790,7 @@ public sealed class ClearActiveSolutionTool : ToolBase
         await Context.Agent.RestartLanguageServerAsync(Language.CSharp, ct);
 
         return wasScoped
-            ? "C# scope cleared. csharp.scope.solutions removed from .serena/project.yml. C# language server stopped; next semantic request will reload with no scope (whole-repo glob)."
+            ? "C# scope cleared. csharp.scope.solutions removed from .serena/project.yml. C# language server stopped; a large multi-solution repository must select a new scope before the next semantic request."
             : "No active C# scope to clear. C# language server restarted anyway.";
     }
 }
@@ -839,8 +839,8 @@ public sealed class LanguageServerStatusTool : ToolBase
 
     public override string Description =>
         "Report the workspace-load readiness of each running language server. " +
-        "Returns a JSON object keyed by language with state (NotStarted/Loading/Ready/Failed), " +
-        "elapsed seconds since load began, and scope description when known. " +
+        "Returns a JSON object keyed by language with state (NotStarted/Loading/Ready/Partial/Failed), " +
+        "expected/loaded project counts, workspace warnings, elapsed seconds, and scope. " +
         "Call after set_active_solution (especially on large solutions) to know when " +
         "find_symbol / find_referencing_symbols are viable. Cheap; safe to poll.";
 
@@ -871,6 +871,7 @@ public sealed class LanguageServerStatusTool : ToolBase
                 ["projects_total"] = snap.ProjectsTotal,
                 ["elapsed_seconds"] = Math.Round(snap.ElapsedSeconds, 1),
                 ["scope"] = snap.ScopeDescription,
+                ["warnings"] = snap.Warnings,
                 ["advice"] = AdviceFor(snap.State),
             };
         }
@@ -884,8 +885,9 @@ public sealed class LanguageServerStatusTool : ToolBase
     private static string AdviceFor(WorkspaceReadyState state) => state switch
     {
         WorkspaceReadyState.NotStarted => "Server not started. Call warm_language_server to begin warmup, then poll this tool.",
-        WorkspaceReadyState.Loading => "Server warming. Use search_for_pattern; poll this tool again before retrying symbol calls.",
+        WorkspaceReadyState.Loading => "Server warming. Cached symbol queries remain available; use targeted text search for non-symbol terms and poll before retrying Roslyn-bound calls.",
         WorkspaceReadyState.Ready => "Ready for symbol queries.",
+        WorkspaceReadyState.Partial => "Semantic queries are available, but Roslyn reported an incomplete or warning-bearing workspace load. Results may omit projects; inspect warnings before relying on cross-project completeness.",
         WorkspaceReadyState.Failed => "Workspace load failed. Use kill_language_server, then activate_project / set_active_solution to retry.",
         _ => "",
     };

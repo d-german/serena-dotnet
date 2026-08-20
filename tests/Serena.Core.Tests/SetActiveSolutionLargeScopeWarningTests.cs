@@ -36,7 +36,7 @@ public class SetActiveSolutionLargeScopeWarningTests
     {
         string output = InvokeFormatSuccess(51);
         output.Should().StartWith("\u26a0\ufe0f Large scope (51 projects)");
-        output.Should().Contain("search_for_pattern");
+        output.Should().Contain("cached find_symbol/get_symbols_overview");
         output.Should().Contain("get_language_server_status");
         output.Should().Contain("kill_language_server");
     }

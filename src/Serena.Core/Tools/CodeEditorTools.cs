@@ -2,6 +2,7 @@
 // Tools for symbol editing: replace_symbol_body, insert_before/after_symbol, replace_content, rename_symbol
 
 using Microsoft.Extensions.Logging;
+using Serena.Lsp;
 
 namespace Serena.Core.Tools;
 
@@ -178,7 +179,7 @@ public sealed class RenameSymbolTool : ToolBase
         "Renames the symbol with the given name_path to new_name throughout the entire codebase. " +
         "PERFORMANCE: ALWAYS requires Roslyn (full symbol graph). Returns a warming status until " +
         "get_language_server_status reports Ready. Call warm_language_server after set_active_solution " +
-        "and wait for Ready before invoking this tool.";
+        "and wait for Ready before invoking this tool. Rename is blocked when the workspace is Partial.";
 
     protected override IReadOnlyList<ToolParameter> ExtractParameters() =>
     [
@@ -193,6 +194,20 @@ public sealed class RenameSymbolTool : ToolBase
         string relativePath = GetRequired<string>(arguments, "relative_path");
         string newName = GetRequired<string>(arguments, "new_name");
 
+        var state = Context.Agent.GetLanguageServerReadyState(Language.CSharp);
+        if (state.State == WorkspaceReadyState.Partial)
+        {
+            return ToJson(new
+            {
+                error = "language_server_partial",
+                message = "Rename was not performed because the Roslyn workspace is only partially loaded.",
+                workspace_warning_count = state.Warnings?.Count ?? 0,
+                workspace_warning_samples = FindReferencingSymbolsTool.SummarizeWorkspaceWarnings(state.Warnings),
+                status_hint = "Call get_language_server_status for the complete bounded warning list.",
+                advice = "Resolve project-load warnings or select a smaller valid solution, then wait for Ready."
+            });
+        }
+
         var editor = await RequireCodeEditorAsync(relativePath, ct);
         return await editor.RenameSymbolAsync(namePath, relativePath, newName, ct);
     }
@@ -204,7 +219,8 @@ public sealed class SafeDeleteSymbolTool : ToolBase
     public SafeDeleteSymbolTool(IToolContext context) : base(context) { }
 
     public override string Description =>
-        "Deletes the symbol if it is safe to do so (no references) or returns a list of references.";
+        "Deletes the symbol only when a complete Roslyn workspace proves there are no references; " +
+        "otherwise returns references. Requires Ready and is blocked when the workspace is Partial.";
 
     protected override IReadOnlyList<ToolParameter> ExtractParameters() =>
     [
@@ -216,6 +232,20 @@ public sealed class SafeDeleteSymbolTool : ToolBase
     {
         string namePathPattern = GetRequired<string>(arguments, "name_path_pattern");
         string relativePath = GetRequired<string>(arguments, "relative_path");
+
+        var state = Context.Agent.GetLanguageServerReadyState(Language.CSharp);
+        if (state.State == WorkspaceReadyState.Partial)
+        {
+            return ToJson(new
+            {
+                error = "language_server_partial",
+                message = "Safe delete was not performed because an incomplete workspace cannot prove that references are absent.",
+                workspace_warning_count = state.Warnings?.Count ?? 0,
+                workspace_warning_samples = FindReferencingSymbolsTool.SummarizeWorkspaceWarnings(state.Warnings),
+                status_hint = "Call get_language_server_status for the complete bounded warning list.",
+                advice = "Resolve project-load warnings or select a smaller valid solution, then wait for Ready."
+            });
+        }
 
         var editor = await RequireCodeEditorAsync(relativePath, ct);
         return await editor.SafeDeleteSymbolAsync(namePathPattern, relativePath, ct);

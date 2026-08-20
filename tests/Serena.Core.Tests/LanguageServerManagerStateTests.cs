@@ -3,6 +3,7 @@
 
 using FluentAssertions;
 using Serena.Core.Project;
+using Serena.Core.Tools;
 using Serena.Lsp;
 
 namespace Serena.Core.Tests;
@@ -58,10 +59,50 @@ public class LanguageServerManagerStateTests
     }
 
     [Fact]
+    public void MarkPartial_PreservesProjectCountAndExplainsIncompleteResults()
+    {
+        var sink = NewSink();
+        sink.MarkLoading(Language.CSharp, projectsTotal: 29, scopeDescription: "BigApp.sln");
+        sink.MarkPartial(Language.CSharp, "one legacy project failed", projectsLoaded: 28);
+
+        var snapshot = sink.GetReadyState(Language.CSharp);
+        snapshot.State.Should().Be(WorkspaceReadyState.Partial);
+        snapshot.ProjectsTotal.Should().Be(29);
+        snapshot.ProjectsLoaded.Should().Be(28);
+        snapshot.Warnings.Should().Contain("one legacy project failed");
+    }
+
+    [Fact]
+    public void MarkFailed_ReportsActionableFailureReason()
+    {
+        var sink = NewSink();
+        sink.MarkLoading(Language.CSharp);
+        sink.MarkFailed(Language.CSharp, "select a solution first");
+
+        var snapshot = sink.GetReadyState(Language.CSharp);
+        snapshot.State.Should().Be(WorkspaceReadyState.Failed);
+        snapshot.Warnings.Should().Contain("select a solution first");
+    }
+
+    [Fact]
     public void OtherLanguage_StaysNotStarted()
     {
         var sink = NewSink();
         sink.MarkReady(Language.CSharp);
         sink.GetReadyState(Language.Python).State.Should().Be(WorkspaceReadyState.NotStarted);
+    }
+
+    [Fact]
+    public void PartialReferenceWarnings_AreSampledAndTruncated()
+    {
+        string longWarning = new('x', 500);
+
+        var samples = FindReferencingSymbolsTool.SummarizeWorkspaceWarnings(
+            ["first", longWarning, "third", "fourth"]);
+
+        samples.Should().HaveCount(3);
+        samples[0].Should().Be("first");
+        samples[1].Should().HaveLength(241).And.EndWith("…");
+        samples[2].Should().Be("third");
     }
 }

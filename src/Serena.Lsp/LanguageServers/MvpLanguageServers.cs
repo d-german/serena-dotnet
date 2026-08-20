@@ -17,6 +17,8 @@ namespace Serena.Lsp.LanguageServers;
 /// </summary>
 public sealed class CSharpLanguageServer : LanguageServerDefinition
 {
+    private const int MaxUnscopedProjects = 50;
+
     public CSharpLanguageServer(ILogger<CSharpLanguageServer> logger) : base(logger) { }
 
     public override Language Language => Language.CSharp;
@@ -134,9 +136,16 @@ public sealed class CSharpLanguageServer : LanguageServerDefinition
         var sink = settings.ReadyStateSink;
         try
         {
+            int? expectedProjects = null;
             if (!scope.IsEmpty)
             {
-                sink?.MarkLoading(Language.CSharp, scope.SolutionPaths.Count, $"{scope.SolutionPaths.Count} solution(s)");
+                var scopedProjects = await SolutionParser.GetCSharpProjectPathsAsync(scope.SolutionPaths, ct)
+                    .ConfigureAwait(false);
+                expectedProjects = scopedProjects.Count;
+                sink?.MarkLoading(
+                    Language.CSharp,
+                    expectedProjects,
+                    $"{scope.SolutionPaths.Count} solution(s), {expectedProjects} C# project(s)");
                 await OpenScopedSolutionsAsync(client, scope, ct);
             }
             else
@@ -145,12 +154,30 @@ public sealed class CSharpLanguageServer : LanguageServerDefinition
                 await OpenAllInRepoAsync(client, projectRoot, ct);
             }
 
-            await WaitForIndexingAsync(client, ct);
-            sink?.MarkReady(Language.CSharp);
+            bool completed = await WaitForIndexingAsync(client, ct);
+            var warnings = client.GetWorkspaceWarnings();
+            if (!completed)
+            {
+                sink?.MarkPartial(
+                    Language.CSharp,
+                    "Roslyn stopped reporting activity before sending workspace/projectInitializationComplete; cross-project results may be incomplete.",
+                    warnings: warnings);
+            }
+            else if (warnings.Count > 0)
+            {
+                sink?.MarkPartial(
+                    Language.CSharp,
+                    "Roslyn completed workspace initialization with project-load warnings; semantic results may omit failed projects.",
+                    warnings: warnings);
+            }
+            else
+            {
+                sink?.MarkReady(Language.CSharp, projectsLoaded: expectedProjects);
+            }
         }
-        catch
+        catch (Exception ex)
         {
-            sink?.MarkFailed(Language.CSharp);
+            sink?.MarkFailed(Language.CSharp, ex.Message);
             throw;
         }
     }
@@ -216,20 +243,25 @@ public sealed class CSharpLanguageServer : LanguageServerDefinition
         // Discover all project files
         var csprojFiles = Directory.GetFiles(projectRoot, "*.csproj", SearchOption.AllDirectories);
 
-        if (slnFiles.Length > 0)
+        if (slnFiles.Length > 1 || (slnFiles.Length == 0 && csprojFiles.Length > MaxUnscopedProjects))
         {
-            Logger.LogInformation("Found {Count} solution file(s)", slnFiles.Length);
-            for (int i = 0; i < slnFiles.Length; i++)
-            {
-                string solutionUri = LspClient.PathToUri(slnFiles[i]);
-                Logger.LogInformation("Opening solution {Index}/{Total}: {Solution}",
-                    i + 1, slnFiles.Length, Path.GetFileName(slnFiles[i]));
-                await client.SendNotificationAsync("solution/open", new { solution = solutionUri });
-            }
+            throw new InvalidOperationException(
+                $"Repository contains {slnFiles.Length} solution(s) and {csprojFiles.Length} C# project(s). " +
+                "Select a solution with set_active_solution before starting Roslyn; " +
+                "Serena will not open an unbounded large-repository workspace automatically.");
         }
 
-        // Open all project files (Roslyn deduplicates by path)
-        if (csprojFiles.Length > 0)
+        if (slnFiles.Length == 1)
+        {
+            string solutionUri = LspClient.PathToUri(slnFiles[0]);
+            Logger.LogInformation("Opening the repository solution: {Solution}",
+                Path.GetFileName(slnFiles[0]));
+            await client.SendNotificationAsync("solution/open", new { solution = solutionUri });
+        }
+
+        // A solution already owns its project graph. Only use project/open for
+        // small repositories that have no solution file.
+        if (slnFiles.Length == 0 && csprojFiles.Length > 0)
         {
             var projectUris = csprojFiles.Select(LspClient.PathToUri).ToArray();
             Logger.LogInformation("Opening {Count} project(s)", csprojFiles.Length);
@@ -244,7 +276,7 @@ public sealed class CSharpLanguageServer : LanguageServerDefinition
         ct.ThrowIfCancellationRequested();
     }
 
-    private async Task WaitForIndexingAsync(LspClient client, CancellationToken ct)
+    private async Task<bool> WaitForIndexingAsync(LspClient client, CancellationToken ct)
     {
         // Wait for indexing: keep waiting as long as Roslyn is sending us activity ($/progress, diagnostics).
         // Give up after 30s of silence — works for any repo size.
@@ -260,6 +292,7 @@ public sealed class CSharpLanguageServer : LanguageServerDefinition
             Logger.LogWarning("C# project indexing stopped \u2014 no activity for {Timeout}s. Cross-file references may be incomplete",
                 (int)inactivityTimeout.TotalSeconds);
         }
+        return indexed;
     }
 
     /// <summary>

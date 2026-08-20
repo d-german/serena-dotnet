@@ -25,6 +25,7 @@ public static class Program
         rootCommand.Add(CreateDoctorCommand());
         rootCommand.Add(CreateVersionCommand());
         rootCommand.Add(CreateProjectCommand());
+        rootCommand.Add(SymbolsCommand.Create());
 
         var parseResult = rootCommand.Parse(args);
         return await parseResult.InvokeAsync();
@@ -207,6 +208,8 @@ public static class Program
             File.WriteAllText(projectYml, $"""
                 # Serena Project Configuration
                 project_name: {projectName}
+                languages:
+                - csharp
                 encoding: utf-8
                 """);
 
@@ -253,31 +256,61 @@ public static class Program
 
         // C# — installed as a dotnet global tool
         CheckLanguageServer("C# (Roslyn)", "roslyn-language-server",
-            localDir: null, dotnetToolsDir: dotnetToolsDir);
+            localDir: null, dotnetToolsDir: dotnetToolsDir,
+            installHint: "auto-installs on first C# request; or: dotnet tool install -g roslyn-language-server --prerelease");
 
         // TypeScript — installed locally via npm
         CheckLanguageServer("TypeScript", "typescript-language-server",
-            localDir: Path.Combine(lsBase, "typescript"), dotnetToolsDir: null);
+            localDir: Path.Combine(lsBase, "typescript"), dotnetToolsDir: null,
+            installHint: "auto-installs locally on first TypeScript/JavaScript request (requires Node.js/npm)");
 
         // Python — installed locally via npm
         CheckLanguageServer("Python (Pyright)", "pyright-langserver",
-            localDir: Path.Combine(lsBase, "python"), dotnetToolsDir: null);
+            localDir: Path.Combine(lsBase, "python"), dotnetToolsDir: null,
+            installHint: "auto-installs locally on first Python request (requires Node.js/npm)");
 
         // Rust — user-installed
         CheckLanguageServer("Rust (rust-analyzer)", "rust-analyzer",
-            localDir: null, dotnetToolsDir: null);
+            localDir: null, dotnetToolsDir: null,
+            installHint: "rustup component add rust-analyzer");
 
         // Go — user-installed
         CheckLanguageServer("Go (gopls)", "gopls",
-            localDir: null, dotnetToolsDir: null);
+            localDir: null, dotnetToolsDir: null,
+            installHint: "go install golang.org/x/tools/gopls@latest");
+
+        CheckLanguageServer("Java (JDT LS)", "jdtls",
+            localDir: null, dotnetToolsDir: null,
+            installHint: "install Eclipse JDT LS and put jdtls in PATH, or configure server_path");
+        CheckLanguageServer("Kotlin", "kotlin-language-server",
+            localDir: null, dotnetToolsDir: null,
+            installHint: "install kotlin-language-server and put it in PATH, or configure server_path");
+        CheckLanguageServer("C / C++ (clangd)", "clangd",
+            localDir: null, dotnetToolsDir: null,
+            installHint: "install LLVM/clangd and put clangd in PATH");
+        CheckLanguageServer("Ruby (Solargraph)", "solargraph",
+            localDir: null, dotnetToolsDir: null,
+            installHint: "gem install solargraph");
+        CheckLanguageServer("PHP (Phpactor)", "phpactor",
+            localDir: null, dotnetToolsDir: null,
+            installHint: "install Phpactor and put phpactor in PATH, or configure server_path");
+        CheckLanguageServer("Bash", "bash-language-server",
+            localDir: null, dotnetToolsDir: null,
+            installHint: "npm install -g bash-language-server");
+        CheckLanguageServer("Dart", "dart",
+            localDir: null, dotnetToolsDir: null,
+            installHint: "install the Dart SDK and put dart in PATH");
+        CheckLanguageServer("Elixir", "elixir-ls",
+            localDir: null, dotnetToolsDir: null,
+            installHint: "install ElixirLS and put elixir-ls in PATH, or configure server_path");
 
         Console.WriteLine();
-        Console.WriteLine("Language servers are auto-installed when the MCP server starts.");
-        Console.WriteLine("If any are missing, ensure prerequisites are installed and restart the server.");
+        Console.WriteLine("Roslyn, TypeScript, and Pyright are auto-installed when first needed.");
+        Console.WriteLine("All other servers must be in PATH or configured with server_path; see README Language Support.");
     }
 
     private static void CheckLanguageServer(string displayName, string binaryName,
-        string? localDir, string? dotnetToolsDir)
+        string? localDir, string? dotnetToolsDir, string? installHint = null)
     {
         // Check local npm install
         if (localDir is not null)
@@ -318,7 +351,8 @@ public static class Program
             return;
         }
 
-        Console.WriteLine($"  ✗ {displayName,-25} not found");
+        Console.WriteLine($"  ✗ {displayName,-25} not found" +
+            (installHint is null ? string.Empty : $" — {installHint}"));
     }
 
     private static bool CheckPrerequisite(string binary, string versionArg, string displayName, string installHint)
@@ -416,6 +450,11 @@ public static class Program
             DefaultValueFactory = _ => 10.0
         };
 
+        var solutionOption = new Option<string?>("--solution")
+        {
+            Description = "Limit indexing to the C# projects in this .sln/.slnx while keeping the cache at the repository root"
+        };
+
         var command = new Command("index")
         {
             Description = "Index a project by requesting symbols for all source files"
@@ -423,6 +462,7 @@ public static class Program
         command.Add(pathArg);
         command.Add(logLevelOption);
         command.Add(timeoutOption);
+        command.Add(solutionOption);
 
         command.SetAction(async (ParseResult parseResult, CancellationToken ct) =>
         {
@@ -430,11 +470,31 @@ public static class Program
             string projectRoot = Path.GetFullPath(rawPath);
             string logLevel = parseResult.GetValue(logLevelOption) ?? "Warning";
             double timeout = parseResult.GetValue(timeoutOption);
+            string? rawSolution = parseResult.GetValue(solutionOption);
 
             if (!Directory.Exists(projectRoot))
             {
                 Console.Error.WriteLine($"Error: Directory not found: {projectRoot}");
                 return;
+            }
+
+            IReadOnlyList<string>? solutionPaths = null;
+            if (!string.IsNullOrWhiteSpace(rawSolution))
+            {
+                string solutionPath = Path.GetFullPath(
+                    Path.IsPathRooted(rawSolution)
+                        ? rawSolution
+                        : Path.Combine(projectRoot, rawSolution));
+                if (!File.Exists(solutionPath))
+                {
+                    Console.Error.WriteLine($"Error: Solution not found: {solutionPath}");
+                    return;
+                }
+                solutionPaths = [solutionPath];
+
+                var scopedProject = new SerenaProject(
+                    projectRoot, NullLogger<SerenaProject>.Instance);
+                scopedProject.UpdateAndPersistCSharpScope(solutionPaths);
             }
 
             var loggerFactory = LoggerFactory.Create(builder =>
@@ -449,12 +509,18 @@ public static class Program
             var indexer = new ProjectIndexer(registry, loggerFactory);
 
             Console.WriteLine($"Indexing symbols in {projectRoot} …");
+            if (solutionPaths is not null)
+            {
+                Console.WriteLine($"Solution scope: {solutionPaths[0]}");
+                Console.WriteLine("Saved as the active C# scope in .serena/project.yml");
+            }
 
             var result = await indexer.IndexProjectAsync(
                 projectRoot,
                 onProgress: ReportIndexProgress,
                 onStatus: status => { Console.WriteLine($"  {status}"); Console.Out.Flush(); },
                 perFileTimeout: TimeSpan.FromSeconds(timeout),
+                solutionPaths: solutionPaths,
                 ct: ct);
 
             Console.WriteLine();
@@ -492,9 +558,13 @@ public static class Program
         }
         else
         {
-            // Redirected stdout: emit one line per percent change so logs stay
-            // readable. Always emit failures.
-            if (pct != s_lastReportedPercent || !progress.Success)
+            // Redirected stdout is commonly captured into an agent context.
+            // Five-percent checkpoints keep it useful without spending ~100
+            // lines on an unchanged large-solution cache verification.
+            bool crossedCheckpoint = s_lastReportedPercent < 0
+                || pct == 100
+                || pct / 5 != s_lastReportedPercent / 5;
+            if (crossedCheckpoint || !progress.Success)
             {
                 s_lastReportedPercent = pct;
                 Console.WriteLine($"  [{pct,3}%] {progress.CurrentFile}/{progress.TotalFiles} {status} {path}");

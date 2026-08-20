@@ -27,11 +27,11 @@ public sealed class FindSymbolTool : ToolBase
     public override string Description =>
         "Retrieves information on all symbols/code entities based on the given name path pattern. " +
         "Accepts either `name_path_pattern` (canonical) or `name_path` (alias) for the pattern argument. " +
-        "PERFORMANCE: when called WITH a relative_path, this uses a lightweight per-file parser " +
-        "and does NOT require Roslyn (works during warmup). When called WITHOUT relative_path " +
-        "(solution-wide search) it requires Roslyn and may return a warming status while loading. " +
+        "PERFORMANCE: cache-first. With a relative_path, a cached file is searched without Roslyn; " +
+        "a true cache miss starts the language server to request document symbols. Without relative_path, " +
+        "a populated project cache can answer the search; otherwise Roslyn is required. " +
         "On large solutions (>50 projects): call warm_language_server right after set_active_solution " +
-        "to start warmup, prefer search_for_pattern for initial exploration, and call " +
+        "to start warmup, continue using cached symbol queries for declarations, use search_for_pattern only for arbitrary text, and call " +
         "get_language_server_status to check readiness before solution-wide symbol queries.";
 
     protected override IReadOnlyList<ToolParameter> ExtractParameters() =>
@@ -303,9 +303,10 @@ public sealed class GetSymbolsOverviewTool : ToolBase
 
     public override string Description =>
         "Get a high-level understanding of the code symbols in a file. " +
-        "PERFORMANCE: file-scoped (uses the lightweight per-file parser, does NOT require Roslyn). " +
-        "Safe to call during warmup. Prefer this + search_for_pattern over solution-wide symbol " +
-        "queries while warm_language_server / get_language_server_status report Loading.";
+        "PERFORMANCE: file-scoped and cache-first. A cached file does not require Roslyn; " +
+        "a true cache miss starts the language server to request document symbols. " +
+        "During warmup, cached results remain available. For uncached semantic work, wait until " +
+        "get_language_server_status reports Ready or Partial; inspect Partial warnings before trusting negative results.";
 
     protected override IReadOnlyList<ToolParameter> ExtractParameters() =>
     [
@@ -362,9 +363,8 @@ public sealed class GetSymbolsOverviewTool : ToolBase
         }
 
         // Cache-first fast path is built into RequireReadOnlyRetrieverAsync:
-        // the retriever consults the symbol cache before starting the LSP,
-        // so `GetSymbolOverviewAsync` below is instant on cached files and
-        // only falls through to Roslyn on a genuine cache miss.
+        // the retriever consults the symbol cache before starting the LSP.
+        // A genuine cache miss falls through to Roslyn for document symbols.
         if (!File.Exists(absPath))
         {
             return $"File not found: {relativePath}";
@@ -451,9 +451,9 @@ public sealed class FindReferencingSymbolsTool : ToolBase
     public override string Description =>
         "Finds references to the symbol at the given name_path. " +
         "PERFORMANCE: ALWAYS requires Roslyn — there is no file-scoped fallback. Will return a " +
-        "warming status until get_language_server_status reports Ready. On large solutions: " +
-        "call warm_language_server right after set_active_solution; use search_for_pattern for " +
-        "call-site discovery while waiting; only call this once Ready. Do not retry immediately " +
+        "warming status until get_language_server_status reports Ready or Partial. On large solutions: " +
+        "call warm_language_server right after set_active_solution; use cached symbol tools or targeted text search for " +
+        "initial discovery while waiting. Do not retry immediately " +
         "on a warming response — poll get_language_server_status first.";
 
     protected override IReadOnlyList<ToolParameter> ExtractParameters() =>
@@ -508,7 +508,8 @@ public sealed class FindReferencingSymbolsTool : ToolBase
                 retriever, references, includeKinds, excludeKinds, Logger, ct);
         }
 
-        if (references.Count == 0)
+        var workspaceState = Context.Agent.GetLanguageServerReadyState(Language.CSharp);
+        if (references.Count == 0 && workspaceState.State != WorkspaceReadyState.Partial)
         {
             return $"No references found for '{namePath}'";
         }
@@ -522,8 +523,26 @@ public sealed class FindReferencingSymbolsTool : ToolBase
             ["containing_symbol"] = r.ContainingSymbolName,
         }).ToList();
 
-        string result = ToolResultFormatter.FormatReferences(refDicts, maxChars: -1);
-        return LimitLength(result, maxAnswerChars,
+        if (workspaceState.State == WorkspaceReadyState.Partial)
+        {
+            string result = FormatPartialReferences(workspaceState.Warnings, refDicts, refDicts.Count);
+            return LimitLength(result, maxAnswerChars,
+                () => FormatPartialReferences(
+                    workspaceState.Warnings,
+                    StripReferenceSnippets(refDicts),
+                    refDicts.Count),
+                () => FormatPartialReferences(
+                    workspaceState.Warnings,
+                    BuildReferenceFileCounts(refDicts),
+                    refDicts.Count),
+                () => FormatPartialReferences(
+                    workspaceState.Warnings,
+                    referencePayload: null,
+                    totalReferences: refDicts.Count));
+        }
+
+        string readyResult = ToolResultFormatter.FormatReferences(refDicts, maxChars: -1);
+        return LimitLength(readyResult, maxAnswerChars,
             () => FormatReferencesWithoutSnippets(refDicts),
             () => FormatReferenceFileCounts(refDicts),
             () => $"Total references: {refDicts.Count}");
@@ -536,20 +555,58 @@ public sealed class FindReferencingSymbolsTool : ToolBase
 
     private static string FormatReferencesWithoutSnippets(List<Dictionary<string, object?>> refDicts)
     {
-        var stripped = refDicts.Select(d => d
+        return System.Text.Json.JsonSerializer.Serialize(StripReferenceSnippets(refDicts));
+    }
+
+    private static List<Dictionary<string, object?>> StripReferenceSnippets(
+        List<Dictionary<string, object?>> refDicts) =>
+        refDicts.Select(d => d
             .Where(kvp => kvp.Key != "context_snippet")
             .ToDictionary(kvp => kvp.Key, kvp => kvp.Value))
-            .ToList();
-        return System.Text.Json.JsonSerializer.Serialize(stripped);
-    }
+        .ToList();
 
     private static string FormatReferenceFileCounts(List<Dictionary<string, object?>> refDicts)
     {
-        var groups = refDicts
-            .GroupBy(d => d.TryGetValue("relative_path", out var p) ? p?.ToString() ?? "?" : "?")
-            .Select(g => $"{g.Key}: {g.Count()} refs");
+        var groups = BuildReferenceFileCounts(refDicts)
+            .Select(kvp => $"{kvp.Key}: {kvp.Value} refs");
         return string.Join(", ", groups);
     }
+
+    private static Dictionary<string, int> BuildReferenceFileCounts(
+        List<Dictionary<string, object?>> refDicts) =>
+        refDicts
+            .GroupBy(d => d.TryGetValue("relative_path", out var p) ? p?.ToString() ?? "?" : "?")
+            .ToDictionary(g => g.Key, g => g.Count());
+
+    private static string FormatPartialReferences(
+        IReadOnlyList<string>? warnings,
+        object? referencePayload,
+        int totalReferences)
+    {
+        var result = new Dictionary<string, object?>
+        {
+            ["workspace_state"] = "Partial",
+            ["completeness"] = "not_guaranteed",
+            ["workspace_warning_count"] = warnings?.Count ?? 0,
+            ["workspace_warning_samples"] = SummarizeWorkspaceWarnings(warnings),
+            ["status_hint"] = "Call get_language_server_status for the complete bounded warning list.",
+            ["total_references"] = totalReferences,
+        };
+        if (referencePayload is not null)
+        {
+            result[referencePayload is Dictionary<string, int>
+                ? "reference_file_counts"
+                : "references"] = referencePayload;
+        }
+        return System.Text.Json.JsonSerializer.Serialize(result);
+    }
+
+    internal static IReadOnlyList<string> SummarizeWorkspaceWarnings(
+        IReadOnlyList<string>? warnings) =>
+        warnings?.Take(3)
+            .Select(warning => warning.Length <= 240 ? warning : warning[..240] + "…")
+            .ToList()
+        ?? [];
 
     /// <summary>
     /// Resolves the containing symbol kind for each reference and filters by kind.

@@ -100,6 +100,38 @@ public sealed class SymbolCacheRefresherTests : IDisposable
     }
 
     [Fact]
+    public async Task RefreshFileAsync_ReindexesKnownFile_WithoutWaitingForStaleScan()
+    {
+        var cache = NewCache();
+        string path = WriteFile("known.cs", "class Known {}");
+        cache.Set(path, CacheFingerprint.ForFile(path), []);
+
+        string? reindexedPath = null;
+        var refresher = new SymbolCacheRefresher(_tempDir, cache,
+            (p, _) => { reindexedPath = p; return Task.FromResult(true); },
+            NullLogger.Instance);
+
+        bool result = await refresher.RefreshFileAsync(path, CancellationToken.None);
+
+        Assert.True(result);
+        Assert.Equal(path, reindexedPath);
+    }
+
+    [Fact]
+    public async Task RefreshFileAsync_ReturnsFalse_WhenReindexerThrows()
+    {
+        var cache = NewCache();
+        string path = WriteFile("throws.cs", "class Throws {}");
+        var refresher = new SymbolCacheRefresher(_tempDir, cache,
+            (_, _) => throw new InvalidOperationException("boom"),
+            NullLogger.Instance);
+
+        bool result = await refresher.RefreshFileAsync(path, CancellationToken.None);
+
+        Assert.False(result);
+    }
+
+    [Fact]
     public async Task ScopeAbsPath_LimitsReindexToMatchingFiles()
     {
         var cache = NewCache();
