@@ -12,6 +12,7 @@
 
 using System.CommandLine;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging.Abstractions;
 using Serena.Lsp.Caching;
 using Serena.Lsp.Client;
@@ -21,7 +22,7 @@ namespace Serena.Cli;
 internal static class SymbolsCommand
 {
     /// <summary>Must match LanguageServerManager.SymbolCacheVersion or the cache reads as stale.</summary>
-    private const int SymbolCacheVersion = 1;
+    private const int SymbolCacheVersion = 2;
 
     private const string CacheFilename = "symbols.json";
 
@@ -212,6 +213,20 @@ internal static class SymbolsCommand
             {
                 var cache = OpenCache(root, language);
                 var symbols = cache?.TryGetUnchecked(file);
+
+                // A prebuilt index shipped in a relocatable bundle stores paths from the
+                // machine that built it, so an exact match on the local path misses. Retry
+                // with the path translated into the stored form before giving up, otherwise
+                // a file that is indexed reports as absent.
+                if (symbols is null && cache is not null)
+                {
+                    string? stored = ToStoredPath(root, cache, file);
+                    if (stored is not null)
+                    {
+                        symbols = cache.TryGetUnchecked(stored);
+                    }
+                }
+
                 if (symbols is null)
                 {
                     continue;
@@ -230,7 +245,9 @@ internal static class SymbolsCommand
             }
 
             Console.Error.WriteLine($"'{file}' is not in the symbol index.");
-            Console.Error.WriteLine("Index it with: serena project index <path>");
+            Console.Error.WriteLine(
+                "Check the path, and confirm the index covers it with: " +
+                "serena-dotnet symbols files \"*<filename>*\" --project <root>");
             return 1;
         });
 
@@ -282,7 +299,7 @@ internal static class SymbolsCommand
 
                 foreach (string key in cache.Keys)
                 {
-                    if (pattern is null || key.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+                    if (MatchesFilePattern(key, pattern))
                     {
                         paths.Add(Relative(root, key));
                     }
@@ -517,11 +534,64 @@ internal static class SymbolsCommand
             : uri;
     }
 
+    /// <summary>
+    /// Matches an indexed path against a caller-supplied pattern. A pattern containing
+    /// <c>*</c> or <c>?</c> is treated as a glob over the whole path, which is what the
+    /// argument name implies; anything else is a plain substring. Without the glob case a
+    /// natural pattern like <c>*Thumbnail*.cs</c> silently matches nothing, which reads
+    /// exactly like "the index does not contain it".
+    /// </summary>
+    private static bool MatchesFilePattern(string key, string? pattern)
+    {
+        if (string.IsNullOrEmpty(pattern))
+        {
+            return true;
+        }
+
+        if (pattern.IndexOf('*') < 0 && pattern.IndexOf('?') < 0)
+        {
+            return key.Contains(pattern, StringComparison.OrdinalIgnoreCase);
+        }
+
+        string regex = "^" + Regex.Escape(pattern.Replace(BackSlash, ForwardSlash))
+            .Replace(@"\*", ".*")
+            .Replace(@"\?", ".") + "$";
+
+        return Regex.IsMatch(key.Replace(BackSlash, ForwardSlash), regex,
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    }
+
+    /// <summary>
+    /// Renders a stored path relative to <paramref name="root"/>.
+    /// </summary>
+    /// <remarks>
+    /// The index stores absolute paths from the machine that built it, so a prebuilt index
+    /// shipped inside a relocatable bundle will hold paths that do not exist here. When the
+    /// stored path is not under <paramref name="root"/>, recover the repository-relative
+    /// part instead of printing a path the caller cannot open.
+    /// </remarks>
     private static string Relative(string root, string path)
     {
         if (string.IsNullOrEmpty(path))
         {
             return path;
+        }
+
+        // Normalise separators first. An index built on Windows stores backslash-separated,
+        // drive-qualified paths, and on Unix a backslash is an ordinary filename character,
+        // so nothing downstream would ever split them.
+        string normalized = path.Replace(BackSlash, ForwardSlash);
+
+        // Strip the root the index was built at before trying GetRelativePath. Order
+        // matters on Unix: "C:/x/y" has no leading slash, so it is a *relative* path there,
+        // and GetRelativePath resolves it against the current directory and returns
+        // something that looks relative but resolves nowhere.
+        string? buildRoot = BuildRootFor(root, normalized);
+        if (buildRoot is not null
+            && normalized.StartsWith(buildRoot + ForwardSlash, StringComparison.OrdinalIgnoreCase))
+        {
+            return normalized[(buildRoot.Length + 1)..]
+                .Replace(ForwardSlash, Path.DirectorySeparatorChar);
         }
 
         try
@@ -533,6 +603,91 @@ internal static class SymbolsCommand
         {
             return path;
         }
+    }
+
+    // How many stored paths to sample when deriving the build root. One is
+    // usually enough; more tolerates an install missing some directories.
+    private const int BuildRootSamples = 64;
+    private const char BackSlash = '\\';
+    private const char ForwardSlash = '/';
+
+    // Deriving the build root costs a directory probe per path segment, so remember it.
+    // One index has one build root, and the CLI is a single short-lived process.
+    private static string? _buildRootFor;
+    private static string? _buildRoot;
+
+    /// <summary>
+    /// The root the index was built at, recovered from the data rather than assumed: the
+    /// first segment of a stored path that names a directory under <paramref name="root"/>
+    /// marks the boundary, and everything before it is the build root. Null when it cannot
+    /// be established, in which case callers should leave paths untouched.
+    /// </summary>
+    private static string? BuildRootFor(string root, string normalizedStoredPath)
+    {
+        if (string.Equals(_buildRootFor, root, StringComparison.OrdinalIgnoreCase)
+            && _buildRoot is not null)
+        {
+            return _buildRoot;
+        }
+
+        string[] segments = normalizedStoredPath.Split(ForwardSlash);
+        for (int i = 1; i < segments.Length - 1; i++)
+        {
+            // Skip empties and anything drive-qualified: Path.Combine treats "C:" as
+            // rooted and returns it verbatim, so probing it would spuriously succeed and
+            // yield an empty prefix.
+            if (segments[i].Length == 0 || segments[i].Contains(':'))
+            {
+                continue;
+            }
+
+            if (Directory.Exists(Path.Combine(root, segments[i])))
+            {
+                string candidate = string.Join(ForwardSlash, segments.Take(i));
+                if (candidate.Length > 0)
+                {
+                    _buildRootFor = root;
+                    _buildRoot = candidate;
+                }
+
+                break;
+            }
+        }
+
+        return _buildRoot;
+    }
+
+    /// <summary>
+    /// Translates a path on this machine into the form the index stored it under, so a
+    /// prebuilt index can be queried by path after the bundle has been relocated.
+    /// </summary>
+    private static string? ToStoredPath(
+        string root,
+        SymbolCache<UnifiedSymbolInformation[]> cache,
+        string localFullPath)
+    {
+        string? buildRoot = null;
+        foreach (string key in cache.Keys.Take(BuildRootSamples))
+        {
+            buildRoot = BuildRootFor(root, key.Replace(BackSlash, ForwardSlash));
+            if (buildRoot is not null)
+            {
+                break;
+            }
+        }
+
+        if (buildRoot is null)
+        {
+            return null;
+        }
+
+        string relative = Path.GetRelativePath(root, localFullPath);
+        if (relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative))
+        {
+            return null;
+        }
+
+        return buildRoot + ForwardSlash + relative.Replace(BackSlash, ForwardSlash);
     }
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };

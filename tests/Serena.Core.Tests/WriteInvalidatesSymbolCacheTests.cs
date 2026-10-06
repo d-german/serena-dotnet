@@ -242,7 +242,7 @@ public sealed class WriteInvalidatesSymbolCacheTests : IDisposable
         var cache = new SymbolCache<UnifiedSymbolInformation[]>(
             cacheDir,
             "symbols.json",
-            1,
+            Serena.Core.Project.LanguageServerManager.SymbolCacheVersion,
             NullLogger.Instance);
         cache.Load();
 

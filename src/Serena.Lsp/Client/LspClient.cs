@@ -41,6 +41,7 @@ public sealed class LspClient : IAsyncDisposable
         new(StringComparer.Ordinal);
     private int _omittedWorkspaceWarningCount;
     private long _lastActivityTicks = Stopwatch.GetTimestamp();
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _documentLocks = new(StringComparer.OrdinalIgnoreCase);
     private int _crossFileRefsReady; // 0 = not ready, 1 = ready; use Interlocked for thread safety
 
     public Language Language => _language;
@@ -288,10 +289,12 @@ public sealed class LspClient : IAsyncDisposable
 
         if (!buffer.IsOpenInLs)
         {
+            string text = buffer.Contents;
             await _notifications.DidOpenTextDocumentAsync(new DidOpenTextDocumentParams
             {
-                TextDocument = new TextDocumentItem(uri, languageId, 0, buffer.Contents),
+                TextDocument = new TextDocumentItem(uri, languageId, 0, text),
             });
+            buffer.ServerText = text;
             buffer.MarkOpenInLs();
         }
 
@@ -326,14 +329,84 @@ public sealed class LspClient : IAsyncDisposable
             return;
         }
 
+        // The server's copy, not Contents: a tool that wrote the file before notifying would
+        // make Contents re-read the new text from disk and the range below describe it.
+        string previous = buffer.ServerText ?? buffer.Contents;
         buffer.Contents = newContent;
         int version = buffer.IncrementVersion();
 
+        // Replace the whole previous text through a range rather than sending a range-less
+        // full replacement: Roslyn advertises incremental sync and dereferences the range of
+        // every change, so a change without one throws and the server exits.
         await _notifications.DidChangeTextDocumentAsync(new DidChangeTextDocumentParams
         {
             TextDocument = new VersionedTextDocumentIdentifier(uri, version ),
-            ContentChanges = [new TextDocumentContentChangeEvent { Text = newContent }],
+            ContentChanges =
+            [
+                new TextDocumentContentChangeEvent
+                {
+                    Range = new Protocol.Types.Range(Position.Zero, EndPosition(previous, _language)),
+                    Text = newContent,
+                },
+            ],
         });
+        buffer.ServerText = newContent;
+    }
+
+    /// <summary>
+    /// The position just past the last character of <paramref name="text"/>, counted the
+    /// way the server counts lines: <c>\r\n</c>, <c>\n</c> and <c>\r</c>, plus U+2028 and
+    /// U+2029, which both Roslyn and TypeScript treat as line breaks, plus U+0085 for C#.
+    /// Characters are UTF-16 code units. A position short of the real end would leave the
+    /// old text's tail in the server's copy.
+    /// </summary>
+    private const char LineSeparator = (char)0x2028;
+    private const char ParagraphSeparator = (char)0x2029;
+    private const char NextLine = (char)0x0085;
+
+    internal static Position EndPosition(string text, Language language)
+    {
+        int line = 0;
+        int lineStart = 0;
+        for (int i = 0; i < text.Length; i++)
+        {
+            char c = text[i];
+            if (c == '\r' && i + 1 < text.Length && text[i + 1] == '\n')
+            {
+                i++;
+            }
+            if (c is '\n' or '\r' or LineSeparator or ParagraphSeparator || (c == NextLine && language == Language.CSharp))
+            {
+                line++;
+                lineStart = i + 1;
+            }
+        }
+        return new Position(line, text.Length - lineStart);
+    }
+
+    /// <summary>
+    /// Serializes multi-step exchanges on one open document, such as a temporary edit and
+    /// its restore, so concurrent callers can neither observe nor interleave each other's
+    /// steps. Dispose the result to release the document.
+    /// </summary>
+    internal async Task<IDisposable> LockDocumentAsync(string absolutePath, CancellationToken ct)
+    {
+        var gate = _documentLocks.GetOrAdd(PathToUri(absolutePath), _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct).ConfigureAwait(false);
+        return new DocumentLock(gate);
+    }
+
+    private sealed class DocumentLock(SemaphoreSlim gate) : IDisposable
+    {
+        private int _released;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _released, 1) == 0)
+            {
+                gate.Release();
+            }
+        }
     }
 
     /// <summary>
@@ -543,14 +616,22 @@ public sealed class LspClient : IAsyncDisposable
 
     /// <summary>
     /// Force-kills the language server process tree without waiting for LSP shutdown.
-    /// Use when the server is hung or burning CPU and a graceful stop would block.
+    /// Use when the server is hung or burning CPU and a graceful stop would block, or with
+    /// <paramref name="expected"/> for a planned restart that should not log as a failure.
     /// </summary>
-    public void ForceKill()
+    public void ForceKill(bool expected = false)
     {
-        _logger.LogWarning("Force-killing language server [{Language}]", _language);
+        if (expected)
+        {
+            _logger.LogDebug("Killing language server [{Language}] for a planned restart", _language);
+        }
+        else
+        {
+            _logger.LogWarning("Force-killing language server [{Language}]", _language);
+        }
         _serverStarted = false;
         _fileBuffers.Clear();
-        _process.ForceStop();
+        _process.ForceStop(expected);
     }
 
     // --- Utility Methods ---

@@ -10,7 +10,7 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>serena-dotnet</ToolCommandName>
     <PackageId>Serena.DotNet</PackageId>
-    <Version>0.2.1</Version>
+    <Version>0.4.0</Version>
     <Authors>dgerman</Authors>
     <PackageDescription>A .NET-first MCP coding agent inspired by oraios/serena. Ships as a .NET global tool with 38 tools for navigating, understanding, and editing code. Features an indexed SQLite symbol cache, solution-scoped indexing for large repositories, lazy language-server startup, explicit Roslyn readiness/completeness telemetry, outline-first responses, and 13 language-server backends.</PackageDescription>
     <PackageTags>mcp;coding-agent;lsp;roslyn;csharp;ai-tools;serena;dotnet-tool</PackageTags>
@@ -40,7 +40,7 @@
   <ItemGroup>
     <PackageReference Include="System.CommandLine" Version="2.*" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0-preview.*" />
-    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="10.0.401" PrivateAssets="All" />
   </ItemGroup>
 
 </Project>

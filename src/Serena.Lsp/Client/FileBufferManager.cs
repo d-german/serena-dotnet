@@ -78,6 +78,13 @@ public sealed class LspFileBuffer
     }
 
     /// <summary>
+    /// The text the language server currently holds for this document: what was sent with
+    /// didOpen, then with each didChange. Unlike <see cref="Contents"/> it never re-reads
+    /// the disk, so it stays right when a tool writes the file before notifying the server.
+    /// </summary>
+    public string? ServerText { get; internal set; }
+
+    /// <summary>
     /// MD5 hash of the current contents.
     /// </summary>
     public string ContentHash

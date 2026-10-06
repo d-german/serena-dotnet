@@ -485,7 +485,7 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
         // stops the LSP request and frees CPU. StreamJsonRpc will send
         // $/cancelRequest to Roslyn when the token fires.
         var symbols = await WithLspTimeoutAsync(
-            innerCt => lsp.RequestDocumentSymbolsAsync(absolutePath, innerCt),
+            innerCt => FrameworkConditionalSymbols.RequestAsync(lsp, absolutePath, innerCt),
             ct);
 
         // Populate cache

@@ -43,6 +43,30 @@ public sealed record IndexFailure(string FilePath, string Error);
 /// </summary>
 public sealed class ProjectIndexer
 {
+    /// <summary>
+    /// Files requested concurrently when the caller does not choose. Half the logical
+    /// CPUs leaves room for the language server's own work; past eight, a single
+    /// language server stops getting faster and only uses more memory.
+    /// </summary>
+    public static int DefaultParallelism => Math.Clamp(Environment.ProcessorCount / 2, 1, 8);
+
+    /// <summary>
+    /// Completed files between cache checkpoints. Without checkpoints a multi-hour
+    /// index lives only in memory until the language server stops, so a crash near the
+    /// end loses everything; with them a rerun resumes from the last checkpoint.
+    /// </summary>
+    internal const int CheckpointInterval = 1000;
+
+    /// <summary>
+    /// Files per language-server session when the caller does not choose, applied only
+    /// while the server has no workspace loaded. Roslyn treats files outside a loaded
+    /// workspace as miscellaneous documents and gets slower with every one it has seen,
+    /// so a 57,000-file index degrades quadratically; a restart costs one to two
+    /// seconds and resets the per-file cost. With a loaded workspace a restart would
+    /// reload it, and the slowdown does not occur, so the default leaves it alone.
+    /// </summary>
+    public const int AutoRestartInterval = 2000;
+
     private readonly LanguageServerRegistry _registry;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<ProjectIndexer> _logger;
@@ -65,9 +89,17 @@ public sealed class ProjectIndexer
         Action<string>? onStatus = null,
         TimeSpan? perFileTimeout = null,
         IReadOnlyList<string>? solutionPaths = null,
+        int? maxParallelism = null,
+        int? restartEvery = null,
         CancellationToken ct = default)
     {
         var timeout = perFileTimeout ?? TimeSpan.FromSeconds(10);
+        int parallelism = Math.Max(1, maxParallelism ?? DefaultParallelism);
+        int restartInterval = Math.Max(0, restartEvery ?? AutoRestartInterval);
+        bool restartOnlyWithoutWorkspace = restartEvery is null;
+        // Once the probe has timed out, later sessions of the same server will not do
+        // better; waiting the full timeout after every restart would only add up.
+        bool parseOptionsProbeFailed = false;
         var project = CreateProject(projectRoot);
         var lsManager = new LanguageServerManager(projectRoot, _registry, _loggerFactory);
 
@@ -135,15 +167,50 @@ public sealed class ProjectIndexer
                     continue;
                 }
                 onStatus?.Invoke(
-                    $"Indexing {filesToIndex.Count} {language.ToIdentifier()} files" +
+                    $"Indexing {filesToIndex.Count} {language.ToIdentifier()} files, {parallelism} at a time" +
                     (cachedFiles.Count > 0 ? $" ({cachedFiles.Count} reused from cache)…" : "…"));
 
-                cache = lsManager.GetSymbolCache(language);
+                var batches = restartInterval > 0
+                    ? filesToIndex.Chunk(restartInterval).Select(b => b.ToList()).ToList()
+                    : [filesToIndex];
+                for (int b = 0; b < batches.Count; b++)
+                {
+                    // Also restart a server that died during the previous batch, so one crash
+                    // costs that batch rather than every file after it.
+                    bool restart = b > 0 && (!client.IsRunning
+                        || !restartOnlyWithoutWorkspace
+                        || lsManager.IsRepositoryTooLargeToLoad(language));
+                    if (restart)
+                    {
+                        onStatus?.Invoke(
+                            $"Restarting {language.ToIdentifier()} language server after {b * restartInterval} files…");
+                        await lsManager.RecycleAsync(language, ct);
+                        client = await StartLanguageServerSafe(lsManager, language, solutionPaths);
+                        if (client is null)
+                        {
+                            foreach (string file in batches.Skip(b).SelectMany(x => x))
+                            {
+                                fileIndex++;
+                                failures.Add(new IndexFailure(file, $"Failed to restart {language} language server"));
+                                onProgress?.Invoke(new IndexProgress(
+                                    fileIndex, totalMapped, file, language, false,
+                                    $"Failed to restart {language} language server"));
+                            }
+                            break;
+                        }
+                    }
 
-                fileIndex = await IndexLanguageFilesAsync(
-                    client, filesToIndex, projectRoot, timeout, cache,
-                    filesPerLanguage, language, failures,
-                    fileIndex, totalMapped, onProgress, ct);
+                    if (language == Language.CSharp && (b == 0 || restart) && !parseOptionsProbeFailed)
+                    {
+                        parseOptionsProbeFailed = !await WaitForCSharpParseOptionsAsync(client, onStatus, ct);
+                    }
+
+                    cache = lsManager.GetSymbolCache(language);
+                    fileIndex = await IndexLanguageFilesAsync(
+                        client, batches[b], projectRoot, timeout, parallelism, cache,
+                        filesPerLanguage, language, failures,
+                        fileIndex, totalMapped, onProgress, onStatus, ct);
+                }
             }
 
             return new IndexResult(filesPerLanguage, failures, sourceFiles.Count, skipped);
@@ -154,36 +221,108 @@ public sealed class ProjectIndexer
         }
     }
 
+    /// <summary>
+    /// Holds indexing until Roslyn parses loose files with its build symbols, so outlines
+    /// do not depend on how soon after a (re)start a file happened to be requested.
+    /// </summary>
+    private static async Task<bool> WaitForCSharpParseOptionsAsync(
+        LspClient client, Action<string>? onStatus, CancellationToken ct)
+    {
+        if (await CSharpParseOptionsProbe.WaitUntilAppliedAsync(client, TimeSpan.FromSeconds(30), ct))
+        {
+            return true;
+        }
+        onStatus?.Invoke(
+            "Warning: Roslyn did not define DEBUG for a probe file within 30s; " +
+            "#if blocks may be missing from C# outlines. Not probing again this run.");
+        return false;
+    }
+
+    /// <summary>
+    /// Requests symbols for <paramref name="files"/>, <paramref name="parallelism"/> at a
+    /// time. Language servers answer concurrent requests, and requesting one file at a
+    /// time leaves all but one core idle on large repositories. Files that time out are
+    /// retried one at a time with a longer timeout once the parallel pass has finished,
+    /// since a timeout under load is usually contention rather than a broken file.
+    /// </summary>
     private static async Task<int> IndexLanguageFilesAsync(
         LspClient client, List<string> files, string projectRoot, TimeSpan timeout,
-        SymbolCache<UnifiedSymbolInformation[]>? cache,
+        int parallelism, SymbolCache<UnifiedSymbolInformation[]>? cache,
         Dictionary<Language, int> filesPerLanguage, Language language,
         List<IndexFailure> failures, int fileIndex, int totalMapped,
-        Action<IndexProgress>? onProgress, CancellationToken ct)
+        Action<IndexProgress>? onProgress, Action<string>? onStatus, CancellationToken ct)
     {
-        foreach (string file in files)
+        var gate = new object();
+        var timedOut = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        int sinceCheckpoint = 0;
+
+        void Report(string file, FileIndexOutcome outcome)
         {
-            ct.ThrowIfCancellationRequested();
-            fileIndex++;
-            string absolutePath = Path.Combine(projectRoot, file);
-
-            var result = await IndexSingleFileSafe(client, absolutePath, timeout, cache);
-            bool success = result.IsSuccess;
-
-            if (success)
+            lock (gate)
             {
-                filesPerLanguage[language]++;
-            }
-            else
-            {
-                failures.Add(new IndexFailure(file, result.Error));
+                fileIndex++;
+                if (outcome.Success)
+                {
+                    filesPerLanguage[language]++;
+                }
+                else
+                {
+                    failures.Add(new IndexFailure(file, outcome.Error!));
+                }
+                onProgress?.Invoke(new IndexProgress(
+                    fileIndex, totalMapped, file, language, outcome.Success, outcome.Error));
             }
 
-            onProgress?.Invoke(new IndexProgress(
-                fileIndex, totalMapped, file, language, success,
-                success ? null : result.Error));
+            if (outcome.Success && cache is not null
+                && Interlocked.Increment(ref sinceCheckpoint) >= CheckpointInterval)
+            {
+                Interlocked.Exchange(ref sinceCheckpoint, 0);
+                cache.Save();
+            }
         }
 
+        await Parallel.ForEachAsync(
+            files,
+            new ParallelOptions { MaxDegreeOfParallelism = parallelism, CancellationToken = ct },
+            async (file, token) =>
+            {
+                var outcome = await IndexSingleFileSafe(
+                    client, Path.Combine(projectRoot, file), timeout, cache, token);
+                if (outcome.TimedOut)
+                {
+                    timedOut.Enqueue(file);
+                    return;
+                }
+                Report(file, outcome);
+            }).ConfigureAwait(false);
+
+        if (!timedOut.IsEmpty)
+        {
+            var retryTimeout = timeout * 3;
+            onStatus?.Invoke(
+                $"Retrying {timedOut.Count} {language.ToIdentifier()} file(s) that timed out, " +
+                $"one at a time with a {retryTimeout.TotalSeconds:0}s timeout…");
+            // Retries that keep timing out mean the server is unresponsive, not that these
+            // files are slow; waiting out every remaining retry could take hours.
+            const int MaxConsecutiveRetryTimeouts = 3;
+            int consecutiveTimeouts = 0;
+            foreach (string file in timedOut.Order(StringComparer.OrdinalIgnoreCase))
+            {
+                ct.ThrowIfCancellationRequested();
+                if (consecutiveTimeouts >= MaxConsecutiveRetryTimeouts)
+                {
+                    Report(file, FileIndexOutcome.Failed(
+                        $"Not retried: {MaxConsecutiveRetryTimeouts} consecutive retries timed out"));
+                    continue;
+                }
+                var outcome = await IndexSingleFileSafe(
+                    client, Path.Combine(projectRoot, file), retryTimeout, cache, ct);
+                consecutiveTimeouts = outcome.TimedOut ? consecutiveTimeouts + 1 : 0;
+                Report(file, outcome);
+            }
+        }
+
+        cache?.Save();
         return fileIndex;
     }
 
@@ -225,7 +364,7 @@ public sealed class ProjectIndexer
             await client.OpenFileAsync(absolutePath);
             try
             {
-                var symbols = await client.RequestDocumentSymbolsAsync(absolutePath, ct);
+                var symbols = await FrameworkConditionalSymbols.RequestAsync(client, absolutePath, ct);
                 if (cache is not null && fingerprint.Length > 0)
                 {
                     cache.Set(absolutePath, fingerprint, symbols.ToArray());
@@ -501,27 +640,25 @@ public sealed class ProjectIndexer
         }
     }
 
-    private static async Task<Result> IndexSingleFileSafe(
+    /// <summary>
+    /// Requests and caches symbols for one file. The caller has already excluded files
+    /// whose cached fingerprint is current (see <see cref="PartitionFilesByCache"/>), so
+    /// there is no per-file cache lookup here: once the cache has a database, that lookup
+    /// is a SQLite query under the cache's lock, which serializes parallel workers.
+    /// </summary>
+    private static async Task<FileIndexOutcome> IndexSingleFileSafe(
         LspClient client, string absolutePath, TimeSpan timeout,
-        SymbolCache<UnifiedSymbolInformation[]>? cache = null)
+        SymbolCache<UnifiedSymbolInformation[]>? cache, CancellationToken ct)
     {
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(timeout);
         try
         {
             var fingerprint = CacheFingerprint.ForFile(absolutePath);
-            if (cache is not null && fingerprint.Length > 0)
-            {
-                var cached = cache.TryGet(absolutePath, fingerprint);
-                if (cached is not null)
-                {
-                    return Result.Success();
-                }
-            }
-
-            using var cts = new CancellationTokenSource(timeout);
             await client.OpenFileAsync(absolutePath);
             try
             {
-                var symbols = await client.RequestDocumentSymbolsAsync(absolutePath, cts.Token);
+                var symbols = await FrameworkConditionalSymbols.RequestAsync(client, absolutePath, timeoutCts.Token);
                 if (cache is not null && fingerprint.Length > 0)
                 {
                     cache.Set(absolutePath, fingerprint, symbols.ToArray());
@@ -531,15 +668,25 @@ public sealed class ProjectIndexer
             {
                 await client.CloseFileAsync(absolutePath);
             }
-            return Result.Success();
+            return FileIndexOutcome.Indexed;
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
-            return Result.Failure($"Timed out after {timeout.TotalSeconds}s");
+            return FileIndexOutcome.TimeOut(timeout);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            return Result.Failure(ex.Message);
+            return FileIndexOutcome.Failed(ex.Message);
         }
+    }
+
+    private readonly record struct FileIndexOutcome(bool Success, bool TimedOut, string? Error)
+    {
+        public static FileIndexOutcome Indexed => new(true, false, null);
+
+        public static FileIndexOutcome TimeOut(TimeSpan timeout) =>
+            new(false, true, $"Timed out after {timeout.TotalSeconds:0.#}s");
+
+        public static FileIndexOutcome Failed(string error) => new(false, false, error);
     }
 }

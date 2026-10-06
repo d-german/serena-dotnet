@@ -455,6 +455,21 @@ public static class Program
             Description = "Limit indexing to the C# projects in this .sln/.slnx while keeping the cache at the repository root"
         };
 
+        var parallelismOption = new Option<int>("--parallelism")
+        {
+            Description = "Files to request from the language server at once " +
+                $"(default: half the logical CPUs, at most 8; {ProjectIndexer.DefaultParallelism} on this machine)",
+            DefaultValueFactory = _ => ProjectIndexer.DefaultParallelism
+        };
+
+        var restartEveryOption = new Option<int?>("--restart-every")
+        {
+            Description = "Restart each language server after this many files; 0 never restarts. " +
+                $"Default: every {ProjectIndexer.AutoRestartInterval} files, only while the server has no " +
+                "workspace loaded (large repositories without a solution scope), where Roslyn otherwise " +
+                "slows down with every file"
+        };
+
         var command = new Command("index")
         {
             Description = "Index a project by requesting symbols for all source files"
@@ -463,6 +478,8 @@ public static class Program
         command.Add(logLevelOption);
         command.Add(timeoutOption);
         command.Add(solutionOption);
+        command.Add(parallelismOption);
+        command.Add(restartEveryOption);
 
         command.SetAction(async (ParseResult parseResult, CancellationToken ct) =>
         {
@@ -471,11 +488,25 @@ public static class Program
             string logLevel = parseResult.GetValue(logLevelOption) ?? "Warning";
             double timeout = parseResult.GetValue(timeoutOption);
             string? rawSolution = parseResult.GetValue(solutionOption);
+            int parallelism = parseResult.GetValue(parallelismOption);
+            int? restartEvery = parseResult.GetValue(restartEveryOption);
 
             if (!Directory.Exists(projectRoot))
             {
                 Console.Error.WriteLine($"Error: Directory not found: {projectRoot}");
-                return;
+                return 1;
+            }
+
+            if (parallelism < 1)
+            {
+                Console.Error.WriteLine("Error: --parallelism must be 1 or more");
+                return 1;
+            }
+
+            if (restartEvery < 0)
+            {
+                Console.Error.WriteLine("Error: --restart-every must be 0 or more");
+                return 1;
             }
 
             IReadOnlyList<string>? solutionPaths = null;
@@ -488,7 +519,7 @@ public static class Program
                 if (!File.Exists(solutionPath))
                 {
                     Console.Error.WriteLine($"Error: Solution not found: {solutionPath}");
-                    return;
+                    return 1;
                 }
                 solutionPaths = [solutionPath];
 
@@ -521,12 +552,15 @@ public static class Program
                 onStatus: status => { Console.WriteLine($"  {status}"); Console.Out.Flush(); },
                 perFileTimeout: TimeSpan.FromSeconds(timeout),
                 solutionPaths: solutionPaths,
+                maxParallelism: parallelism,
+                restartEvery: restartEvery,
                 ct: ct);
 
             Console.WriteLine();
             Console.WriteLine();
 
             await ReportIndexResultAsync(result, projectRoot, ct);
+            return 0;
         });
 
         return command;

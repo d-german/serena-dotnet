@@ -11,6 +11,14 @@ using SysProcessStartInfo = System.Diagnostics.ProcessStartInfo;
 namespace Serena.Lsp.LanguageServers;
 
 /// <summary>
+/// Thrown by the C# warmup when a repository is too large to open without a solution
+/// scope. Expected on large monorepos: Roslyn still answers per-document requests such
+/// as document symbols, so callers report it as a one-line warning, not a failure.
+/// </summary>
+public sealed class UnscopedRepositoryTooLargeException(string message)
+    : InvalidOperationException(message);
+
+/// <summary>
 /// C# language server using the official Roslyn Language Server from Microsoft.
 /// Auto-installs via <c>dotnet tool install -g roslyn-language-server --prerelease</c> if not found.
 /// Falls back to csharp-ls if explicitly configured.
@@ -18,6 +26,9 @@ namespace Serena.Lsp.LanguageServers;
 public sealed class CSharpLanguageServer : LanguageServerDefinition
 {
     private const int MaxUnscopedProjects = 50;
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _tooLargeRepositories =
+        new(StringComparer.OrdinalIgnoreCase);
 
     public CSharpLanguageServer(ILogger<CSharpLanguageServer> logger) : base(logger) { }
 
@@ -235,6 +246,14 @@ public sealed class CSharpLanguageServer : LanguageServerDefinition
 
     private async Task OpenAllInRepoAsync(LspClient client, string projectRoot, CancellationToken ct)
     {
+        // A repository found too large once stays too large for this process. Batch indexing
+        // restarts the server every few thousand files, and rediscovering that would walk the
+        // whole tree again each time, competing with the indexer for disk.
+        if (_tooLargeRepositories.TryGetValue(projectRoot, out string? verdict))
+        {
+            throw new UnscopedRepositoryTooLargeException(verdict);
+        }
+
         // Discover all solution files (including subdirectories for mono-repos)
         var slnFiles = Directory.GetFiles(projectRoot, "*.sln", SearchOption.AllDirectories)
             .Concat(Directory.GetFiles(projectRoot, "*.slnx", SearchOption.AllDirectories))
@@ -245,10 +264,12 @@ public sealed class CSharpLanguageServer : LanguageServerDefinition
 
         if (slnFiles.Length > 1 || (slnFiles.Length == 0 && csprojFiles.Length > MaxUnscopedProjects))
         {
-            throw new InvalidOperationException(
+            string message =
                 $"Repository contains {slnFiles.Length} solution(s) and {csprojFiles.Length} C# project(s). " +
                 "Select a solution with set_active_solution before starting Roslyn; " +
-                "Serena will not open an unbounded large-repository workspace automatically.");
+                "Serena will not open an unbounded large-repository workspace automatically.";
+            _tooLargeRepositories[projectRoot] = message;
+            throw new UnscopedRepositoryTooLargeException(message);
         }
 
         if (slnFiles.Length == 1)

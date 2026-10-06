@@ -239,7 +239,7 @@ public sealed class SymbolCacheRefresher
             await lsp.OpenFileAsync(absolutePath);
             try
             {
-                var symbols = await lsp.RequestDocumentSymbolsAsync(absolutePath, cts.Token);
+                var symbols = await FrameworkConditionalSymbols.RequestAsync(lsp, absolutePath, cts.Token);
                 cache.Set(absolutePath, fingerprint, symbols.ToArray());
                 return true;
             }

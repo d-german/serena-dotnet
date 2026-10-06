@@ -33,11 +33,22 @@ public sealed class GitIgnoreFilter : IIgnoreFilter
         ".git", ".hg", ".svn", ".serena", ".vs", ".idea", "bin", "obj", "node_modules",
     ];
 
+    /// <summary>
+    /// Serena's own ignore rules at the project root, in .gitignore syntax and applied by
+    /// every Serena tool (indexing, find_file, list_dir, search_for_pattern), never by git.
+    /// For trees that are not git repositories (TFVC workspaces, extracted archives), and
+    /// for paths that belong in source control but not in Serena's view of the code, such as
+    /// vendored or minified third-party code.
+    /// </summary>
+    public const string SerenaIgnoreFileName = ".serenaignore";
+
     private GitIgnoreFilter() { }
 
     /// <summary>
-    /// Loads .gitignore rules from a project root directory.
-    /// Reads the root .gitignore and any nested .gitignore files found by scanning the directory tree.
+    /// Loads ignore rules from a project root directory: the root .gitignore, then any
+    /// nested .gitignore files found by scanning the directory tree, then the root
+    /// <see cref="SerenaIgnoreFileName"/>. Last match wins, so the Serena rules come last
+    /// and a nested .gitignore cannot re-include what they exclude.
     /// </summary>
     public static GitIgnoreFilter LoadFromProjectRoot(string projectRoot)
     {
@@ -52,6 +63,12 @@ public sealed class GitIgnoreFilter : IIgnoreFilter
 
         // Scan for nested .gitignore files (skip built-in ignored dirs)
         ScanNestedGitignores(projectRoot, projectRoot, filter);
+
+        string rootSerenaIgnore = Path.Combine(projectRoot, SerenaIgnoreFileName);
+        if (File.Exists(rootSerenaIgnore))
+        {
+            filter.AddRulesFromFile(rootSerenaIgnore, "");
+        }
 
         return filter;
     }

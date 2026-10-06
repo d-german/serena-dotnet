@@ -46,6 +46,57 @@ public sealed class ProjectFileDiscoveryTests : IDisposable
     }
 
     [Fact]
+    public void GatherSourceFiles_HonoursSerenaIgnoreWithoutAGitRepository()
+    {
+        WriteFile(".serenaignore", "third-party-assemblies/\n*.min.js\n");
+        WriteFile("src/App.cs", "public class App {}");
+        WriteFile("src/site.js", "function site() {}");
+        WriteFile("src/site.min.js", "function a(){}");
+        WriteFile("third-party-assemblies/Vendor/js/vendor.js", "function vendor() {}");
+
+        var project = NewProject();
+
+        var files = project.GatherSourceFiles();
+
+        files.Should().Contain("src/App.cs");
+        files.Should().Contain("src/site.js");
+        files.Should().NotContain("src/site.min.js");
+        files.Should().NotContain(f => f.StartsWith("third-party-assemblies/", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void SerenaIgnore_AppliesAfterRootGitIgnoreSoItCanReinclude()
+    {
+        WriteFile(".gitignore", "generated/\n");
+        WriteFile(".serenaignore", "!generated/\n");
+        WriteFile("generated/Proxy.cs", "public class Proxy {}");
+
+        var project = NewProject();
+
+        project.GatherSourceFiles().Should().Contain("generated/Proxy.cs");
+    }
+
+    [Fact]
+    public void SerenaIgnore_CannotBeOverriddenByANestedGitIgnore()
+    {
+        WriteFile(".serenaignore", "*.min.js\n");
+        WriteFile("web/.gitignore", "!*.js\n");
+        WriteFile("web/app.js", "function app() {}");
+        WriteFile("web/vendor.min.js", "function a(){}");
+
+        var files = NewProject().GatherSourceFiles();
+
+        files.Should().Contain("web/app.js");
+        files.Should().NotContain("web/vendor.min.js");
+    }
+
+    [Fact]
+    public void ProjectIndexer_DefaultParallelismStaysWithinBounds()
+    {
+        ProjectIndexer.DefaultParallelism.Should().BeInRange(1, 8);
+    }
+
+    [Fact]
     public void ProjectIndexer_DoesNotTreatUnknownExtensionFilesAsCSharp()
     {
         WriteFile("src/App.cs", "public class App {}");

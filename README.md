@@ -257,6 +257,20 @@ This parses the solution, follows resolvable transitive `<ProjectReference Inclu
 
 Repeat indexing is fingerprint-first. If every selected file is already current, the indexer reuses the cache and does not start Roslyn or any other language server. If only a few files changed, it starts only the affected language server and requests symbols only for those files.
 
+Indexing a very large tree:
+
+```bash
+serena-dotnet project index . --parallelism 8 --restart-every 2000
+```
+
+- `--parallelism N` requests N files at once (default: half the logical CPUs, at most 8). Files that time out under load are retried one at a time with three times the `--timeout` before being reported as failures.
+- `--restart-every N` restarts each language server after N files. By default this happens every 2000 files only while the server has no workspace loaded, which is the case for a repository too large to open without `--solution`. Roslyn treats those files as miscellaneous documents and gets slower with every one it has seen; restarting resets that. Pass `0` to never restart, or a number to restart unconditionally.
+- The cache is written to disk every 1000 files, so an interrupted run resumes from its last checkpoint instead of starting over.
+- Each C# session waits until Roslyn applies build symbols such as `DEBUG` to loose files before indexing, so `#if` blocks are outlined the same way however early a file is requested.
+- C# files whose `#if` conditions test target frameworks (`NETFRAMEWORK`, `NET48`, `NET`, `NET8_0_OR_GREATER`, ...) are outlined twice, as modern .NET and as .NET Framework 4.8, and the outlines are merged, so code that only one build compiles is still indexed.
+
+On a 57,000-file C# repository with 228 solutions, these took a whole-tree index from about four hours to about ten minutes, with identical output.
+
 After that, every `find_symbol` call:
 
 1. Serves results from the on-disk symbol cache (no LSP traffic).
@@ -271,6 +285,13 @@ The cache lives under `.serena/cache/<lang>/symbols.db` and is fingerprinted by 
 `search_for_pattern` remains available for arbitrary regex. It prunes ignored directories before descending, scans files in parallel, merges overlapping context blocks so lines are not repeated, and caps output at 100,000 characters by default. Narrow with `relative_path` and `paths_include_glob` when possible.
 
 Indexer discovery prunes ignored directories while walking the tree. Built-in skips include `.git`, `.serena`, `.vs`, `.idea`, `bin`, `obj`, and `node_modules`, and project `.gitignore` rules still apply. Unknown or extensionless files are not treated as C#.
+
+A `.serenaignore` at the project root adds Serena's own rules in `.gitignore` syntax. They apply to every Serena tool (indexing, `find_file`, `list_dir`, `search_for_pattern`), never to git, and they are applied after every `.gitignore`, so a nested `.gitignore` cannot re-include what they exclude. Use it in trees that are not git repositories (a TFVC workspace has no `.gitignore`), and for code that belongs in source control but not in Serena's view of the code, such as vendored or minified JavaScript:
+
+```
+third-party-assemblies/
+*.min.js
+```
 
 ### Tunable env vars
 

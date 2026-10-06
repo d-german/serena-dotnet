@@ -402,14 +402,26 @@ public sealed class LanguageServerProcess : IAsyncDisposable
     /// <summary>
     /// Force-stops the language server process and all its children.
     /// </summary>
-    public void ForceStop()
+    /// <param name="expected">
+    /// True for a planned stop, such as a restart during batch indexing: it is logged at
+    /// debug level and the resulting disconnect is not reported as a failure.
+    /// </param>
+    public void ForceStop(bool expected = false)
     {
         if (_process is null || _process.HasExited)
         {
             return;
         }
 
-        _logger.LogWarning("Force-stopping language server [{Language}] (PID: {Pid})", _language, _process.Id);
+        if (expected)
+        {
+            _isShuttingDown = true;
+            _logger.LogDebug("Stopping language server [{Language}] (PID: {Pid})", _language, _process.Id);
+        }
+        else
+        {
+            _logger.LogWarning("Force-stopping language server [{Language}] (PID: {Pid})", _language, _process.Id);
+        }
         KillProcessTree(_process);
     }
 

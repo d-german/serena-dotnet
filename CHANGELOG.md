@@ -1,5 +1,73 @@
 # Changelog
 
+## [0.4.0]
+
+The symbol cache format changed (version 2): rerun `project index` once after upgrading.
+
+### Changed
+- **`symbols` queries work on an index built at another path.** A prebuilt index shipped
+  in a relocatable bundle stores the build machine's absolute paths; `symbols overview`
+  now translates a local path into the stored form before reporting a file as absent,
+  and results are printed relative to the local root instead of as paths that do not
+  exist here. `symbols files` accepts `*` and `?` globs as well as substrings.
+- **`project index` requests files in parallel.** Indexing asked the language server for
+  one file at a time, leaving all but one core idle. `--parallelism N` (default: half the
+  logical CPUs, at most 8) sends N requests at once. Files that time out under load are
+  retried one at a time with three times the per-file timeout before they are reported.
+- **The symbol cache is checkpointed every 1000 files.** It was written only when the
+  language server stopped, so a multi-hour index existed only in memory and a crash near
+  the end lost all of it. An interrupted run now resumes from the last checkpoint.
+- **Language servers are restarted every 2000 files when the repository is too large to
+  load without a solution scope,** or whenever a server has died.
+  Roslyn treats files outside a loaded workspace as miscellaneous documents and slows
+  down with every one it has seen, so whole-tree indexing of a large repository degraded
+  quadratically. Restarts skip the LSP shutdown handshake, which Roslyn routinely ignores
+  until the 15-second shutdown timeout, and cost one to two seconds.
+  `--restart-every N` overrides the interval; `0` disables restarts.
+- **C# indexing waits until Roslyn applies build symbols to loose files.** Roslyn parses
+  files outside a loaded workspace through a canonical project that takes a moment to
+  load; files requested before it has are parsed with no symbols defined, so
+  `#if DEBUG` and `#if NET8_0_OR_GREATER` blocks vanished from their outlines depending
+  on timing. Each C# session now probes a temporary `#if DEBUG` file until its class
+  appears (warning after 30 seconds) before indexing.
+- **The expected "repository too large to open unscoped" warmup failure is a one-line
+  warning,** logged once per language instead of an error with a stack trace on every
+  start.
+
+  Together these took a whole-tree index of a 57,000-file C# repository from about four
+  hours to about ten minutes, with identical symbol output.
+
+### Added
+- **`.serenaignore`** at the project root: Serena's own ignore rules in `.gitignore`
+  syntax, applied by every Serena tool and after every `.gitignore`, for trees without a
+  `.gitignore` (TFVC workspaces) and for vendored or minified code.
+- **C# outlines include code that only compiles for .NET Framework.** Roslyn outlines
+  files outside a loaded workspace as modern .NET, so declarations inside
+  `#if NETFRAMEWORK`, `#if NET48` or the `#else` of `#if NET` were inactive and missing
+  from the index: whole files in a multi-targeting codebase had no symbols. For C# files
+  whose conditionals test target-framework symbols, a second outline is requested with
+  the .NET Framework 4.8 symbols in effect and merged with the first, so the index holds
+  every declaration either build compiles. Indexing, inline cache refresh and live symbol
+  retrieval all use the merged outline.
+
+- **The symbol cache version is now 2,** so caches built before the outline changes above
+  are rebuilt on the next index instead of being reused by fingerprint.
+- **`project index` exits with code 1** on invalid arguments or a missing directory or
+  solution, instead of 0.
+
+### Fixed
+- **Sending a changed document to Roslyn terminated the server.** `didChange` sent a
+  full-document replacement as a change with a null range; Roslyn advertises incremental
+  sync, dereferences the range of every change, and exited on the
+  NullReferenceException. Changes now replace the previous text through an explicit
+  range covering all of it. The range is computed from the text the server actually
+  holds, not from the file, which an edit tool has usually rewritten by the time it
+  notifies, and counts line breaks the way the server does (U+2028 and U+2029, plus
+  U+0085 for C#), so the server's copy never keeps a stale tail.
+- **A language server that crashes during indexing is restarted at the next batch,**
+  and the timeout retry pass stops after three consecutive timeouts instead of waiting
+  out every remaining file against an unresponsive server.
+
 ## [0.2.1]
 
 ### Fixed

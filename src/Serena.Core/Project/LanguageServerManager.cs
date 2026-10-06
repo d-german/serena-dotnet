@@ -20,7 +20,9 @@ namespace Serena.Core.Project;
 /// </summary>
 public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateSink
 {
-    private const int SymbolCacheVersion = 1;
+    // 2: C# outlines merge in .NET Framework-only declarations and wait for DEBUG, so
+    // caches built before then must be rebuilt rather than reused by fingerprint.
+    internal const int SymbolCacheVersion = 2;
 
     private readonly ILogger<LanguageServerManager> _logger;
     private readonly ILoggerFactory _loggerFactory;
@@ -33,6 +35,7 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
     // (PostStartAsync). Cancelled + disposed in StopAsync/RestartAsync so a
     // restart can interrupt an in-flight Roslyn load.
     private readonly ConcurrentDictionary<Language, CancellationTokenSource> _languageCts = new();
+    private readonly ConcurrentDictionary<Language, byte> _tooLargeToLoad = new();
     // v1.0.27: per-language gate so two parallel first-callers don't both
     // race past the TryGetValue check and start two LSP processes.
     private readonly ConcurrentDictionary<Language, SemaphoreSlim> _startGates = new();
@@ -140,6 +143,16 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
                 catch (OperationCanceledException) when (warmupCts.IsCancellationRequested)
                 {
                     _logger.LogInformation("Warmup cancelled for {Language} (Stop/Restart)", language);
+                }
+                catch (UnscopedRepositoryTooLargeException ex)
+                {
+                    // Expected on large monorepos and repeated on every restart during
+                    // batch indexing, so warn once without a stack trace.
+                    if (_tooLargeToLoad.TryAdd(language, 0))
+                    {
+                        _logger.LogWarning("{Language} workspace not loaded: {Reason}", language, ex.Message);
+                    }
+                    MarkFailed(language, ex.Message);
                 }
                 catch (Exception ex)
                 {
@@ -318,6 +331,47 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
         _readyStates.TryRemove(language, out _);
         _logger.LogInformation("Restarted language server slot for {Language} (cache evicted)", language);
     }
+
+    /// <summary>
+    /// Saves the symbol cache and kills the language server without the LSP shutdown
+    /// handshake, so the next <see cref="GetOrStartAsync"/> starts a fresh process.
+    /// For batch indexing, where the server holds nothing worth draining: a graceful
+    /// <see cref="RestartAsync"/> waits out the full shutdown timeout whenever the
+    /// server ignores "exit", which Roslyn routinely does.
+    /// </summary>
+    public async Task RecycleAsync(Language language, CancellationToken ct = default)
+    {
+        if (_languageCts.TryRemove(language, out var warmupCts))
+        {
+            try { warmupCts.Cancel(); } catch { /* best-effort */ }
+            warmupCts.Dispose();
+        }
+
+        if (_caches.TryGetValue(language, out var cache))
+        {
+            cache.Save();
+        }
+
+        _readyStates.TryRemove(language, out _);
+        if (!_clients.Remove(language, out var client))
+        {
+            return;
+        }
+
+        // An expected kill marks the process as shutting down, so disposing it right away
+        // releases the client, its JSON-RPC connection and the process handle without
+        // starting the graceful shutdown this method exists to skip.
+        client.ForceKill(expected: true);
+        await client.DisposeAsync();
+        _logger.LogInformation("Recycled language server for {Language}", language);
+    }
+
+    /// <summary>
+    /// True once the language server's warmup found the repository too large to open
+    /// without a solution scope. Every file is then a miscellaneous document, the case in
+    /// which Roslyn slows with each file it has seen and restarts pay for themselves.
+    /// </summary>
+    public bool IsRepositoryTooLargeToLoad(Language language) => _tooLargeToLoad.ContainsKey(language);
 
     // === IServerReadyStateSink ===========================================
 

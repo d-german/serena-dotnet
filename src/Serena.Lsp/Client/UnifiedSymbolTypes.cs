@@ -154,8 +154,13 @@ public sealed class UnifiedSymbolInformation
     /// <summary>
     /// Assigns overload indices to children that share the same name.
     /// </summary>
-    private static void AssignOverloadIndices(List<UnifiedSymbolInformation> symbols)
+    internal static void AssignOverloadIndices(List<UnifiedSymbolInformation> symbols)
     {
+        foreach (var symbol in symbols)
+        {
+            symbol.OverloadIndex = null;
+        }
+
         var nameGroups = symbols.GroupBy(s => s.Name).Where(g => g.Count() > 1);
         foreach (var group in nameGroups)
         {

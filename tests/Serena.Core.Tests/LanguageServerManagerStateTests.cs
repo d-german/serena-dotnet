@@ -93,6 +93,26 @@ public class LanguageServerManagerStateTests
     }
 
     [Fact]
+    public async Task RecycleAsync_WithNoRunningServer_LeavesStateUntouched()
+    {
+        var manager = (LanguageServerManager)NewSink();
+
+        await manager.Invoking(m => m.RecycleAsync(Language.CSharp)).Should().NotThrowAsync();
+
+        manager.GetReadyState(Language.CSharp).State.Should().Be(WorkspaceReadyState.NotStarted);
+        manager.RunningClients.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void UnscopedRepositoryTooLarge_RemainsAnInvalidOperationExceptionForExistingCallers()
+    {
+        var ex = new Lsp.LanguageServers.UnscopedRepositoryTooLargeException("too large");
+
+        ex.Should().BeAssignableTo<InvalidOperationException>();
+        ex.Message.Should().Be("too large");
+    }
+
+    [Fact]
     public void PartialReferenceWarnings_AreSampledAndTruncated()
     {
         string longWarning = new('x', 500);
