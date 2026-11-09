@@ -8,6 +8,7 @@ using Serena.Lsp;
 using Serena.Lsp.Caching;
 using Serena.Lsp.Client;
 using Serena.Lsp.LanguageServers;
+using Serena.Lsp.Outline;
 using Serena.Lsp.Project;
 
 namespace Serena.Core.Project;
@@ -91,6 +92,7 @@ public sealed class ProjectIndexer
         IReadOnlyList<string>? solutionPaths = null,
         int? maxParallelism = null,
         int? restartEvery = null,
+        bool useLanguageServer = false,
         CancellationToken ct = default)
     {
         var timeout = perFileTimeout ?? TimeSpan.FromSeconds(10);
@@ -143,10 +145,36 @@ public sealed class ProjectIndexer
                         fileIndex, totalMapped, file, language, true));
                 }
 
+                // Entries reused from an index built before occurrence capture
+                // have outlines but no occurrence rows; those need only the text.
+                if (cache is not null && cachedFiles.Count > 0)
+                {
+                    int backfilled = cache.Occurrences.Backfill(
+                        cachedFiles.Select(f => Path.IsPathRooted(f) ? f : Path.Combine(projectRoot, f)));
+                    if (backfilled > 0)
+                    {
+                        onStatus?.Invoke(
+                            $"Backfilled occurrence rows for {backfilled} cached {language.ToIdentifier()} file(s)");
+                    }
+                }
+
                 if (filesToIndex.Count == 0)
                 {
                     onStatus?.Invoke(
                         $"Reused {cachedFiles.Count} cached {language.ToIdentifier()} files; language server not started");
+                    continue;
+                }
+
+                // C# outlines come from the parser unless the caller asks for the server: no
+                // workspace load, no Partial state, and a file takes milliseconds.
+                if (language == Language.CSharp && !useLanguageServer)
+                {
+                    onStatus?.Invoke(
+                        $"Outlining {filesToIndex.Count} C# file(s) with the parser, {parallelism} at a time" +
+                        (cachedFiles.Count > 0 ? $" ({cachedFiles.Count} reused from cache)…" : "…"));
+                    fileIndex = await OutlineWithParserAsync(
+                        filesToIndex, projectRoot, parallelism, lsManager.GetOrCreateSymbolCache(language),
+                        filesPerLanguage, language, failures, fileIndex, totalMapped, onProgress, ct);
                     continue;
                 }
 
@@ -213,12 +241,42 @@ public sealed class ProjectIndexer
                 }
             }
 
+            onStatus?.Invoke("Building inventory of project references and configuration keys…");
+            int inventoryRows = BuildInventory(projectRoot, project, _loggerFactory);
+            onStatus?.Invoke($"Inventory: {inventoryRows} row(s)");
+
+            onStatus?.Invoke("Writing the project overview memory…");
+            var caches = new Dictionary<Language, SymbolCache<UnifiedSymbolInformation[]>>();
+            foreach (var language in filesPerLanguage.Keys)
+            {
+                if (lsManager.GetOrLoadSymbolCache(language) is { } indexed)
+                {
+                    caches[language] = indexed;
+                }
+            }
+            string overviewPath = ProjectOverviewBuilder.Write(project, caches, _loggerFactory);
+            onStatus?.Invoke($"Overview: {Path.GetRelativePath(projectRoot, overviewPath)} (read_memory {ProjectOverviewBuilder.MemoryName})");
+
             return new IndexResult(filesPerLanguage, failures, sourceFiles.Count, skipped);
         }
         finally
         {
             await lsManager.DisposeAsync();
         }
+    }
+
+    /// <summary>
+    /// Scans MSBuild and JSON configuration files into the inventory database
+    /// beside the language caches. Needs no language server and takes seconds.
+    /// </summary>
+    public static int BuildInventory(string projectRoot, SerenaProject project, ILoggerFactory loggerFactory)
+    {
+        var rows = ProjectInventoryBuilder.Build(project);
+        var inventory = new ProjectInventory(
+            Path.Combine(projectRoot, ".serena", "cache"),
+            loggerFactory.CreateLogger<ProjectInventory>());
+        inventory.Replace(rows);
+        return rows.Count;
     }
 
     /// <summary>
@@ -327,7 +385,69 @@ public sealed class ProjectIndexer
     }
 
     /// <summary>
+    /// Outlines C# files with the parser, <paramref name="parallelism"/> at a time, and
+    /// stores each outline as it is produced. Saves at checkpoints and at the end so a
+    /// cancelled run keeps what it did.
+    /// </summary>
+    private static async Task<int> OutlineWithParserAsync(
+        List<string> files, string projectRoot, int parallelism,
+        SymbolCache<UnifiedSymbolInformation[]> cache,
+        Dictionary<Language, int> filesPerLanguage, Language language,
+        List<IndexFailure> failures, int fileIndex, int totalMapped,
+        Action<IndexProgress>? onProgress, CancellationToken ct)
+    {
+        var gate = new object();
+        int sinceCheckpoint = 0;
+
+        await Parallel.ForEachAsync(
+            files,
+            new ParallelOptions { MaxDegreeOfParallelism = parallelism, CancellationToken = ct },
+            (file, _) =>
+            {
+                string absolutePath = Path.Combine(projectRoot, file);
+                string? error = null;
+                try
+                {
+                    string fingerprint = CacheFingerprint.ForFile(absolutePath);
+                    var outline = CSharpSyntaxOutline.Build(absolutePath, File.ReadAllText(absolutePath));
+                    if (fingerprint.Length > 0)
+                    {
+                        cache.Set(absolutePath, fingerprint, [.. outline]);
+                    }
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    error = ex.Message;
+                }
+
+                lock (gate)
+                {
+                    fileIndex++;
+                    if (error is null)
+                    {
+                        filesPerLanguage[language]++;
+                    }
+                    else
+                    {
+                        failures.Add(new IndexFailure(file, error));
+                    }
+                    onProgress?.Invoke(new IndexProgress(fileIndex, totalMapped, file, language, error is null, error));
+                }
+                if (error is null && Interlocked.Increment(ref sinceCheckpoint) >= CheckpointInterval)
+                {
+                    Interlocked.Exchange(ref sinceCheckpoint, 0);
+                    cache.Save();
+                }
+                return ValueTask.CompletedTask;
+            });
+
+        cache.Save();
+        return fileIndex;
+    }
+
+    /// <summary>
     /// Indexes a single file, returning the symbols found. Useful for debugging.
+    /// C# is outlined by the parser; other languages need their server.
     /// </summary>
     public async Task<Result<IReadOnlyList<UnifiedSymbolInformation>>> IndexFileAsync(
         string projectRoot,
@@ -356,6 +476,20 @@ public sealed class ProjectIndexer
                 {
                     return Result.Success<IReadOnlyList<UnifiedSymbolInformation>>(cached);
                 }
+            }
+
+            if (language == Language.CSharp)
+            {
+                if (!File.Exists(absolutePath))
+                {
+                    return Result.Failure<IReadOnlyList<UnifiedSymbolInformation>>($"File not found: {absolutePath}");
+                }
+                var parsed = CSharpSyntaxOutline.Build(absolutePath, await File.ReadAllTextAsync(absolutePath, ct));
+                if (fingerprint.Length > 0)
+                {
+                    lsManager.GetOrCreateSymbolCache(language.Value).Set(absolutePath, fingerprint, [.. parsed]);
+                }
+                return Result.Success(parsed);
             }
 
             var client = await lsManager.GetOrStartAsync(language.Value, ct: ct);

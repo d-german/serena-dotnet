@@ -90,7 +90,8 @@ public sealed class ReplaceContentTool : ToolBase
     public ReplaceContentTool(IToolContext context) : base(context) { }
 
     public override string Description =>
-        "Replaces one or more occurrences of a given pattern in a file with new content.";
+        "Replaces one or more occurrences of a given pattern in a file with new content. " +
+        "For several edits, or edits across files, use apply_edits instead: one call, one turn.";
 
     protected override IReadOnlyList<ToolParameter> ExtractParameters() =>
     [
@@ -99,6 +100,9 @@ public sealed class ReplaceContentTool : ToolBase
         new("repl", "The replacement string.", typeof(string), Required: true),
         new("mode", "Either 'literal' or 'regex'.", typeof(string), Required: true),
         new("allow_multiple_occurrences", "Whether to allow replacing multiple occurrences.", typeof(bool), Required: false, DefaultValue: false),
+        new("context_lines", "Lines of context to echo around the first replacement, numbered from one. 0 (default) echoes nothing.", typeof(int), Required: false, DefaultValue: 0),
+        new("report_diagnostics", "Append the language server's diagnostics for the file when the server is running and Ready or Partial. Never starts a server.", typeof(bool), Required: false, DefaultValue: false),
+        new("min_severity", "Lowest diagnostic severity to list when report_diagnostics is true: 'error' (default), 'warning', 'information' or 'hint'.", typeof(string), Required: false, DefaultValue: "error"),
     ];
 
     protected override async Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
@@ -106,68 +110,39 @@ public sealed class ReplaceContentTool : ToolBase
         string relativePath = GetRequired<string>(arguments, "relative_path");
         string needle = GetRequired<string>(arguments, "needle");
         string repl = GetRequired<string>(arguments, "repl");
-        string mode = GetOptional(arguments, "mode", "literal");
+        var mode = ContentReplacement.ParseMode(GetOptional(arguments, "mode", "literal"));
         bool allowMultiple = GetOptional(arguments, "allow_multiple_occurrences", false);
+        int contextLines = GetOptional(arguments, "context_lines", 0);
+        bool reportDiagnostics = GetOptional(arguments, "report_diagnostics", false);
+        var minSeverity = DiagnosticsReport.ParseMinSeverity(GetOptional(arguments, "min_severity", "error"));
 
         string absolutePath = ResolvePath(relativePath);
         var encoding = GetProjectEncoding();
+        await using var lease = await Serena.Core.Editor.FileWriteGate.LockAsync(absolutePath, ct);
         string content = await File.ReadAllTextAsync(absolutePath, encoding, ct);
 
-        var (newContent, count) = string.Equals(mode, "regex", StringComparison.OrdinalIgnoreCase)
-            ? ReplaceWithRegex(content, needle, repl, allowMultiple, relativePath)
-            : ReplaceWithLiteral(content, needle, repl, allowMultiple, relativePath);
+        var result = ContentReplacement.Apply(content, needle, repl, mode, allowMultiple, relativePath);
 
-        await Serena.Core.Editor.FileWriteGate.WriteAllTextAsync(absolutePath, newContent, encoding, ct);
-        await TryNotifyLspAsync(absolutePath, newContent, ct);
+        await lease.WriteAllTextAsync(result.NewContent, encoding, ct);
+        await TryNotifyLspAsync(absolutePath, result.NewContent, ct);
 
-        return $"Replaced {count} occurrence(s) in {relativePath}";
-    }
-
-    private static (string NewContent, int Count) ReplaceWithRegex(
-        string content, string needle, string repl, bool allowMultiple, string relativePath)
-    {
-        string normalizedRepl = TextReplacementHelper.NormalizeBackreferences(repl);
-        normalizedRepl = TextReplacementHelper.NormalizeLineEndings(normalizedRepl, content);
-        var regex = TextReplacementHelper.CreateSearchRegex(needle);
-        int count = regex.Matches(content).Count;
-
-        ValidateOccurrenceCount(count, allowMultiple, relativePath, $"Pattern not found in {relativePath}: {needle}");
-
-        return (regex.Replace(content, normalizedRepl), count);
-    }
-
-    private static (string NewContent, int Count) ReplaceWithLiteral(
-        string content, string needle, string repl, bool allowMultiple, string relativePath)
-    {
-        // Normalize line endings: MCP JSON delivers \n but files may have \r\n.
-        // Python Serena avoids this because open() normalizes to \n on read.
-        string normalizedNeedle = TextReplacementHelper.NormalizeLineEndings(needle, content);
-        string normalizedRepl = TextReplacementHelper.NormalizeLineEndings(repl, content);
-
-        int count = TextReplacementHelper.CountOccurrences(content, normalizedNeedle);
-
-        ValidateOccurrenceCount(count, allowMultiple, relativePath, $"Text not found in {relativePath}");
-
-        string newContent = allowMultiple
-            ? content.Replace(normalizedNeedle, normalizedRepl)
-            : TextReplacementHelper.ReplaceFirst(content, normalizedNeedle, normalizedRepl);
-
-        return (newContent, count);
-    }
-
-    private static void ValidateOccurrenceCount(int count, bool allowMultiple, string relativePath, string notFoundMessage)
-    {
-        if (count == 0)
+        var answer = new System.Text.StringBuilder();
+        answer.Append($"Replaced {result.Count} occurrence(s) in {relativePath}");
+        if (contextLines > 0)
         {
-            throw new InvalidOperationException(notFoundMessage);
+            answer.Append('\n').Append(ContentReplacement.FormatContext(result.NewContent, result.FirstIndex, result.FirstLength, contextLines));
         }
-
-        if (count > 1 && !allowMultiple)
+        if (reportDiagnostics)
         {
-            throw new InvalidOperationException(
-                $"Text matches {count} occurrences in {relativePath}, but allow_multiple_occurrences is false.");
+            string? diagnostics = await DiagnosticsReport.TryBuildAfterEditAsync(Context, absolutePath, relativePath, minSeverity, ct);
+            if (diagnostics is not null)
+            {
+                answer.Append('\n').Append(diagnostics);
+            }
         }
+        return answer.ToString();
     }
+
 }
 
 [SymbolicEdit]

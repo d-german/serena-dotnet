@@ -27,6 +27,9 @@ public sealed class LspRequestClient
     public Task<InitializeResult> InitializeAsync(InitializeParams @params, CancellationToken ct = default)
         => _process.SendRequestAsync<InitializeResult>(LspMethods.Initialize, @params, ct);
 
+    public Task<JToken?> DocumentDiagnosticAsync(DocumentDiagnosticParams @params, CancellationToken ct = default)
+        => _process.SendRequestAsync<JToken?>(LspMethods.TextDocumentDiagnostic, @params, ct);
+
     public Task ShutdownAsync(CancellationToken ct = default)
         => _process.SendRequestAsync("shutdown", cancellationToken: ct);
 

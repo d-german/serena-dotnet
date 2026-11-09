@@ -1,5 +1,234 @@
 # Changelog
 
+## [0.7.2]
+
+### Changed
+- **Onboarding instructions are imperative.** A session given only "onboard this repository" read the
+  generated overview, concluded that most steps were answered and asked whether to write memories
+  instead of writing them: the 0.6.2 wording ("skip the steps below that it answers") gave it the
+  exit. The instructions now say to do every step in this turn, that the overview holds facts but no
+  domain knowledge, patterns or conventions, that step 5 is required, and that onboarding is complete
+  only when `check_onboarding_performed` lists the memories.
+
+## [0.7.1]
+
+Three more measured runs (serena 0.6.1, serena 0.7.0, and a second vanilla run that
+delegated its test projects to sub-agents) showed what remained: edits racing on one
+file, files created by other tools missing from the index, a generated overview nobody
+read, and an activation that reset the server when a second caller activated the same
+project.
+
+### Changed
+- **Activating the active project again is a reconcile, not a restart.** `activate_project`
+  on the path that is already active keeps the caches, the pending outlines and a running
+  Roslyn, reconciles the index with the disk and returns. A sub-agent that activates the
+  project its parent works in no longer resets the parent's state. A path that does not
+  exist fails without touching the active project (it used to dispose it first).
+- **Edits to one file apply in sequence.** Every edit tool holds the file's lease from read
+  to write (`FileWriteGate.LockAsync`), so `replace_symbol_body`, `apply_edits`,
+  `replace_content`, the line tools and `create_text_file` issued in parallel on one file
+  each see the previous result instead of overwriting it. Unrelated files never wait on
+  each other.
+- **`activate_project` shows the start of the generated overview** (first 40 lines) instead
+  of pointing at it, and labels the memory list "read the project ones before exploring".
+  Global memories filed under another project's folder are left out of the list.
+- **Names match without arity.** `find_symbol`, `symbols find` and the name index treat
+  `ToResult` as naming `ToResult<T>` and `ToResult<T, E>`; a pattern that carries type
+  parameters still names exactly that one.
+
+### Added
+- **Project file watcher.** While a project with an index is active, files created, changed
+  or deleted by anything other than serena's tools (an agent's built-in create tool, git,
+  dotnet format) reach the index as they land: a C# file is outlined from its text, a
+  vanished file is dropped, a folder that moves in has its files outlined, and a vanished
+  folder prunes the index. `.git`, `.serena`, gitignored paths and `exclude_patterns` are
+  not watched.
+
+## [0.7.0]
+
+Five measured runs of one refactor showed what agents use serena for: batch edits and the
+occurrence index. The language server, which every outline depended on, spent the runs Loading
+or Partial and silently failed to refresh edited files, and nobody called the semantic tools
+that need it. So the everyday path no longer needs it.
+
+### Changed
+- **C# outlines come from the parser.** `project index`, `project index-file`, the refresh
+  after every edit, the reconciliation at `activate_project` and a cache miss in `find_symbol`
+  or `get_symbols_overview` all outline a C# file from its syntax tree (Microsoft.CodeAnalysis.CSharp),
+  in process, in milliseconds, with no workspace load and no Loading or Partial state. The
+  shape is the one Roslyn's server returns for `textDocument/documentSymbol`: names with type
+  parameters, `name : type` and `name(params) : return` details, constructors as methods, fields
+  as their declarators, local functions under their member, explicit implementations under
+  their plain name, overload indices by document order, and the .NET Framework merge for files
+  with target-framework conditionals. Checked against a server-built index of 1,560 files:
+  1,556 identical by name and kind, 1,518 of 1,522 identical name paths; the four that differ
+  are fields the server had named with an empty type.
+- **An edit refreshes its outline synchronously.** `apply_edits` and the other edit tools
+  rebuild the outline from the written text before returning; the pending set and the
+  background drain added in 0.6.2 now serve only languages that still need a server.
+- **`project index` is seconds, not minutes, for C#.** Roslyn is started only when the caller
+  passes `--server` (the pre-0.7 path, kept for comparison) or for other languages.
+
+### Added
+- `project parser-check <path>`: compares the parser's outline of every indexed C# file with
+  the outline stored in the index and lists the differences, so a server-built index can be
+  checked against the parser before trusting the parser alone.
+- `SymbolCache.ReconcileWithDisk` takes an optional outline builder, used for C#, so a changed
+  or new file gets a fresh outline at activation instead of losing it until the next index.
+
+### Unchanged
+- `find_referencing_symbols`, `rename_symbol`, `get_file_diagnostics` and the diagnostics in
+  `apply_edits` still use the language server; they are the semantic questions a syntax tree
+  cannot answer. The server starts on the first such call, as before.
+
+## [0.6.2]
+
+The 0.6.1 rerun showed the occurrence index staying current while the outline refresh still
+failed: the edit tool waited ten seconds for Roslyn to re-outline each changed file, Roslyn was
+Partial on 77 projects with a build competing for the CPU, and every one of 57 attempts timed out
+without a trace. Every agent in the round also spent its first minutes rediscovering the same
+facts about the solution. Both are addressed here.
+
+### Changed
+- **Outline refresh is asynchronous.** An edit drops the stale outline, rebuilds the occurrence
+  rows from the text and returns at once; the outline is rebuilt in the background with a
+  60-second budget whenever the server is Ready or Partial. Files whose outline could not be
+  rebuilt stay in a per-language pending set that is drained again when the server becomes
+  usable and on every later edit, up to three attempts each. A file edited while its outline was
+  being requested is dropped and queued again, so a stale outline is never stored.
+- **Failures are recorded.** The refresher returns the reason (timeout, server error, file
+  unreadable); the manager logs each failed attempt at Information and the give-up at Warning,
+  and `get_language_server_status` reports `pending_outlines` per language.
+- **The `apply_edits` index line** now appears only when a server is not usable, and says that the
+  outline waits for the server while `find_occurrences` is already current.
+
+### Added
+- **Generated project overview.** `project index` ends by writing
+  `.serena/memories/generated/project-overview.md` from the index and the inventory: solutions,
+  projects and their folders, target frameworks, build and test commands and frameworks, the
+  `.editorconfig` rules the build enforces as errors, the measured line-ending and BOM convention,
+  the most depended-on projects, namespaces and the largest types per language, packages grouped
+  by what they are, and the configuration sections. Facts only, every line a count, a name, a path
+  or a version. `project overview <path>` rewrites it from the existing index without a server.
+  `activate_project` points at it, `check_onboarding_performed` does not count it as onboarding,
+  and the `onboarding` prompt tells the agent to read it first and write only what it cannot know.
+- `ProjectInventory.All(kind)` for consumers that need every row of one kind.
+
+## [0.6.1]
+
+A measured session (round 4 of the tooling comparison, 8 Nov 2026) showed the index going
+stale during a 35-minute refactor: the only save ran when the agent restarted the language
+server, 79 edited files lost their outline for the rest of the session because the server was
+still loading, and files deleted or created by other tools were never noticed. The cause was
+the shape of the persistence code rather than any one bug, so this release restructures it.
+
+### Changed
+- **Write-behind persistence.** The symbol cache saves itself two seconds after the last
+  mutation, flushes before any query that reads the database, and flushes on dispose. The
+  language server manager no longer saves at stop, restart and recycle; those five call sites
+  are gone, and so is the `invalidated-paths.txt` journal, which the write-behind save makes
+  redundant.
+- **`OccurrenceIndex` is its own class.** The occurrence tables, their schema and migrations,
+  the text capture, the queries and the backfill moved out of the generic `SymbolCache<T>`
+  into `cache.Occurrences`. The cache no longer inspects its type parameter at runtime to
+  decide whether occurrences apply.
+- **`restart_language_server` restarts.** It used to dispose the manager and leave the server
+  NotStarted, so every later edit skipped its outline refresh until something else started the
+  server. It now starts the servers that were running, with the project's current settings,
+  and reports that they are warming up.
+- **`apply_edits` says when the outline could not be rebuilt.** One line at the end of the
+  result names the server state and the number of files whose occurrence rows were updated
+  from text but whose outline waits for the server.
+
+### Added
+- **Deleted files are first class.** `find_occurrences` and `symbols references` leave out a
+  file that no longer exists and drop its rows; `SymbolCache.PruneMissingFiles()` does the same
+  for the whole index.
+- **Reconciliation at `activate_project`.** When an index exists, activation compares it with
+  the files on disk: deleted files are dropped, changed files lose their stale outline and get
+  fresh occurrence rows from their text, and files new to a directory the index already covers
+  get occurrence rows. Directories the index never covered are left alone, so a
+  solution-scoped index stays scoped. The activation result reports the counts.
+- `SymbolCache` reloads a database that appeared after it was first opened (an index built by
+  another process), instead of reporting the cache absent for the rest of the session.
+
+## [0.6.0]
+
+For the read-only consumers of a prebuilt index (the HCW troubleshooter runs
+`serena-dotnet symbols find` and `symbols overview` with no language server). In one
+real investigation 22 text searches ran against 9 index lookups, and the blind spots behind
+them were callers, csproj and package references, and JSON configuration. Both are now in
+the index.
+
+### Added
+- **`symbols references <Name>`**: where an identifier occurs, from an occurrence table
+  built at index time: file, one-based line, the enclosing symbol from the stored outline,
+  a `[declaration]` marker and the source line. Textual, so same-named members of unrelated
+  types are all listed, and it answers in milliseconds without Roslyn. `--path`, `--lang`,
+  `--max`, `--json`.
+- **`find_occurrences`** MCP tool: the same lookup for agents, with `exclude_declarations`,
+  for the cheap first answer to "who calls this?" before a Roslyn-bound
+  `find_referencing_symbols`.
+- **Occurrence capture in every index path.** `project index`, `project index-file`, the
+  inline refresh after an edit and the cache-miss retrieval all record the file's
+  PascalCase identifiers (three characters or more, comments masked, string literals kept)
+  beside its outline. The table is additive: an index built before 0.6.0 opens unchanged
+  and reports "no occurrence table" in `symbols stats` and `symbols references`; the next
+  `project index` backfills rows from the text of every cached file that has none, without
+  re-outlining unchanged files or starting a language server.
+- **Edits keep references current even with no language server running.** The outline of
+  an edited file still needs Roslyn and stays removed until the next index or cache miss,
+  but its occurrence rows are rebuilt from the text at once, so `find_occurrences` and
+  `symbols references` never report stale lines for a file an agent just changed. Rows are
+  keyed by path for that reason, independent of the outline entry.
+- **`symbols config <term>` and `symbols packages <term>`** over a new inventory of non-code
+  facts: PackageReference, ProjectReference and selected properties from `.csproj`,
+  `.props` and `.targets`; flattened colon-path keys from `appsettings*.json`,
+  `*settings*.json`, `*.Octodeploy.json`, `ocelot*.json`, `launchSettings.json` and
+  `web.config`. Values are truncated to 120 characters and redacted when the key names a
+  password, secret, token, API key, connection string or credential, since an index can be
+  bundled and shared.
+- **`project inventory <path>`** rebuilds only the inventory in seconds, no language server.
+  `project index` builds it as well. `symbols stats` reports occurrence rows per language
+  and inventory rows per kind.
+
+## [0.5.0]
+
+Built from a three-round comparison of agents refactoring a 25-project C# solution with
+Serena, with Rider's MCP server and with grep plus the compiler. Half of the Serena
+agent's builds failed on errors the language server already knew about, 371 of its
+edits were single-line `replace_content` calls, and files it created or edited dropped
+out of the symbol cache for the whole session because Roslyn never reached `Ready`.
+
+### Added
+- **`get_file_diagnostics`**: the language server's compiler and analyzer diagnostics for
+  one file, as `severity CODE (line,col): message` lines with one-based positions. Uses
+  pull diagnostics (`textDocument/diagnostic`, advertised through a new client
+  capability and detected through dynamic registration) and falls back to the last
+  `publishDiagnostics` for servers that only push. Starts the language server if
+  needed and returns the warming response while the workspace loads.
+- **`apply_edits`**: a batch of find-and-replace edits across files in one call. Edits
+  to one file are applied to the running text and written atomically; a failed edit
+  leaves its file untouched and is reported with its reason while other files proceed.
+  The result echoes each changed line with its number and, when the file's language
+  server is already running and Ready or Partial, the diagnostics for every written
+  file. Tool parameters may now be arrays of objects; the schema emits `items: object`.
+- **`replace_content` options `context_lines`, `report_diagnostics` and `min_severity`**
+  give a single edit the same echo and check. Defaults keep the previous output.
+
+### Changed
+- **Edited and created files are reindexed inline in `Partial` as well as `Ready`.** A
+  single-file document symbol request does not need the whole workspace, and on a
+  solution with one unloadable project Roslyn ends `Partial` every time, so the inline
+  refresh never ran and every new or edited file was a cache miss until the next
+  `project index`.
+- **A new file mirrors the BOM of its nearest sibling with the same extension** (own
+  directory, then up to three parents) instead of always being written without one.
+- **The instructions manual** tells agents to list references before changing a
+  signature, batch edits with `apply_edits`, check with diagnostics instead of builds,
+  trust the echoed lines instead of re-reading, and re-activate after a command-line
+  `project index`.
+
 ## [0.4.0]
 
 The symbol cache format changed (version 2): rerun `project index` once after upgrading.

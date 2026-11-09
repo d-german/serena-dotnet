@@ -242,18 +242,21 @@ public abstract class ToolBase : ITool
 
     /// <summary>
     /// Best-effort post-write hook. This must not start a language server:
-    /// it invalidates the written file's cache entry immediately and refreshes
-    /// it only when a matching language server is already warm.
+    /// it drops the written file's stale outline immediately, rebuilds it only
+    /// when a matching language server is already warm, and rebuilds the
+    /// occurrence rows from the text. Null when the file is not indexed source
+    /// or the update failed.
     /// </summary>
-    protected async Task TryNotifyLspAsync(string absolutePath, string content, CancellationToken ct)
+    protected async Task<SymbolCacheUpdate?> TryNotifyLspAsync(string absolutePath, string content, CancellationToken ct)
     {
         try
         {
-            await Context.Agent.UpdateSymbolCacheForWrittenFileAsync(absolutePath, content, ct);
+            return await Context.Agent.UpdateSymbolCacheForWrittenFileAsync(absolutePath, content, ct);
         }
         catch (Exception ex)
         {
             Logger.LogDebug(ex, "Post-write cache/LSP update failed for {Path} (best-effort)", absolutePath);
+            return null;
         }
     }
 
@@ -602,10 +605,11 @@ public abstract class ToolBase : ITool
         type = Nullable.GetUnderlyingType(type) ?? type;
         if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(List<>))
         {
+            var elementType = type.GetGenericArguments()[0];
             prop["type"] = "array";
             prop["items"] = new Dictionary<string, object>
             {
-                ["type"] = MapClrTypeToJsonSchemaType(type.GetGenericArguments()[0]),
+                ["type"] = IsDictionaryType(elementType) ? "object" : MapClrTypeToJsonSchemaType(elementType),
             };
         }
         else
@@ -614,9 +618,19 @@ public abstract class ToolBase : ITool
         }
     }
 
+    private static bool IsDictionaryType(Type type) =>
+        type.IsGenericType && (
+            type.GetGenericTypeDefinition() == typeof(Dictionary<,>)
+            || type.GetGenericTypeDefinition() == typeof(IReadOnlyDictionary<,>)
+            || type.GetGenericTypeDefinition() == typeof(IDictionary<,>));
+
     private static string MapClrTypeToJsonSchemaType(Type type)
     {
         type = Nullable.GetUnderlyingType(type) ?? type;
+        if (IsDictionaryType(type))
+        {
+            return "object";
+        }
         if (type == typeof(string))
         {
             return "string";

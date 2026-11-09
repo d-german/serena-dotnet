@@ -33,6 +33,7 @@ public sealed class SerenaAgent : IAsyncDisposable
     private SerenaAgentMode? _activeMode;
     private readonly List<IPreToolUseHook> _hooks = [];
     private readonly SemaphoreSlim _projectLock = new(1, 1);
+    private Project.ProjectFileWatcher? _fileWatcher;
 
     public SerenaAgent(
         SerenaConfig config,
@@ -166,6 +167,7 @@ public sealed class SerenaAgent : IAsyncDisposable
                 // Always restore the previous state, even if disposal failed.
                 _agent._activeProject = _previousProject;
                 _agent._lsManager = _previousLsManager;
+                _agent.RestoreFileWatcher();
             }
         }
     }
@@ -178,35 +180,53 @@ public sealed class SerenaAgent : IAsyncDisposable
         await _projectLock.WaitAsync(ct);
         try
         {
+            RegisteredProject? projectConfig = null;
+            if (_config.RegisteredProjects.TryGetValue(nameOrPath, out var found))
+            {
+                projectConfig = found;
+            }
+            else
+            {
+                projectConfig = _config.RegisteredProjects.Values.FirstOrDefault(
+                    p => string.Equals(p.Path, nameOrPath, StringComparison.OrdinalIgnoreCase));
+            }
+
+            string projectRoot = projectConfig?.Path ?? nameOrPath;
+            if (!Directory.Exists(projectRoot))
+            {
+                return Result.Failure($"Project path not found: {projectRoot}");
+            }
+
+            // Activating the project that is already active is a reconcile, not a
+            // restart: the caches, the pending outlines and a running Roslyn stay
+            // as they are. A sub-agent activating the project its parent works in
+            // must not reset the parent's state.
+            if (_activeProject is not null && _lsManager is not null && IsSameRoot(_activeProject.Root, projectRoot))
+            {
+                IndexReconciliations = ReconcileIndexesWithDisk(_activeProject, _lsManager);
+                if (_fileWatcher is null)
+                {
+                    StartFileWatcher(_activeProject);
+                }
+                _logger.LogInformation("Project already active, index reconciled: {Path}", projectRoot);
+                return Result.Success();
+            }
+
+            StopFileWatcher();
             if (_lsManager is not null)
             {
                 await _lsManager.DisposeAsync();
             }
 
-        RegisteredProject? projectConfig = null;
-        if (_config.RegisteredProjects.TryGetValue(nameOrPath, out var found))
-        {
-            projectConfig = found;
-        }
-        else
-        {
-            projectConfig = _config.RegisteredProjects.Values.FirstOrDefault(
-                p => string.Equals(p.Path, nameOrPath, StringComparison.OrdinalIgnoreCase));
-        }
+            _activeProject = new SerenaProject(projectRoot, _loggerFactory.CreateLogger<SerenaProject>(), projectConfig);
+            _lsManager = new Project.LanguageServerManager(
+                projectRoot,
+                _lsRegistry,
+                _loggerFactory);
 
-        string projectRoot = projectConfig?.Path ?? nameOrPath;
-        if (!Directory.Exists(projectRoot))
-        {
-            return Result.Failure($"Project path not found: {projectRoot}");
-        }
-
-        _activeProject = new SerenaProject(projectRoot, _loggerFactory.CreateLogger<SerenaProject>(), projectConfig);
-        _lsManager = new Project.LanguageServerManager(
-            projectRoot,
-            _lsRegistry,
-            _loggerFactory);
-
-        _logger.LogInformation("Activated project: {Path}", projectRoot);
+            _logger.LogInformation("Activated project: {Path}", projectRoot);
+            IndexReconciliations = ReconcileIndexesWithDisk(_activeProject, _lsManager);
+            StartFileWatcher(_activeProject);
             return Result.Success();
         }
         finally
@@ -214,6 +234,110 @@ public sealed class SerenaAgent : IAsyncDisposable
             _projectLock.Release();
         }
     }
+
+    private static bool IsSameRoot(string a, string b) =>
+        string.Equals(
+            Path.TrimEndingDirectorySeparator(Path.GetFullPath(a)),
+            Path.TrimEndingDirectorySeparator(Path.GetFullPath(b)),
+            StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// What activation did to each language's on-disk index: files deleted
+    /// since the index was built are dropped, files changed or created by
+    /// other tools get fresh occurrence rows. Empty when no index exists.
+    /// </summary>
+    public IReadOnlyDictionary<Language, CacheReconciliation> IndexReconciliations { get; private set; } =
+        new Dictionary<Language, CacheReconciliation>();
+
+    /// <summary>
+    /// Files are gathered only when at least one language has an index, so a
+    /// project that was never indexed pays nothing at activation.
+    /// </summary>
+    private IReadOnlyDictionary<Language, CacheReconciliation> ReconcileIndexesWithDisk(
+        SerenaProject project, Project.LanguageServerManager lsManager)
+    {
+        var results = new Dictionary<Language, CacheReconciliation>();
+        try
+        {
+            var languages = project.GetConfiguredLanguages() is { Count: > 0 } configured
+                ? configured
+                : [Language.CSharp, Language.TypeScript];
+            var indexed = languages.Where(l => lsManager.GetOrLoadSymbolCache(l) is not null).ToList();
+            if (indexed.Count == 0)
+            {
+                return results;
+            }
+
+            var grouped = Project.ProjectIndexer.GroupFilesByLanguage(project.GatherSourceFiles(), project);
+            foreach (var language in indexed)
+            {
+                var files = grouped.GetValueOrDefault(language) ?? [];
+                var result = lsManager.ReconcileSymbolCache(
+                    language, files.Select(file => Path.Combine(project.Root, file)));
+                if (result is not null)
+                {
+                    results[language] = result;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Index reconciliation at activation failed; the index is used as is");
+        }
+        return results;
+    }
+
+    /// <summary>
+    /// Watches the active project for files written by anything other than
+    /// serena's own tools, so they reach the index as they land instead of at
+    /// the next activation. Only a project with an index has one.
+    /// </summary>
+    private void StartFileWatcher(SerenaProject project)
+    {
+        if (IndexReconciliations.Count == 0)
+        {
+            return;
+        }
+        try
+        {
+            _fileWatcher = new Project.ProjectFileWatcher(
+                project,
+                () => _lsManager,
+                () => Task.Run(() =>
+                {
+                    if (_lsManager is { } manager)
+                    {
+                        ReconcileIndexesWithDisk(project, manager);
+                    }
+                }),
+                IndexReconciliations.Keys,
+                _loggerFactory.CreateLogger<Project.ProjectFileWatcher>());
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not watch {Root} for external changes; the index refreshes at the next activation", project.Root);
+        }
+    }
+
+    private void StopFileWatcher()
+    {
+        _fileWatcher?.Dispose();
+        _fileWatcher = null;
+    }
+
+    private void RestoreFileWatcher()
+    {
+        StopFileWatcher();
+        if (_activeProject is not null && _lsManager is not null)
+        {
+            IndexReconciliations = ReconcileIndexesWithDisk(_activeProject, _lsManager);
+            StartFileWatcher(_activeProject);
+        }
+    }
+
+    internal Project.ProjectFileWatcher? FileWatcher => _fileWatcher;
+
+    internal Project.LanguageServerManager? LanguageServerManager => _lsManager;
 
     /// <summary>
     /// Gets or starts a language server for a given file.
@@ -247,6 +371,31 @@ public sealed class SerenaAgent : IAsyncDisposable
     }
 
     /// <summary>
+    /// The language server already running for a file's language, or null.
+    /// Never starts a server, so edit tools can report diagnostics when Roslyn
+    /// happens to be warm without paying a cold start when it is not.
+    /// </summary>
+    public Lsp.Client.LspClient? TryGetRunningLanguageServer(string filePath)
+    {
+        if (_lsManager is null)
+        {
+            return null;
+        }
+
+        var language = LanguageExtensions.FromFileExtension(Path.GetExtension(filePath));
+        if (language is null)
+        {
+            return null;
+        }
+        if (_activeProject is not null && !_activeProject.IsLanguageEnabled(language.Value))
+        {
+            return null;
+        }
+
+        return _lsManager.TryGetRunningClient(language.Value);
+    }
+
+    /// <summary>
     /// Builds language-server-specific settings, injecting per-project context
     /// (e.g., C# solution scope from <c>csharp.scope.solutions</c> in project.yml
     /// or the <c>set_active_solution</c> tool).
@@ -276,10 +425,10 @@ public sealed class SerenaAgent : IAsyncDisposable
     }
 
     /// <summary>
-    /// Restarts the running language server for the given language so the next
-    /// request picks up updated startup-time settings (notably the C# solution
-    /// scope). No-op when the server isn't running. Symbol caches are flushed
-    /// to disk and reloaded on next start.
+    /// Restarts the running language server for the given language with the
+    /// project's current startup-time settings (notably the C# solution scope),
+    /// so it comes back Loading and warms up in the background. No-op when the
+    /// server isn't running.
     /// </summary>
     public Task RestartLanguageServerAsync(Language language, CancellationToken ct = default)
     {
@@ -287,8 +436,14 @@ public sealed class SerenaAgent : IAsyncDisposable
         {
             return Task.CompletedTask;
         }
-        return _lsManager.RestartAsync(language, ct);
+        return _lsManager.RestartAsync(language, BuildLsSettings(language), ct);
     }
+
+    /// <summary>Files whose outline an edit dropped and the server has not rebuilt yet.</summary>
+    public int PendingOutlineCount(Language language) => _lsManager?.PendingOutlineCount(language) ?? 0;
+
+    /// <summary>Why the last background outline rebuild failed, or null.</summary>
+    public string? LastOutlineFailure(Language language) => _lsManager?.LastOutlineFailure(language);
 
     /// <summary>
     /// Returns the workspace-load readiness state for the given language.
@@ -329,31 +484,34 @@ public sealed class SerenaAgent : IAsyncDisposable
 
     /// <summary>
     /// Records a file write without starting a language server. The active
-    /// project's symbol cache is invalidated for the file immediately, and
-    /// refreshed only when the matching language server is already warm.
+    /// project's symbol cache drops the file's stale outline immediately,
+    /// rebuilds it only when the matching language server is already warm,
+    /// and rebuilds the occurrence rows from the text either way. Null when
+    /// the file is not source of an enabled language or no project is active.
     /// </summary>
-    public Task UpdateSymbolCacheForWrittenFileAsync(
+    public async Task<SymbolCacheUpdate?> UpdateSymbolCacheForWrittenFileAsync(
         string absolutePath,
         string content,
         CancellationToken ct = default)
     {
         if (_lsManager is null)
         {
-            return Task.CompletedTask;
+            return null;
         }
 
         var language = LanguageExtensions.FromFileExtension(Path.GetExtension(absolutePath));
         if (language is null)
         {
-            return Task.CompletedTask;
+            return null;
         }
 
         if (_activeProject is not null && !_activeProject.IsLanguageEnabled(language.Value))
         {
-            return Task.CompletedTask;
+            return null;
         }
 
-        return _lsManager.UpdateSymbolCacheForWrittenFileAsync(language.Value, absolutePath, content, ct);
+        return await _lsManager.UpdateSymbolCacheForWrittenFileAsync(language.Value, absolutePath, content, ct)
+            .ConfigureAwait(false);
     }
 
     /// <summary>
@@ -444,6 +602,7 @@ public sealed class SerenaAgent : IAsyncDisposable
         await _projectLock.WaitAsync();
         try
         {
+            var runningLanguages = _lsManager?.RunningClients.Keys.ToList() ?? [];
             if (_lsManager is not null)
             {
                 await _lsManager.DisposeAsync();
@@ -456,6 +615,21 @@ public sealed class SerenaAgent : IAsyncDisposable
                     _lsRegistry,
                     _loggerFactory);
                 _logger.LogInformation("Language server manager has been reset");
+
+                // A restart that leaves the server NotStarted makes every later edit
+                // skip its outline refresh until something else starts the server.
+                // Start again what was running; warmup continues in the background.
+                foreach (var language in runningLanguages)
+                {
+                    try
+                    {
+                        await _lsManager.GetOrStartAsync(language, BuildLsSettings(language)).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to start {Language} language server after reset", language);
+                    }
+                }
             }
             else
             {
@@ -509,6 +683,7 @@ public sealed class SerenaAgent : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        StopFileWatcher();
         if (_lsManager is not null)
         {
             await _lsManager.DisposeAsync();

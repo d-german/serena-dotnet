@@ -139,7 +139,7 @@ public class MemoriesManagerExtensionTests : IDisposable
 public class DiFix_SingleAgentTests
 {
     [Fact]
-    public void BuildToolRegistry_Returns26Tools()
+    public void BuildToolRegistry_Returns41Tools()
     {
         var loggerFactory = NullLoggerFactory.Instance;
         var config = new SerenaConfig(NullLogger<SerenaConfig>.Instance);
@@ -148,7 +148,7 @@ public class DiFix_SingleAgentTests
 
         var registry = Serena.Mcp.Program.BuildToolRegistry(agent, loggerFactory);
 
-        Assert.Equal(38, registry.All.Count);
+        Assert.Equal(41, registry.All.Count);
     }
 
     [Fact]
@@ -163,7 +163,7 @@ public class DiFix_SingleAgentTests
         agent.SetToolRegistry(registry);
 
         // Agent.Tools should not throw (registry is set)
-        Assert.Equal(38, agent.Tools.All.Count);
+        Assert.Equal(41, agent.Tools.All.Count);
     }
 
     [Fact]

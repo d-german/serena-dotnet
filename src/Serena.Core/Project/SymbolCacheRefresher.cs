@@ -18,6 +18,18 @@ namespace Serena.Core.Project;
 public delegate Task<bool> ReindexFileDelegate(string absolutePath, CancellationToken ct);
 
 /// <summary>
+/// What a single-file reindex did. <see cref="Reason"/> is set when the cache was
+/// not updated, so the caller can log or report why rather than guess.
+/// </summary>
+public sealed record ReindexOutcome(bool Updated, string? Reason = null)
+{
+    public static readonly ReindexOutcome Done = new(true);
+}
+
+/// <summary>A reindexer that says why it failed.</summary>
+public delegate Task<ReindexOutcome> ReindexFileDetailedDelegate(string absolutePath, CancellationToken ct);
+
+/// <summary>
 /// Detects and refreshes stale entries in a <see cref="SymbolCache{T}"/> on demand.
 /// Debounces concurrent calls so rapid-fire tool invocations don't repeatedly stat
 /// the same large set of files. Reindexing is bounded; if too many files are stale
@@ -31,12 +43,15 @@ public sealed class SymbolCacheRefresher
     /// <summary>Maximum number of stale files to reindex inline.</summary>
     public const int MaxInlineReindex = 10;
 
-    /// <summary>Per-file LSP timeout for re-indexing.</summary>
-    private static readonly TimeSpan FileTimeout = TimeSpan.FromSeconds(10);
+    /// <summary>
+    /// Per-file LSP timeout for the inline stale scan, which runs on the agent's
+    /// request path and must stay short.
+    /// </summary>
+    public static readonly TimeSpan FileTimeout = TimeSpan.FromSeconds(10);
 
     private readonly string _projectRoot;
     private readonly SymbolCache<UnifiedSymbolInformation[]> _cache;
-    private readonly ReindexFileDelegate _reindex;
+    private readonly ReindexFileDetailedDelegate _reindex;
     private readonly ILogger _logger;
 
     private long _lastScanTicks;
@@ -47,6 +62,18 @@ public sealed class SymbolCacheRefresher
         SymbolCache<UnifiedSymbolInformation[]> cache,
         ReindexFileDelegate reindex,
         ILogger logger)
+        : this(projectRoot, cache,
+            async (path, ct) => await reindex(path, ct).ConfigureAwait(false) ? ReindexOutcome.Done : new ReindexOutcome(false),
+            logger)
+    {
+    }
+
+    // Private so a lambda that only throws still binds to the public constructor unambiguously.
+    private SymbolCacheRefresher(
+        string projectRoot,
+        SymbolCache<UnifiedSymbolInformation[]> cache,
+        ReindexFileDetailedDelegate reindex,
+        ILogger logger)
     {
         _projectRoot = projectRoot;
         _cache = cache;
@@ -55,17 +82,21 @@ public sealed class SymbolCacheRefresher
     }
 
     /// <summary>
-    /// Convenience factory that wires a default LSP-backed reindexer.
+    /// Convenience factory that wires a default LSP-backed reindexer. The timeout
+    /// defaults to <see cref="FileTimeout"/>; a background caller that is not on
+    /// the agent's request path can afford a longer one.
     /// </summary>
     public static SymbolCacheRefresher ForLspClient(
         string projectRoot,
         SymbolCache<UnifiedSymbolInformation[]> cache,
         LspClient lsp,
-        ILogger logger)
+        ILogger logger,
+        TimeSpan? fileTimeout = null)
     {
+        var timeout = fileTimeout ?? FileTimeout;
         return new SymbolCacheRefresher(
             projectRoot, cache,
-            (path, ct) => DefaultLspReindexAsync(cache, lsp, path, logger, ct),
+            (path, ct) => DefaultLspReindexAsync(cache, lsp, path, logger, timeout, ct),
             logger);
     }
 
@@ -115,7 +146,7 @@ public sealed class SymbolCacheRefresher
                 {
                     break;
                 }
-                if (await _reindex(path, ct))
+                if ((await _reindex(path, ct)).Updated)
                 {
                     reindexed++;
                 }
@@ -138,16 +169,23 @@ public sealed class SymbolCacheRefresher
     /// broad stale-file scans. Intended for edit tools that already know the
     /// file they changed.
     /// </summary>
-    public async Task<bool> RefreshFileAsync(string absolutePath, CancellationToken ct)
+    public async Task<bool> RefreshFileAsync(string absolutePath, CancellationToken ct) =>
+        (await RefreshFileDetailedAsync(absolutePath, ct).ConfigureAwait(false)).Updated;
+
+    /// <summary>
+    /// Like <see cref="RefreshFileAsync"/>, with the reason when the outline was
+    /// not rebuilt. Never throws.
+    /// </summary>
+    public async Task<ReindexOutcome> RefreshFileDetailedAsync(string absolutePath, CancellationToken ct)
     {
         try
         {
-            return await ReindexFileAsync(absolutePath, ct);
+            return await _reindex(absolutePath, ct).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Auto-reindex failed for {Path}", absolutePath);
-            return false;
+            return new ReindexOutcome(false, $"{ex.GetType().Name}: {ex.Message}");
         }
     }
 
@@ -206,42 +244,38 @@ public sealed class SymbolCacheRefresher
         return [.. stale];
     }
 
-    private async Task<bool> ReindexFileAsync(string absolutePath, CancellationToken ct)
-    {
-        return await _reindex(absolutePath, ct);
-    }
-
-    private static async Task<bool> DefaultLspReindexAsync(
+    private static async Task<ReindexOutcome> DefaultLspReindexAsync(
         SymbolCache<UnifiedSymbolInformation[]> cache,
         LspClient lsp,
         string absolutePath,
         ILogger logger,
+        TimeSpan timeout,
         CancellationToken ct)
     {
         // File deleted since last index: drop from cache.
         if (!File.Exists(absolutePath))
         {
             cache.Remove(absolutePath);
-            return true;
+            return ReindexOutcome.Done;
         }
 
         string fingerprint = CacheFingerprint.ForFile(absolutePath);
         if (fingerprint.Length == 0)
         {
-            return false;
+            return new ReindexOutcome(false, "file unreadable");
         }
 
         try
         {
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            cts.CancelAfter(FileTimeout);
+            cts.CancelAfter(timeout);
 
             await lsp.OpenFileAsync(absolutePath);
             try
             {
                 var symbols = await FrameworkConditionalSymbols.RequestAsync(lsp, absolutePath, cts.Token);
                 cache.Set(absolutePath, fingerprint, symbols.ToArray());
-                return true;
+                return ReindexOutcome.Done;
             }
             finally
             {
@@ -249,15 +283,19 @@ public sealed class SymbolCacheRefresher
                 catch { /* best-effort */ }
             }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
             logger.LogDebug("Auto-reindex timed out for {Path}", absolutePath);
-            return false;
+            return new ReindexOutcome(false, $"document symbol request timed out after {timeout.TotalSeconds:0}s");
+        }
+        catch (OperationCanceledException)
+        {
+            return new ReindexOutcome(false, "cancelled");
         }
         catch (Exception ex)
         {
             logger.LogDebug(ex, "Auto-reindex failed for {Path}", absolutePath);
-            return false;
+            return new ReindexOutcome(false, $"{ex.GetType().Name}: {ex.Message}");
         }
     }
 }

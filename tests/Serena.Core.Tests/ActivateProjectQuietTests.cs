@@ -63,7 +63,7 @@ public class ActivateProjectQuietTests : IDisposable
         output.Should().NotContain("Onboarding: performed");
         output.Should().NotContain("Onboarding: NOT performed");
         // "Available memories:" header MUST still appear because there is one.
-        output.Should().Contain("Available memories:");
+        output.Should().Contain("Available memories");
         output.Should().Contain("project_overview");
     }
 }

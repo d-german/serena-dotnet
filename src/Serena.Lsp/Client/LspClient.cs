@@ -44,6 +44,16 @@ public sealed class LspClient : IAsyncDisposable
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _documentLocks = new(StringComparer.OrdinalIgnoreCase);
     private int _crossFileRefsReady; // 0 = not ready, 1 = ready; use Interlocked for thread safety
 
+    // Push-model diagnostics, retained per document URI so a diagnostics
+    // request can fall back to the last publish when the server does not
+    // answer pull requests. ReceivedTicks lets a caller wait for a publish
+    // that postdates its own document sync.
+    private sealed record PublishedDiagnostics(IReadOnlyList<FileDiagnostic> Items, long ReceivedTicks);
+    private readonly ConcurrentDictionary<string, PublishedDiagnostics> _publishedDiagnostics =
+        new(StringComparer.OrdinalIgnoreCase);
+    private int _pullDiagnosticsRegistered; // set when the server registers textDocument/diagnostic dynamically
+    private static readonly TimeSpan PublishDiagnosticsWait = TimeSpan.FromSeconds(3);
+
     public Language Language => _language;
     public string ProjectRoot => _projectRoot;
     public bool IsRunning => _process.IsRunning;
@@ -156,7 +166,13 @@ public sealed class LspClient : IAsyncDisposable
             (JToken? _) => { RecordActivity(); return (object?)null; });
 
         rpc.AddLocalRpcMethod("client/registerCapability",
-            (JToken? token) => { RecordActivity(); _logger.LogDebug("client/registerCapability: {Token}", token?.ToString(Newtonsoft.Json.Formatting.None)); return (object?)null; });
+            (JToken? token) =>
+            {
+                RecordActivity();
+                _logger.LogDebug("client/registerCapability: {Token}", token?.ToString(Newtonsoft.Json.Formatting.None));
+                RecordDynamicRegistrations(token);
+                return (object?)null;
+            });
 
         rpc.AddLocalRpcMethod("window/logMessage",
             (JToken? token) => { RecordActivity(); CaptureWorkspaceWarning(token); return (object?)null; });
@@ -178,7 +194,116 @@ public sealed class LspClient : IAsyncDisposable
             (JToken? _) => { RecordActivity(); return (object?)null; });
 
         rpc.AddLocalRpcMethod("textDocument/publishDiagnostics",
-            (JToken? _) => { RecordActivity(); return (object?)null; });
+            (JToken? token) => { RecordActivity(); RecordPublishedDiagnostics(token); return (object?)null; });
+    }
+
+    private void RecordDynamicRegistrations(JToken? token)
+    {
+        if (token is not JObject obj || obj["registrations"] is not JArray registrations)
+        {
+            return;
+        }
+
+        foreach (var registration in registrations)
+        {
+            if (string.Equals(registration.Value<string>("method"), LspMethods.TextDocumentDiagnostic, StringComparison.Ordinal))
+            {
+                Interlocked.Exchange(ref _pullDiagnosticsRegistered, 1);
+            }
+        }
+    }
+
+    private void RecordPublishedDiagnostics(JToken? token)
+    {
+        if (token is not JObject obj)
+        {
+            return;
+        }
+
+        string? uri = obj.Value<string>("uri");
+        if (string.IsNullOrEmpty(uri))
+        {
+            return;
+        }
+
+        var items = DiagnosticParser.ParseItems(obj["diagnostics"]);
+        _publishedDiagnostics[uri] = new PublishedDiagnostics(items, Stopwatch.GetTimestamp());
+    }
+
+    /// <summary>
+    /// True when the server answers pull-model <c>textDocument/diagnostic</c>
+    /// requests, either by static capability or by dynamic registration.
+    /// </summary>
+    public bool SupportsPullDiagnostics =>
+        _serverCapabilities?.DiagnosticProvider is not null
+        || Volatile.Read(ref _pullDiagnosticsRegistered) == 1;
+
+    /// <summary>
+    /// The last diagnostics the server published for a document, or null if
+    /// it never published any.
+    /// </summary>
+    public IReadOnlyList<FileDiagnostic>? GetPublishedDiagnostics(string absolutePath) =>
+        _publishedDiagnostics.TryGetValue(PathToUri(absolutePath), out var published) ? published.Items : null;
+
+    /// <summary>
+    /// Makes sure the server holds the document's current on-disk text: opens
+    /// it when it is not open, or sends a didChange when the server's copy is
+    /// behind the file. Edit tools that bypass the buffer (direct file writes)
+    /// are reconciled here.
+    /// </summary>
+    public async Task EnsureDocumentSyncedAsync(string absolutePath)
+    {
+        string uri = PathToUri(absolutePath);
+        var buffer = _fileBuffers.GetBuffer(uri);
+        if (buffer is null)
+        {
+            await OpenFileAsync(absolutePath).ConfigureAwait(false);
+            return;
+        }
+
+        string current = buffer.Contents;
+        if (!string.Equals(buffer.ServerText, current, StringComparison.Ordinal))
+        {
+            await NotifyFileChangedAsync(absolutePath, current).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Returns the server's diagnostics for one document after syncing its text.
+    /// Uses the pull model when the server supports it; otherwise waits briefly
+    /// for a publishDiagnostics notification that postdates the sync and falls
+    /// back to the last one received.
+    /// </summary>
+    public async Task<IReadOnlyList<FileDiagnostic>> RequestDocumentDiagnosticsAsync(
+        string absolutePath, CancellationToken ct = default)
+    {
+        string uri = PathToUri(absolutePath);
+        long syncedAt = Stopwatch.GetTimestamp();
+        await EnsureDocumentSyncedAsync(absolutePath).ConfigureAwait(false);
+
+        if (SupportsPullDiagnostics)
+        {
+            var report = await _requests.DocumentDiagnosticAsync(
+                new DocumentDiagnosticParams { TextDocument = new TextDocumentIdentifier(uri) }, ct)
+                .ConfigureAwait(false);
+            var pulled = DiagnosticParser.ParsePullReport(report);
+            if (pulled is not null)
+            {
+                return pulled;
+            }
+        }
+
+        var deadline = Stopwatch.GetTimestamp() + (long)(PublishDiagnosticsWait.TotalSeconds * Stopwatch.Frequency);
+        while (Stopwatch.GetTimestamp() < deadline)
+        {
+            if (_publishedDiagnostics.TryGetValue(uri, out var fresh) && fresh.ReceivedTicks >= syncedAt)
+            {
+                return fresh.Items;
+            }
+            await Task.Delay(100, ct).ConfigureAwait(false);
+        }
+
+        return _publishedDiagnostics.TryGetValue(uri, out var last) ? last.Items : [];
     }
 
     private void CaptureWorkspaceWarning(JToken? token)

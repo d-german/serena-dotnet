@@ -1,6 +1,8 @@
 // Workflow Tools - Onboarding and initial instructions
 // Tools for: check_onboarding_performed, onboarding, initial_instructions
 
+using Serena.Core.Project;
+
 using System.Text;
 using Serena.Core.Templates;
 
@@ -17,12 +19,20 @@ public sealed class CheckOnboardingPerformedTool : ToolBase
     protected override Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
     {
         var mm = CreateMemoriesManager();
-        var projectMemories = mm.ListProjectMemories();
+        var allProjectMemories = mm.ListProjectMemories();
+        bool hasOverview = allProjectMemories.Contains(ProjectOverviewBuilder.MemoryName, StringComparer.OrdinalIgnoreCase);
+        // The indexer's generated memories are facts about the project, not an agent's onboarding.
+        var projectMemories = allProjectMemories
+            .Where(m => !m.StartsWith(ProjectOverviewBuilder.GeneratedPrefix, StringComparison.OrdinalIgnoreCase))
+            .ToList();
 
         if (projectMemories.Count == 0)
         {
             return Task.FromResult(
                 "Onboarding has NOT been performed for this project.\n" +
+                (hasOverview
+                    ? $"The generated overview exists: read_memory \"{ProjectOverviewBuilder.MemoryName}\" first, then call the 'onboarding' tool to add what it cannot know.\n"
+                    : "") +
                 "No project memories found. Call the 'onboarding' tool to start learning about the project.");
         }
 
@@ -41,7 +51,7 @@ public sealed class OnboardingTool : ToolBase
     public OnboardingTool(IToolContext context) : base(context) { }
 
     public override string Description =>
-        "Call this tool if onboarding was not performed yet. Returns instructions on how to explore the project.";
+        "Call this tool if onboarding was not performed yet. Returns the steps to learn the project and write its memories in this same turn.";
 
     protected override Task<string> ApplyAsync(IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
     {
@@ -62,38 +72,43 @@ public sealed class OnboardingTool : ToolBase
 
     private static readonly string OnboardingPrompt = """
         ## Project Onboarding Instructions
+        You are onboarding onto a new project. Do every step below in this turn and write the memories before you
+        answer; do not stop to ask whether to write them. Onboarding is complete only when `check_onboarding_performed`
+        lists them.
 
-        You are onboarding onto a new project. Follow these steps to learn about it:
+        ### 0. Read the generated overview first
+        - If `read_memory "generated/project-overview"` succeeds, it already holds the facts: solutions and projects, folders,
+          frameworks, build and test commands, the rules the build enforces, the most depended-on projects, namespaces and the
+          largest types, packages and configuration sections. Do not repeat those facts in your memories and do not edit that
+          memory (every `project index` rewrites it). It holds no domain knowledge, no patterns and no conventions: those are
+          what steps 1 to 4 find and step 5 writes.
 
         ### 1. Explore Project Structure
-        - Use `list_dir` with `relative_path: "."` and `recursive: false` to see the top-level structure
-        - Identify the main source directories, configuration files, and build files
+        - `list_dir` with `relative_path: "."` and `recursive: false`, then the main source folders the overview names.
 
         ### 2. Identify Language & Framework
-        - Look for common configuration files: package.json, *.csproj, pyproject.toml, Cargo.toml, etc.
-        - Determine the primary programming language and framework
+        - Confirm from the project files (*.csproj, package.json, pyproject.toml, Cargo.toml) when the overview does not say.
 
         ### 3. Understand Build & Test
-        - Find and document build commands (e.g., `dotnet build`, `npm run build`, `make`)
-        - Find and document test commands (e.g., `dotnet test`, `npm test`, `pytest`)
-        - Try running them with `execute_shell_command` to verify they work
+        - Record the build and test commands and any project that must be excluded or needs an environment. Run them with
+          `execute_shell_command` only when the overview does not already state them.
 
         ### 4. Explore Key Code
-        - Use `find_file` and `get_symbols_overview` to understand the main modules
-        - Use `find_symbol` to explore important classes and functions
-        - Look at entry points (Main, index, app files)
+        - Read the entry points and the largest types with `get_symbols_overview` and `find_symbol`; note the domain terms,
+          the layering, how errors are returned, how services are registered, how tests are organised and named.
 
-        ### 5. Create Memories
-        Write what you learned using `write_memory`. Create memories for:
-        - **architecture**: High-level project structure and design patterns
-        - **build**: How to build, test, and run the project
-        - **conventions**: Coding conventions, naming patterns, and style guidelines
-        - **dependencies**: Key dependencies and their purpose
-
-        Use descriptive names with "/" for organization (e.g., "architecture/overview", "build/commands").
+        ### 5. Create Memories (required)
+        Write what you learned with `write_memory`, now, in this turn:
+        - **architecture/overview**: what the system is, its modules and how they fit, the main domain types and the patterns
+          the code follows
+        - **build/commands**: how to build, test and run, including exclusions and gotchas
+        - **conventions/code-style**: naming, namespaces, formatting, line endings, test layout and the rules the code follows
+          that the build does not enforce
+        - **dependencies**: key packages and what they are for, when the overview's package list needs explanation
+        Keep each memory short and factual; use "/" in names for organization.
 
         ### 6. Verify Onboarding
-        After creating memories, call `check_onboarding_performed` to confirm completion.
+        Call `check_onboarding_performed` and include its output in your answer.
         """;
 }
 
@@ -209,15 +224,24 @@ public sealed class InitialInstructionsTool : ToolBase
         ### Symbol Navigation
         - `find_symbol` — Find symbols by name path pattern
         - `get_symbols_overview` — High-level view of symbols in a file
-        - `find_referencing_symbols` — Find all references to a symbol
+        - `find_occurrences` — Where an identifier occurs, from the index, in milliseconds and without
+          Roslyn: file, line, enclosing symbol, declaration marker. Textual, so same-named members of
+          unrelated types are all listed. The cheap first answer to "who calls this?"
+        - `find_referencing_symbols` — Resolved references from Roslyn, when names must be disambiguated
 
         ### Code Editing (requires LSP)
         - `replace_symbol_body` — Replace a symbol's implementation
         - `insert_before_symbol` — Insert code before a symbol
         - `insert_after_symbol` — Insert code after a symbol
-        - `replace_content` — Find-and-replace with literal or regex
+        - `replace_content` — Find-and-replace with literal or regex (one edit)
+        - `apply_edits` — A batch of find-and-replace edits across files in one call; echoes the
+          changed lines and, when the language server is warm, each file's diagnostics
         - `rename_symbol` — Rename a symbol across the codebase
         - `safe_delete_symbol` — Delete a symbol if no references exist
+
+        ### Checking (requires LSP)
+        - `get_file_diagnostics` — The language server's compiler and analyzer diagnostics for one
+          file, with one-based positions. Sub-second; use it instead of a build to check an edit
 
         ### Memory System
         - `read_memory` — Read a stored memory
@@ -298,9 +322,19 @@ public sealed class InitialInstructionsTool : ToolBase
 
         1. **Start with overview**: Use `get_symbols_overview` before `find_symbol`
         2. **Use symbolic tools**: Prefer `find_symbol` + `replace_symbol_body` over text-based editing
-        3. **Check references**: Use `find_referencing_symbols` before renaming or deleting
-        4. **Use memories**: Write important project knowledge to memories for persistence
-        5. **Validate changes**: After edits, use `read_file` to verify the result
-        6. **Organize memories**: Use "/" in memory names for topic organization
+        3. **List references before changing a signature**: `find_occurrences` on the member first
+           (instant, from the index), `find_referencing_symbols` when the name is shared by unrelated
+           types and Roslyn must tell them apart, then edit every caller in the same `apply_edits` batch
+        4. **Batch text edits**: Collect every edit to a file, and every file of one change, into one
+           `apply_edits` call. Each tool call is a model turn, and turns are the cost
+        5. **Check with diagnostics, not builds**: After editing, read the diagnostics that
+           `apply_edits` returns, or call `get_file_diagnostics` on each changed file. Build once
+           when the diagnostics are clean, not after every edit
+        6. **Use memories**: Write important project knowledge to memories for persistence
+        7. **Trust the echoed lines**: `apply_edits` and `replace_content` (with `context_lines`)
+           show the result; do not `read_file` the same lines again
+        8. **Organize memories**: Use "/" in memory names for topic organization
+        9. **After `project index` on the command line**, call `activate_project` again so the running
+           server reloads the rebuilt cache
         """;
 }

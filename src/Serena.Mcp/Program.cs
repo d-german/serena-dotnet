@@ -152,6 +152,9 @@ public static class Program
         registry.Register(new InsertBeforeSymbolTool(context));
         registry.Register(new InsertAfterSymbolTool(context));
         registry.Register(new ReplaceContentTool(context));
+        registry.Register(new ApplyEditsTool(context));
+        registry.Register(new GetFileDiagnosticsTool(context));
+        registry.Register(new FindOccurrencesTool(context));
         registry.Register(new RenameSymbolTool(context));
         registry.Register(new SafeDeleteSymbolTool(context));
         registry.Register(new RenameMemoryTool(context));

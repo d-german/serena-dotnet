@@ -111,6 +111,13 @@ public static class ClientCapabilitiesFactory
                     tagSupport = new { valueSet = new[] { 1, 2 } },
                     versionSupport = true,
                 },
+                // Pull diagnostics (LSP 3.17). Roslyn registers textDocument/diagnostic
+                // dynamically only when the client advertises this capability.
+                diagnostic = new
+                {
+                    dynamicRegistration = true,
+                    relatedDocumentSupport = false,
+                },
             },
             workspace = new
             {

@@ -427,7 +427,218 @@ public static class Program
         var projectCommand = new Command("project") { Description = "Project management commands" };
         projectCommand.Add(CreateProjectIndexCommand());
         projectCommand.Add(CreateProjectIndexFileCommand());
+        projectCommand.Add(CreateProjectInventoryCommand());
+        projectCommand.Add(CreateProjectOverviewCommand());
+        projectCommand.Add(CreateProjectParserCheckCommand());
         return projectCommand;
+    }
+
+    /// <summary>
+    /// Compares the parser's outline of every indexed C# file with the outline stored in the
+    /// index (built by whichever path produced it), so a server-built index can be checked
+    /// against the parser before trusting the parser alone.
+    /// </summary>
+    private static Command CreateProjectParserCheckCommand()
+    {
+        var pathArg = new Argument<string>("path")
+        {
+            Description = "Path to the project directory (default: current directory)",
+            Arity = ArgumentArity.ZeroOrOne
+        };
+        var maxOption = new Option<int>("--max")
+        {
+            Description = "Files with differences to list",
+            DefaultValueFactory = _ => 20
+        };
+
+        var command = new Command("parser-check")
+        {
+            Description = "Compare the parser's C# outlines with the outlines stored in the index and report the differences"
+        };
+        command.Add(pathArg);
+        command.Add(maxOption);
+
+        command.SetAction(parseResult =>
+        {
+            string projectRoot = Path.GetFullPath(parseResult.GetValue(pathArg) ?? ".");
+            int max = parseResult.GetValue(maxOption);
+            var manager = new LanguageServerManager(projectRoot, new LanguageServerRegistry(), NullLoggerFactory.Instance);
+            var cache = manager.GetOrLoadSymbolCache(Language.CSharp);
+            if (cache is null)
+            {
+                Console.Error.WriteLine("No C# index under .serena/cache/csharp.");
+                return 1;
+            }
+
+            // The server returns a flat SymbolInformation list for files inside a loaded project and a
+            // hierarchy for the rest, so two views are compared: the leaves (name and kind, what the
+            // symbol-name index and find_symbol match on) and, where the index is hierarchical, the paths.
+            int files = 0, sameLeaves = 0, samePaths = 0, hierarchical = 0, missingOnDisk = 0;
+            var differences = new List<(string Path, int OnlyStored, int OnlyParser, string Sample)>();
+            foreach (string key in cache.Keys)
+            {
+                if (!File.Exists(key))
+                {
+                    missingOnDisk++;
+                    continue;
+                }
+                var stored = cache.TryGetUnchecked(key);
+                if (stored is null)
+                {
+                    continue;
+                }
+                files++;
+                var parsed = Serena.Lsp.Outline.CSharpSyntaxOutline.Build(key, File.ReadAllText(key));
+                var storedLeaves = Leaves(stored).ToHashSet(StringComparer.Ordinal);
+                var parserLeaves = Leaves(parsed).ToHashSet(StringComparer.Ordinal);
+                bool isHierarchical = stored.Any(s => s.Kind == Serena.Lsp.Protocol.Types.SymbolKind.Namespace || s.Children.Count > 0);
+                if (isHierarchical)
+                {
+                    hierarchical++;
+                    if (NamePaths(stored).ToHashSet(StringComparer.Ordinal).SetEquals(NamePaths(parsed)))
+                    {
+                        samePaths++;
+                    }
+                }
+                if (storedLeaves.SetEquals(parserLeaves))
+                {
+                    sameLeaves++;
+                    continue;
+                }
+                var onlyStored = storedLeaves.Except(parserLeaves).OrderBy(x => x, StringComparer.Ordinal).ToList();
+                var onlyParser = parserLeaves.Except(storedLeaves).OrderBy(x => x, StringComparer.Ordinal).ToList();
+                string sample = string.Join(" | ", onlyStored.Take(2).Select(s => "index " + s).Concat(onlyParser.Take(2).Select(s => "parser " + s)));
+                differences.Add((Path.GetRelativePath(projectRoot, key), onlyStored.Count, onlyParser.Count, sample));
+            }
+
+            Console.WriteLine($"{files} indexed C# file(s) compared by leaf name and kind: {sameLeaves} identical, {differences.Count} differ" +
+                              (missingOnDisk > 0 ? $", {missingOnDisk} no longer on disk" : ""));
+            Console.WriteLine($"{hierarchical} stored as a hierarchy (the rest are the server's flat list): {samePaths} with identical name paths");
+            foreach (var (path, onlyStored, onlyParser, sample) in differences
+                         .OrderByDescending(d => d.OnlyStored + d.OnlyParser).Take(max))
+            {
+                Console.WriteLine($"  {path}: {onlyStored} only in index, {onlyParser} only in parser; {sample}");
+            }
+            return 0;
+
+            // Paths are built by walking the tree: a deserialized symbol has no Parent link, so NamePath would be the leaf alone.
+            static IEnumerable<string> NamePaths(IEnumerable<Serena.Lsp.Client.UnifiedSymbolInformation> symbols, string prefix = "")
+            {
+                foreach (var symbol in symbols)
+                {
+                    string name = symbol.OverloadIndex is { } index ? $"{symbol.Name}[{index}]" : symbol.Name;
+                    string path = prefix.Length == 0 ? name : $"{prefix}/{name}";
+                    yield return $"{path} [{(int)symbol.Kind}]";
+                    foreach (string child in NamePaths(symbol.Children, path))
+                    {
+                        yield return child;
+                    }
+                }
+            }
+
+            static IEnumerable<string> Leaves(IEnumerable<Serena.Lsp.Client.UnifiedSymbolInformation> symbols)
+            {
+                foreach (var symbol in symbols)
+                {
+                    if (symbol.Kind != Serena.Lsp.Protocol.Types.SymbolKind.Namespace)
+                    {
+                        yield return $"{symbol.Name} [{(int)symbol.Kind}]";
+                    }
+                    foreach (string child in Leaves(symbol.Children))
+                    {
+                        yield return child;
+                    }
+                }
+            }
+        });
+
+        return command;
+    }
+
+    private static Command CreateProjectOverviewCommand()
+    {
+        var pathArg = new Argument<string>("path")
+        {
+            Description = "Path to the project directory (default: current directory)",
+            Arity = ArgumentArity.ZeroOrOne
+        };
+
+        var command = new Command("overview")
+        {
+            Description = "Rewrite the generated project overview memory (generated/project-overview) from the existing " +
+                          "index and inventory, without a language server. `project index` writes it as well."
+        };
+        command.Add(pathArg);
+
+        command.SetAction(parseResult =>
+        {
+            string projectRoot = Path.GetFullPath(parseResult.GetValue(pathArg) ?? ".");
+            if (!Directory.Exists(projectRoot))
+            {
+                Console.Error.WriteLine($"Error: Directory not found: {projectRoot}");
+                return 1;
+            }
+
+            var loggerFactory = NullLoggerFactory.Instance;
+            var project = new SerenaProject(projectRoot, NullLogger<SerenaProject>.Instance);
+            var manager = new LanguageServerManager(projectRoot, new LanguageServerRegistry(), loggerFactory);
+            var caches = new Dictionary<Language, Serena.Lsp.Caching.SymbolCache<Serena.Lsp.Client.UnifiedSymbolInformation[]>>();
+            string cacheRoot = Path.Combine(projectRoot, ".serena", "cache");
+            if (Directory.Exists(cacheRoot))
+            {
+                foreach (string dir in Directory.EnumerateDirectories(cacheRoot))
+                {
+                    if (Enum.TryParse<Language>(Path.GetFileName(dir), ignoreCase: true, out var language)
+                        && manager.GetOrLoadSymbolCache(language) is { } cache)
+                    {
+                        caches[language] = cache;
+                    }
+                }
+            }
+
+            string written = ProjectOverviewBuilder.Write(project, caches, loggerFactory);
+            Console.WriteLine($"Overview written to {written}");
+            Console.WriteLine($"Agents read it with read_memory \"{ProjectOverviewBuilder.MemoryName}\"; it is shown by activate_project.");
+            return 0;
+        });
+
+        return command;
+    }
+
+    private static Command CreateProjectInventoryCommand()
+    {
+        var pathArg = new Argument<string>("path")
+        {
+            Description = "Path to the project directory (default: current directory)",
+            Arity = ArgumentArity.ZeroOrOne
+        };
+
+        var command = new Command("inventory")
+        {
+            Description = "Rebuild only the inventory of package and project references and configuration keys " +
+                          "(seconds, no language server). `project index` builds it as well."
+        };
+        command.Add(pathArg);
+
+        command.SetAction(parseResult =>
+        {
+            string projectRoot = Path.GetFullPath(parseResult.GetValue(pathArg) ?? ".");
+            if (!Directory.Exists(projectRoot))
+            {
+                Console.Error.WriteLine($"Error: Directory not found: {projectRoot}");
+                return 1;
+            }
+
+            var project = new SerenaProject(projectRoot, NullLogger<SerenaProject>.Instance);
+            int rows = ProjectIndexer.BuildInventory(
+                projectRoot, project, Microsoft.Extensions.Logging.Abstractions.NullLoggerFactory.Instance);
+            Console.WriteLine(
+                $"Inventory: {rows} row(s) written to " +
+                Path.Combine(projectRoot, ".serena", "cache", Serena.Lsp.Caching.ProjectInventory.FileName));
+            return 0;
+        });
+
+        return command;
     }
 
     private static Command CreateProjectIndexCommand()
@@ -470,9 +681,16 @@ public static class Program
                 "slows down with every file"
         };
 
+        var serverOption = new Option<bool>("--server")
+        {
+            Description = "Outline C# through the Roslyn language server instead of the parser (the pre-0.7 behaviour: " +
+                          "loads the workspace, minutes instead of seconds). Other languages always use their server."
+        };
+
         var command = new Command("index")
         {
-            Description = "Index a project by requesting symbols for all source files"
+            Description = "Index a project: outline every source file (C# by the parser, no language server), capture " +
+                          "identifier occurrences, build the inventory and write the project overview memory"
         };
         command.Add(pathArg);
         command.Add(logLevelOption);
@@ -480,6 +698,7 @@ public static class Program
         command.Add(solutionOption);
         command.Add(parallelismOption);
         command.Add(restartEveryOption);
+        command.Add(serverOption);
 
         command.SetAction(async (ParseResult parseResult, CancellationToken ct) =>
         {
@@ -490,6 +709,7 @@ public static class Program
             string? rawSolution = parseResult.GetValue(solutionOption);
             int parallelism = parseResult.GetValue(parallelismOption);
             int? restartEvery = parseResult.GetValue(restartEveryOption);
+            bool useServer = parseResult.GetValue(serverOption);
 
             if (!Directory.Exists(projectRoot))
             {
@@ -554,6 +774,7 @@ public static class Program
                 solutionPaths: solutionPaths,
                 maxParallelism: parallelism,
                 restartEvery: restartEvery,
+                useLanguageServer: useServer,
                 ct: ct);
 
             Console.WriteLine();

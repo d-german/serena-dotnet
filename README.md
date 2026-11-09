@@ -167,9 +167,10 @@ For production use, scope `.serena/project.yml` to the languages you actually wa
 | Category | Tools |
 |---|---|
 | **File** | `read_file`, `create_text_file`, `list_dir`, `find_file`, `search_for_pattern` |
-| **Symbol (read)** | `find_symbol`, `get_symbols_overview`, `find_referencing_symbols` |
+| **Symbol (read)** | `find_symbol`, `get_symbols_overview`, `find_referencing_symbols`, `find_occurrences` |
 | **Symbol (edit)** | `replace_symbol_body`, `insert_before_symbol`, `insert_after_symbol`, `rename_symbol`, `safe_delete_symbol` |
-| **Line edit** | `insert_at_line`, `replace_lines`, `delete_lines`, `replace_content` |
+| **Line edit** | `insert_at_line`, `replace_lines`, `delete_lines`, `replace_content`, `apply_edits` |
+| **Checking** | `get_file_diagnostics` |
 | **Memory** | `read_memory`, `write_memory`, `list_memories`, `delete_memory`, `rename_memory`, `edit_memory` |
 | **Project** | `activate_project`, `get_current_config`, `set_active_solution`, `clear_active_solution`, `remove_project`, `list_queryable_projects`, `query_project` |
 | **Language server** | `warm_language_server`, `get_language_server_status`, `restart_language_server`, `kill_language_server` |
@@ -184,9 +185,45 @@ For production use, scope `.serena/project.yml` to the languages you actually wa
 
 ### File-write behavior
 
-All edit tools (`replace_content`, `create_text_file`, `insert_at_line`, `replace_lines`, `delete_lines`, and the symbol-edit tools) preserve the target file's existing UTF-8 BOM state. Files without a BOM stay BOM-free; files with one keep theirs. Newly created files are written without a BOM.
+All edit tools (`replace_content`, `apply_edits`, `create_text_file`, `insert_at_line`, `replace_lines`, `delete_lines`, and the symbol-edit tools) preserve the target file's existing UTF-8 BOM state. Files without a BOM stay BOM-free; files with one keep theirs. A newly created file mirrors the BOM state of the nearest existing file with the same extension (its own directory first, then up to three parent directories), so a new `.cs` file in a BOM-everywhere repository gets a BOM; with no such neighbour it is written without one.
 
-After every successful write, Serena removes that file's symbol-cache entry and records the invalidation in `.serena/cache/<lang>/invalidated-paths.txt`. Plain file/text writes do **not** cold-start the language server. If the matching language server is already running and Ready, Serena refreshes just that one file; otherwise the stale entry stays removed until the next index or semantic lookup can rebuild it. This prevents old symbols from leaking through cache-backed project-wide searches after edits.
+After every successful write, Serena removes that file's symbol-cache entry and records the invalidation in `.serena/cache/<lang>/invalidated-paths.txt`. Plain file/text writes do **not** cold-start the language server. If the matching language server is already running and Ready or Partial, Serena refreshes just that one file; otherwise the stale entry stays removed until the next index or semantic lookup can rebuild it. This prevents old symbols from leaking through cache-backed project-wide searches after edits.
+
+### Read-only queries without a language server: the `symbols` CLI
+
+A prebuilt index can be queried from the command line with nothing running: no MCP server, no Roslyn. This is how a read-only troubleshooting agent uses Serena.
+
+```bash
+serena-dotnet symbols stats --project <root>                 # what the index holds
+serena-dotnet symbols find <Name> [--substring --path <dir>]  # declarations by name
+serena-dotnet symbols overview <file>                        # a file's members with lines
+serena-dotnet symbols references <Name> [--path <dir>]       # where an identifier occurs
+serena-dotnet symbols config <term>                          # configuration keys and MSBuild properties
+serena-dotnet symbols packages <term>                        # package and project references
+serena-dotnet project inventory <root>                       # rebuild only the inventory (seconds)
+```
+
+`symbols references` reads an occurrence table that `project index` builds beside each file's outline: every PascalCase identifier of three characters or more, with comments masked and string literals kept, mapped to its lines. Each hit shows the file, the one-based line, the enclosing symbol from the stored outline, a `[declaration]` marker and the source line. It is textual, so two unrelated members with the same name are both listed; it answers in milliseconds and needs no language server. The same lookup is available to agents as the `find_occurrences` tool. After an edit the rows are rebuilt from the file's text even when no language server is running (the outline, which needs Roslyn, waits for the next index or cache miss), so references never go stale on a file an agent just changed. The cache persists itself two seconds after the last change and on shutdown, a query leaves out files that no longer exist and drops their rows, and `activate_project` reconciles the index with the files on disk (deleted files dropped, changed and new files re-captured from text) before the first tool call. An edit drops the file's outline and rebuilds it in the background whenever the language server is Ready or Partial, retrying up to three times and reporting the pending count in `get_language_server_status`; the edit tool never waits for Roslyn. An index built before 0.6.0 opens unchanged and reports "no occurrence table" until the next `project index`.
+
+`symbols config` and `symbols packages` read an inventory of non-code facts: PackageReference, ProjectReference and selected properties from `.csproj`, `.props` and `.targets` files, and flattened colon-path keys (`Thumbnail:Queue:Name`) from `appsettings*.json`, `*settings*.json`, `*.Octodeploy.json`, `ocelot*.json`, `launchSettings.json` and `web.config`. Values are truncated to 120 characters and redacted when the key names a password, secret, token, API key, connection string or credential, because an index can be bundled and shared.
+
+### Batch edits and diagnostics
+
+`apply_edits` takes an array of `{relative_path, needle, repl, mode?, allow_multiple_occurrences?}` edits and applies them in one call. Edits to one file are applied to the running text and written atomically: if any edit to a file fails, that file is left untouched and the failure is reported with its reason while the other files still proceed. The result echoes every changed line with its number, so the agent does not re-read the file, and, when the file's language server is already running and Ready or Partial, the server's diagnostics for each written file. `replace_content` accepts the same `context_lines` and `report_diagnostics` options for a single edit.
+
+### Outlines without a language server
+
+Since 0.7.0 every C# outline comes from the Roslyn parser, not from the Roslyn language server: `project index`, `project index-file`, the refresh after each edit, the reconciliation at `activate_project` and a cache miss in `find_symbol` or `get_symbols_overview` parse the file in process, in milliseconds, with no workspace load and no Loading or Partial state. The outline has the same shape the server returns, so an index built either way serves the same tools; `project parser-check <path>` compares the two for every indexed file. `project index --server` keeps the server path for comparison. The semantic tools (`find_referencing_symbols`, `rename_symbol`, `get_file_diagnostics`) still start the server on first use; nothing else does.
+
+### Keeping the index current
+
+Since 0.7.1 an active project with an index is watched: a file created, changed or deleted by anything other than serena's own tools (an agent's built-in create tool, git, dotnet format) is outlined or dropped as it lands, a folder that moves in has its files outlined, and a vanished folder prunes the index, so nothing waits for the next activation. Activating the project that is already active reconciles the index and returns without restarting anything, which lets a sub-agent activate the project its parent works in. Every edit tool holds the file's lease from read to write, so edits issued in parallel on one file apply in sequence; unrelated files never wait on each other.
+
+### Generated project overview
+
+`project index` ends by writing `.serena/memories/generated/project-overview.md` from the index and the inventory: solutions, projects and their folders, target frameworks, the build and test commands and test frameworks, the `.editorconfig` rules the build enforces as errors, the measured line-ending and BOM convention, the most depended-on projects, namespaces and the largest types per language, packages grouped by what they are, and the configuration sections. Every line is a count, a name, a path or a version; nothing is interpreted. `project overview <path>` rewrites it from the existing index in seconds. `activate_project` points agents at it with `read_memory "generated/project-overview"`, and the `onboarding` tool tells them to read it first and write only what it cannot know: what the core domain is, which patterns the code follows, and why. Generated memories live under `generated/` and do not count as onboarding.
+
+`get_file_diagnostics` returns the language server's compiler and analyzer diagnostics for one file as `severity CODE (line,col): message` lines with one-based positions. Roslyn answers through pull diagnostics (`textDocument/diagnostic`); servers that only push get the last published set after a short wait. It starts the language server if needed and returns the structured warming response while the workspace is loading, like the symbol tools. A missing `using`, an unbalanced brace or a caller broken by a signature change shows up here in well under a second, where a build takes tens of seconds.
 
 ## Performance on Large Repos
 

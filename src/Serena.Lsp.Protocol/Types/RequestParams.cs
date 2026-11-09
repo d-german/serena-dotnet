@@ -333,6 +333,21 @@ public sealed record PublishDiagnosticsParams
     public required IReadOnlyList<Diagnostic> Diagnostics { get; init; }
 }
 
+/// <summary>
+/// Parameters of a pull-model <c>textDocument/diagnostic</c> request (LSP 3.17).
+/// </summary>
+public sealed record DocumentDiagnosticParams
+{
+    [JsonPropertyName("textDocument")]
+    public required TextDocumentIdentifier TextDocument { get; init; }
+
+    [JsonPropertyName("identifier")]
+    public string? Identifier { get; init; }
+
+    [JsonPropertyName("previousResultId")]
+    public string? PreviousResultId { get; init; }
+}
+
 // ---- Configuration ----
 
 public sealed record DidChangeConfigurationParams

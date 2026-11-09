@@ -597,6 +597,25 @@ public sealed class SerenaProject
         IgnoreFilter.IsIgnored(relativePath);
 
     /// <summary>
+    /// True when the project's exclude_patterns rule the path out of indexing,
+    /// the same globs <see cref="GatherSourceFiles"/> applies.
+    /// </summary>
+    public bool IsExcludedByPattern(string relativePath)
+    {
+        var patterns = _config.ExcludePatterns;
+        if (patterns is null || patterns.Count == 0)
+        {
+            return false;
+        }
+        var matcher = new Matcher();
+        foreach (string pattern in patterns)
+        {
+            matcher.AddInclude(pattern);
+        }
+        return matcher.Match(relativePath).HasMatches;
+    }
+
+    /// <summary>
     /// Environment variable that overrides the YAML-configured C# solution scope.
     /// Value: semicolon-separated list of paths (absolute or relative to project root).
     /// </summary>

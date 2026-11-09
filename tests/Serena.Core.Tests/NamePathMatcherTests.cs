@@ -56,4 +56,30 @@ public class NamePathMatcherTests
         var matcher = NamePathMatcher.Parse(pattern);
         matcher.Matches(namePath, substringMatching: true).Should().Be(expected);
     }
+
+    // 0.7.1: a pattern without type parameters names every arity of the symbol;
+    // a pattern with them still names exactly that one.
+    [Theory]
+    [InlineData("ToResult", "ResultExtensions/ToResult<T>", true)]
+    [InlineData("ToResult", "ResultExtensions/ToResult<T, E>", true)]
+    [InlineData("ToResult[1]", "ResultExtensions/ToResult<T>[1]", true)]
+    [InlineData("ToResult[0]", "ResultExtensions/ToResult<T>[1]", false)]
+    [InlineData("ToResult<T>", "ResultExtensions/ToResult<T>", true)]
+    [InlineData("ToResult<T>", "ResultExtensions/ToResult<T, E>", false)]
+    [InlineData("Result", "Shared.Types/Result<T>", true)]
+    [InlineData("Result", "Shared.Types/ResultHelpers", false)]
+    [InlineData("/Shared.Types/Result", "Shared.Types/Result<T>", true)]
+    public void TypeParameters_AreOptionalInThePattern(string pattern, string namePath, bool expected)
+    {
+        var matcher = NamePathMatcher.Parse(pattern);
+        matcher.Matches(namePath).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("toresult", "ResultExtensions/ToResult<T>", true)]
+    [InlineData("ToResult<T>", "ResultExtensions/ToResult<T, E>", false)]
+    public void LeafNameMatching_IgnoresArityWhenThePatternHasNone(string leaf, string namePath, bool expected)
+    {
+        NamePathMatcher.ForLeafName(leaf).Matches(namePath).Should().Be(expected);
+    }
 }

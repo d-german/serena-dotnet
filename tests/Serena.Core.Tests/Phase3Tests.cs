@@ -555,7 +555,7 @@ public class NewlyRegisteredToolTests
 public class ToolRegistrationCountTests
 {
     [Fact]
-    public void BuildToolRegistry_Returns38Tools()
+    public void BuildToolRegistry_Returns41Tools()
     {
         var loggerFactory = NullLoggerFactory.Instance;
         var config = new SerenaConfig(NullLogger<SerenaConfig>.Instance);
@@ -564,7 +564,9 @@ public class ToolRegistrationCountTests
 
         var registry = Serena.Mcp.Program.BuildToolRegistry(agent, loggerFactory);
 
-        Assert.Equal(38, registry.All.Count);
+        Assert.Equal(41, registry.All.Count);
+        Assert.NotNull(registry.Get("apply_edits"));
+        Assert.NotNull(registry.Get("get_file_diagnostics"));
     }
 
     [Fact]

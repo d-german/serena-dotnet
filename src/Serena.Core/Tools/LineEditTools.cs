@@ -38,6 +38,7 @@ public sealed class DeleteLinesTool : ToolBase
 
         string absolutePath = ResolvePath(relativePath);
         var encoding = GetProjectEncoding();
+        await using var lease = await Serena.Core.Editor.FileWriteGate.LockAsync(absolutePath, ct);
         string rawContent = await File.ReadAllTextAsync(absolutePath, encoding, ct);
         var (lines, lineEnding, hasTrailingNewline) = LineEditHelpers.ParseFileContent(rawContent);
 
@@ -63,7 +64,7 @@ public sealed class DeleteLinesTool : ToolBase
         Logger.LogDebug("DeleteLines: {Path} - After: {LineCount} lines (deleted {DeleteCount})",
             relativePath, lines.Count, deleteCount);
 
-        await Serena.Core.Editor.FileWriteGate.WriteAllTextAsync(absolutePath, newContent, encoding, ct);
+        await lease.WriteAllTextAsync(newContent, encoding, ct);
         await TryNotifyLspAsync(absolutePath, newContent, ct);
 
         return $"Deleted {deleteCount} line(s) ({startLine}-{startLine + deleteCount - 1}) from {relativePath}.";
@@ -99,6 +100,7 @@ public sealed class InsertAtLineTool : ToolBase
 
         string absolutePath = ResolvePath(relativePath);
         var encoding = GetProjectEncoding();
+        await using var lease = await Serena.Core.Editor.FileWriteGate.LockAsync(absolutePath, ct);
         string rawContent = await File.ReadAllTextAsync(absolutePath, encoding, ct);
         var (lines, lineEnding, hasTrailingNewline) = LineEditHelpers.ParseFileContent(rawContent);
 
@@ -119,7 +121,7 @@ public sealed class InsertAtLineTool : ToolBase
         Logger.LogDebug("InsertAtLine: {Path} - After: {LineCount} lines",
             relativePath, lines.Count);
 
-        await Serena.Core.Editor.FileWriteGate.WriteAllTextAsync(absolutePath, newContent, encoding, ct);
+        await lease.WriteAllTextAsync(newContent, encoding, ct);
         await TryNotifyLspAsync(absolutePath, newContent, ct);
 
         return $"Inserted {newLines.Length} line(s) at line {insertIndex + 1} in {relativePath}.";
@@ -162,6 +164,7 @@ public sealed class ReplaceLinesTool : ToolBase
 
         string absolutePath = ResolvePath(relativePath);
         var encoding = GetProjectEncoding();
+        await using var lease = await Serena.Core.Editor.FileWriteGate.LockAsync(absolutePath, ct);
         string rawContent = await File.ReadAllTextAsync(absolutePath, encoding, ct);
         var (lines, lineEnding, hasTrailingNewline) = LineEditHelpers.ParseFileContent(rawContent);
 
@@ -190,7 +193,7 @@ public sealed class ReplaceLinesTool : ToolBase
         Logger.LogDebug("ReplaceLines: {Path} - After: {LineCount} lines (delta: {Delta})",
             relativePath, lines.Count, replacementLines.Length - deleteCount);
 
-        await Serena.Core.Editor.FileWriteGate.WriteAllTextAsync(absolutePath, fileContent, encoding, ct);
+        await lease.WriteAllTextAsync(fileContent, encoding, ct);
         await TryNotifyLspAsync(absolutePath, fileContent, ct);
 
         return $"Replaced {deleteCount} line(s) with {replacementLines.Length} line(s) at lines {startLine}-{startLine + deleteCount - 1} in {relativePath}.";

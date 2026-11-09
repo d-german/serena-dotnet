@@ -93,7 +93,8 @@ public sealed class CreateTextFileTool : ToolBase
             Directory.CreateDirectory(dir);
         }
 
-        await Serena.Core.Editor.FileWriteGate.WriteAllTextAsync(fullPath, content, GetProjectEncoding(), ct);
+        await using var lease = await Serena.Core.Editor.FileWriteGate.LockAsync(fullPath, ct);
+        await lease.WriteAllTextAsync(content, GetProjectEncoding(), ct);
         await TryNotifyLspAsync(fullPath, content, ct);
 
         string answer = $"File created: {relativePath}.";

@@ -474,6 +474,15 @@ public sealed class LanguageServerSymbolRetriever : ISymbolRetriever
                     .ToList();
             }
 
+            // A C# file needs no server for its outline: the parser answers the miss and fills the cache.
+            if (LanguageExtensions.FromFileExtension(Path.GetExtension(absolutePath)) == Language.CSharp
+                && Serena.Lsp.Outline.CSharpSyntaxOutline.TryBuild(absolutePath) is { } parsed)
+            {
+                _logger.LogDebug("Symbol cache MISS for {Path}; outlined by the parser", relativePath);
+                _symbolCache.Set(absolutePath, fingerprint, [.. parsed]);
+                return [.. parsed.Select(s => LanguageServerSymbol.FromUnified(s, relativePath))];
+            }
+
             _logger.LogInformation("Symbol cache MISS for {Path} — falling through to LSP", relativePath);
         }
 
@@ -1024,7 +1033,9 @@ public sealed class NamePathMatcher
             // case-insensitively. Strip overload [N] suffix on both sides.
             string targetLeaf = StripIndex(targetSegments[^1]);
             string patternLeaf = StripIndex(_segments[0]);
-            return string.Equals(targetLeaf, patternLeaf, StringComparison.OrdinalIgnoreCase);
+            return string.Equals(targetLeaf, patternLeaf, StringComparison.OrdinalIgnoreCase)
+                || (!SymbolNames.HasTypeParameters(patternLeaf)
+                    && string.Equals(SymbolNames.StripTypeParameters(targetLeaf), patternLeaf, StringComparison.OrdinalIgnoreCase));
         }
 
         if (_isAbsolute)
@@ -1078,7 +1089,23 @@ public sealed class NamePathMatcher
             return targetBase.Contains(patternBase, StringComparison.Ordinal);
         }
 
-        return string.Equals(pattern, target, StringComparison.Ordinal);
+        if (string.Equals(pattern, target, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        // "ToResult" names "ToResult<T>" when the pattern carries no type parameters of its own.
+        return !SymbolNames.HasTypeParameters(StripIndex(pattern))
+            && string.Equals(pattern, StripTypeParameters(target), StringComparison.Ordinal);
+    }
+
+    /// <summary>"ToResult&lt;T&gt;[1]" becomes "ToResult[1]".</summary>
+    private static string StripTypeParameters(string segment)
+    {
+        int bracket = segment.IndexOf('[');
+        string name = bracket >= 0 ? segment[..bracket] : segment;
+        string suffix = bracket >= 0 ? segment[bracket..] : string.Empty;
+        return SymbolNames.StripTypeParameters(name) + suffix;
     }
 
     private static string StripIndex(string segment)

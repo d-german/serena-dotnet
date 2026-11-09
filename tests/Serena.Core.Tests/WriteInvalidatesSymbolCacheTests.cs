@@ -65,10 +65,7 @@ public sealed class WriteInvalidatesSymbolCacheTests : IDisposable
         _agent.GetLanguageServerReadyState(Language.CSharp).State
             .Should().Be(WorkspaceReadyState.NotStarted, "file writes must not cold-start Roslyn just to update cache state");
 
-        var cache = _agent.GetSymbolCache(Language.CSharp);
-        cache.Should().NotBeNull();
-        cache!.TryGetUnchecked(absolutePath)
-            .Should().BeNull("the cached symbols for the old file contents must be removed after the write");
+        AssertCacheEntryRefreshedWithoutStartingLanguageServer(absolutePath, absentSymbol: "Before", presentSymbol: "After");
     }
 
     [Fact]
@@ -90,9 +87,7 @@ public sealed class WriteInvalidatesSymbolCacheTests : IDisposable
         _agent.GetLanguageServerReadyState(Language.CSharp).State
             .Should().Be(WorkspaceReadyState.NotStarted);
 
-        var cache = _agent.GetSymbolCache(Language.CSharp);
-        cache.Should().NotBeNull();
-        cache!.TryGetUnchecked(absolutePath).Should().BeNull();
+        AssertCacheEntryRefreshedWithoutStartingLanguageServer(absolutePath, absentSymbol: "OldName", presentSymbol: "NewName");
     }
 
     [Fact]
@@ -112,7 +107,7 @@ public sealed class WriteInvalidatesSymbolCacheTests : IDisposable
         });
 
         result.Should().Contain("Deleted");
-        AssertCacheEntryRemovedWithoutStartingLanguageServer(absolutePath);
+        AssertCacheEntryRefreshedWithoutStartingLanguageServer(absolutePath);
     }
 
     [Fact]
@@ -132,7 +127,7 @@ public sealed class WriteInvalidatesSymbolCacheTests : IDisposable
         });
 
         result.Should().Contain("Inserted");
-        AssertCacheEntryRemovedWithoutStartingLanguageServer(absolutePath);
+        AssertCacheEntryRefreshedWithoutStartingLanguageServer(absolutePath);
     }
 
     [Fact]
@@ -153,7 +148,7 @@ public sealed class WriteInvalidatesSymbolCacheTests : IDisposable
         });
 
         result.Should().Contain("Replaced");
-        AssertCacheEntryRemovedWithoutStartingLanguageServer(absolutePath);
+        AssertCacheEntryRefreshedWithoutStartingLanguageServer(absolutePath);
     }
 
     [Theory]
@@ -178,7 +173,7 @@ public sealed class WriteInvalidatesSymbolCacheTests : IDisposable
         result.Should().Match(s =>
             s.Contains("Replaced", StringComparison.OrdinalIgnoreCase) ||
             s.Contains("Inserted", StringComparison.OrdinalIgnoreCase));
-        AssertCacheEntryRemovedWithoutStartingLanguageServer(absolutePath);
+        AssertCacheEntryRefreshedWithoutStartingLanguageServer(absolutePath);
     }
 
     [Fact]
@@ -225,16 +220,31 @@ public sealed class WriteInvalidatesSymbolCacheTests : IDisposable
         untouchedResult.Should().Contain(untouchedRelativePath);
     }
 
-    private void AssertCacheEntryRemovedWithoutStartingLanguageServer(string absolutePath)
+    // Since 0.7 a C# write rebuilds the outline from the parser at once, so the entry is not removed but
+    // replaced: it must be fresh for the file now on disk, and the old symbol must be gone when the edit removed it.
+    private void AssertCacheEntryRefreshedWithoutStartingLanguageServer(
+        string absolutePath, string? absentSymbol = null, string? presentSymbol = null)
     {
         _agent.GetLanguageServerReadyState(Language.CSharp).State
-            .Should().Be(WorkspaceReadyState.NotStarted, "write-time cache invalidation must not require a Roslyn cold start");
+            .Should().Be(WorkspaceReadyState.NotStarted, "write-time cache refresh must not require a Roslyn cold start");
 
         var cache = _agent.GetSymbolCache(Language.CSharp);
         cache.Should().NotBeNull();
-        cache!.TryGetUnchecked(absolutePath)
-            .Should().BeNull("the edited file's old symbol entry is stale after a write");
+        var outline = cache!.TryGet(absolutePath, CacheFingerprint.ForFile(absolutePath));
+        outline.Should().NotBeNull("the parser rebuilt the outline from the written text, so the entry matches the file on disk");
+        var names = Flatten(outline!).Select(s => s.Name).ToList();
+        if (absentSymbol is not null)
+        {
+            names.Should().NotContain(absentSymbol, "the stale outline must not survive the write");
+        }
+        if (presentSymbol is not null)
+        {
+            names.Should().Contain(presentSymbol);
+        }
     }
+
+    private static IEnumerable<UnifiedSymbolInformation> Flatten(IEnumerable<UnifiedSymbolInformation> symbols) =>
+        symbols.SelectMany(s => new[] { s }.Concat(Flatten(s.Children)));
 
     private void WriteCacheEntry(string absolutePath, string symbolName)
     {

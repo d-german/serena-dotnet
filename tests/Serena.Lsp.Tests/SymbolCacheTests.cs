@@ -52,9 +52,10 @@ public class SymbolCacheTests
     }
 
     [Fact]
-    public void Remove_PersistsInvalidationWithoutFullCacheSave()
+    public async Task Remove_IsPersistedByWriteBehind_WithoutAnExplicitSave()
     {
         string cacheDir = Path.Combine(Path.GetTempPath(), $"serena_test_{Guid.NewGuid():N}");
+        SymbolCache<string>? writer = null;
         try
         {
             var cache1 = new SymbolCache<string>(cacheDir, "test.json", 1, NullLogger.Instance);
@@ -62,16 +63,48 @@ public class SymbolCacheTests
             cache1.Set("b.cs", "fp2", "still valid");
             cache1.Save();
 
-            var cache2 = new SymbolCache<string>(cacheDir, "test.json", 1, NullLogger.Instance);
-            cache2.Load().Should().BeTrue();
-            cache2.Remove("a.cs");
+            writer = new SymbolCache<string>(cacheDir, "test.json", 1, NullLogger.Instance, TimeSpan.FromMilliseconds(50));
+            writer.Load().Should().BeTrue();
+            writer.Remove("a.cs");
 
-            var cache3 = new SymbolCache<string>(cacheDir, "test.json", 1, NullLogger.Instance);
-            cache3.Load().Should().BeTrue();
+            bool gone = false;
+            for (int attempt = 0; attempt < 100 && !gone; attempt++)
+            {
+                await Task.Delay(50);
+                var reader = new SymbolCache<string>(cacheDir, "test.json", 1, NullLogger.Instance);
+                reader.Load().Should().BeTrue();
+                gone = reader.TryGetUnchecked("a.cs") is null;
+            }
 
-            cache3.TryGetUnchecked("a.cs").Should().BeNull(
-                "a write must not resurrect stale symbols if the MCP process restarts before the full cache is saved");
-            cache3.TryGet("b.cs", "fp2").Should().Be("still valid");
+            gone.Should().BeTrue(
+                "a write must not resurrect stale symbols if the MCP process ends before anyone calls Save()");
+            var final = new SymbolCache<string>(cacheDir, "test.json", 1, NullLogger.Instance);
+            final.Load().Should().BeTrue();
+            final.TryGet("b.cs", "fp2").Should().Be("still valid");
+        }
+        finally
+        {
+            writer?.Dispose();
+            if (Directory.Exists(cacheDir))
+            {
+                Directory.Delete(cacheDir, true);
+            }
+        }
+    }
+
+    [Fact]
+    public void Dispose_FlushesPendingChanges()
+    {
+        string cacheDir = Path.Combine(Path.GetTempPath(), $"serena_test_{Guid.NewGuid():N}");
+        try
+        {
+            var cache = new SymbolCache<string>(cacheDir, "test.json", 1, NullLogger.Instance, TimeSpan.FromMinutes(10));
+            cache.Set("a.cs", "fp1", "value");
+            cache.Dispose();
+
+            var reopened = new SymbolCache<string>(cacheDir, "test.json", 1, NullLogger.Instance);
+            reopened.Load().Should().BeTrue("Dispose must save before the write-behind delay elapses");
+            reopened.TryGet("a.cs", "fp1").Should().Be("value");
         }
         finally
         {
@@ -350,6 +383,37 @@ public class SymbolCacheTests
         var fp1 = CacheFingerprint.ForContent("hello");
         var fp2 = CacheFingerprint.ForContent("world");
         fp1.Should().NotBe(fp2);
+    }
+
+    [Fact]
+    public void SymbolNameIndex_FindsGenericDeclarations_FromANameWithoutArity()
+    {
+        string cacheDir = Path.Combine(Path.GetTempPath(), $"serena_test_{Guid.NewGuid():N}");
+        try
+        {
+            var cache = new SymbolCache<UnifiedSymbolInformation[]>(
+                cacheDir, "symbols.json", 1, NullLogger.Instance);
+            cache.Set("C:/repo/Result.cs", "fp1", [Symbol("Result<T>", Symbol("ToResult<T>"))]);
+            cache.Set("C:/repo/Helpers.cs", "fp2", [Symbol("ResultHelpers", Symbol("ToResult"))]);
+            cache.Set("C:/repo/Other.cs", "fp3", [Symbol("Other", Symbol("ToResultOrDefault"))]);
+            cache.Save();
+
+            cache.TryGetCandidatePaths("ToResult", substringMatching: false, pathPrefix: null, out var paths).Should().BeTrue();
+            paths.Should().BeEquivalentTo("C:/repo/Result.cs", "C:/repo/Helpers.cs");
+
+            cache.TryGetCandidatePaths("ToResult<T>", substringMatching: false, pathPrefix: null, out var exact).Should().BeTrue();
+            exact.Should().Equal("C:/repo/Result.cs");
+
+            cache.TryGetCandidatePaths("Result", substringMatching: false, pathPrefix: null, out var types).Should().BeTrue();
+            types.Should().Equal("C:/repo/Result.cs");
+        }
+        finally
+        {
+            if (Directory.Exists(cacheDir))
+            {
+                Directory.Delete(cacheDir, true);
+            }
+        }
     }
 
     private static UnifiedSymbolInformation Symbol(

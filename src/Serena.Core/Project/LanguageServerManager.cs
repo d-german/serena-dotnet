@@ -2,12 +2,14 @@
 // Manages language server lifecycle per project
 
 using System.Collections.Concurrent;
+using CSharpFunctionalExtensions;
 using System.Diagnostics;
 using Microsoft.Extensions.Logging;
 using Serena.Lsp;
 using Serena.Lsp.Caching;
 using Serena.Lsp.Client;
 using Serena.Lsp.LanguageServers;
+using Serena.Lsp.Outline;
 using Serena.Lsp.Process;
 using Serena.Lsp.Protocol;
 
@@ -24,12 +26,19 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
     // caches built before then must be rebuilt rather than reused by fingerprint.
     internal const int SymbolCacheVersion = 2;
 
+    // Write-behind delay for the symbol caches this manager owns: an edit's
+    // index update reaches disk this long after the last mutation, so a session
+    // that ends without a graceful shutdown loses at most this window.
+    internal static readonly TimeSpan SymbolCacheSaveDelay = TimeSpan.FromSeconds(2);
+
     private readonly ILogger<LanguageServerManager> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly LanguageServerRegistry _registry;
     private readonly string _projectRoot;
     private readonly Dictionary<Language, LspClient> _clients = [];
-    private readonly Dictionary<Language, SymbolCache<UnifiedSymbolInformation[]>> _caches = [];
+    // Read by tool calls and, since 0.7.1, by the project file watcher on its own thread.
+    private readonly ConcurrentDictionary<Language, SymbolCache<UnifiedSymbolInformation[]>> _caches = new();
+    private readonly object _cacheGate = new();
     private readonly ConcurrentDictionary<Language, ReadyStateRecord> _readyStates = new();
     // v1.0.27: per-language CTS owns the lifetime of background warmup
     // (PostStartAsync). Cancelled + disposed in StopAsync/RestartAsync so a
@@ -39,6 +48,27 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
     // v1.0.27: per-language gate so two parallel first-callers don't both
     // race past the TryGetValue check and start two LSP processes.
     private readonly ConcurrentDictionary<Language, SemaphoreSlim> _startGates = new();
+    // The settings each server was last started with, so a restart can start
+    // it again the same way without the caller repeating them.
+    private readonly ConcurrentDictionary<Language, CustomLsSettings?> _lastSettings = new();
+
+    // Files whose outline was dropped by an edit and not yet rebuilt, with the number of
+    // rebuild attempts so far. Drained in the background whenever the server is usable.
+    private readonly ConcurrentDictionary<Language, ConcurrentDictionary<string, int>> _pendingOutlines = new();
+    private readonly ConcurrentDictionary<Language, SemaphoreSlim> _drainGates = new();
+    // The most recent reason an outline rebuild failed, so a status query can show it; the
+    // server's own log is stderr, which an MCP host usually discards.
+    private readonly ConcurrentDictionary<Language, string> _lastOutlineFailure = new();
+    private readonly CancellationTokenSource _lifetime = new();
+
+    /// <summary>A file whose outline fails this many times in a row is given up on until the next index.</summary>
+    internal const int MaxOutlineAttempts = 3;
+
+    /// <summary>
+    /// The background rebuild is off the agent's request path, so it can wait for a
+    /// loaded Roslyn far longer than the inline stale scan.
+    /// </summary>
+    internal static readonly TimeSpan OutlineRefreshTimeout = TimeSpan.FromSeconds(60);
 
     /// <summary>
     /// Mutable internal record so MarkLoading/MarkReady can update a single
@@ -97,6 +127,7 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
             var definition = _registry.Get(language)
                 ?? throw new InvalidOperationException($"No language server registered for {language}");
 
+            _lastSettings[language] = settings;
             var lsSettings = settings ?? new CustomLsSettings();
             // Inject self as the readiness sink so MvpLanguageServers can report
             // workspace-load lifecycle without taking a reverse dep on Serena.Core.
@@ -185,16 +216,15 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
     /// </summary>
     public SymbolCache<UnifiedSymbolInformation[]>? GetOrLoadSymbolCache(Language language)
     {
-        if (_caches.TryGetValue(language, out var existing))
-        {
-            return existing;
-        }
         EnsureSymbolCache(language);
-        var cache = _caches.GetValueOrDefault(language);
+        var cache = _caches[language];
         // EnsureSymbolCache always inserts an entry but Load() may have returned
-        // false if the cache file doesn't exist. Report null in that case so the
-        // caller can fall through to LSP without thinking the cache is empty-but-real.
-        if (cache is not null && cache.Count == 0)
+        // false because no cache file existed at the time. The file can appear
+        // later (a `project index` run in another process), so an empty cache
+        // tries to load again before being reported as absent, and null means
+        // the caller can fall through to LSP without thinking the cache is
+        // empty-but-real.
+        if (cache.Count == 0 && !cache.Load())
         {
             return null;
         }
@@ -203,13 +233,14 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
 
     /// <summary>
     /// Records that a source file was changed by an edit tool without starting
-    /// a language server. Stale cache entries are removed from the in-memory
-    /// cache immediately so later cache-backed searches do not return old
-    /// symbols; persistence is handled by the normal cache-save lifecycle.
-    /// If the language server is already running and ready, the changed file
-    /// is reindexed in place.
+    /// a language server. The stale outline is dropped at once so cache-backed
+    /// searches never return old symbols, the occurrence rows are rebuilt from
+    /// the text at once, and the outline is queued for a background rebuild:
+    /// started now when the server is running and Ready or Partial, deferred
+    /// until it is otherwise. The cache persists every change itself
+    /// (write-behind). The edit tool returns without waiting for Roslyn.
     /// </summary>
-    public async Task UpdateSymbolCacheForWrittenFileAsync(
+    public async Task<SymbolCacheUpdate> UpdateSymbolCacheForWrittenFileAsync(
         Language language,
         string absolutePath,
         string content,
@@ -217,29 +248,236 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
     {
         EnsureSymbolCache(language);
         var cache = _caches[language];
+        var state = GetReadyState(language).State;
+
+        if (_clients.TryGetValue(language, out var client) && client.IsRunning)
+        {
+            await TryNotifyRunningLanguageServerAsync(client, absolutePath, content).ConfigureAwait(false);
+        }
+
+        // C# needs no server for its outline: the parser rebuilds it from the written text now.
+        if (language == Language.CSharp && File.Exists(absolutePath))
+        {
+            string fingerprint = CacheFingerprint.ForFile(absolutePath);
+            cache.Set(absolutePath, fingerprint, [.. CSharpSyntaxOutline.Build(absolutePath, content)]);
+            return new SymbolCacheUpdate(OutlineRefresh.Refreshed, true, state);
+        }
 
         cache.Remove(absolutePath);
-
-        if (!_clients.TryGetValue(language, out var client) || !client.IsRunning)
-        {
-            return;
-        }
-
-        await TryNotifyRunningLanguageServerAsync(client, absolutePath, content).ConfigureAwait(false);
-
-        if (GetReadyState(language).State != WorkspaceReadyState.Ready)
-        {
-            return;
-        }
+        bool occurrencesRefreshed = cache.Occurrences.Capture(absolutePath);
 
         if (!File.Exists(absolutePath))
         {
+            return new SymbolCacheUpdate(OutlineRefresh.Started, occurrencesRefreshed, state);
+        }
+
+        PendingOutlines(language)[SymbolCacheKeys.Normalize(absolutePath)] = 0;
+
+        if (client is { IsRunning: true } && CanRefreshInline(state))
+        {
+            StartOutlineRefresh(language);
+            return new SymbolCacheUpdate(OutlineRefresh.Started, occurrencesRefreshed, state);
+        }
+
+        return new SymbolCacheUpdate(OutlineRefresh.Deferred, occurrencesRefreshed, state);
+    }
+
+    /// <summary>
+    /// The cache for a language, created and loaded on first use. Unlike
+    /// <see cref="GetOrLoadSymbolCache"/> it never returns null, so an indexer
+    /// that builds outlines without a server has somewhere to put them.
+    /// </summary>
+    public SymbolCache<UnifiedSymbolInformation[]> GetOrCreateSymbolCache(Language language)
+    {
+        EnsureSymbolCache(language);
+        return _caches[language];
+    }
+
+    /// <summary>Files whose outline is waiting to be rebuilt for a language.</summary>
+    public int PendingOutlineCount(Language language) =>
+        _pendingOutlines.TryGetValue(language, out var pending) ? pending.Count : 0;
+
+    /// <summary>Why the last outline rebuild for a language failed, with its time and file; null when none has.</summary>
+    public string? LastOutlineFailure(Language language) =>
+        _lastOutlineFailure.TryGetValue(language, out var reason) ? reason : null;
+
+    private ConcurrentDictionary<string, int> PendingOutlines(Language language) =>
+        _pendingOutlines.GetOrAdd(language, _ => new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// Kicks off a background drain of the pending outlines when a usable server
+    /// is running. Fire-and-forget; a drain already in progress is left alone,
+    /// and it re-checks the pending set before finishing, so a file queued while
+    /// it ran is not missed.
+    /// </summary>
+    private void StartOutlineRefresh(Language language)
+    {
+        if (PendingOutlineCount(language) == 0
+            || !_clients.TryGetValue(language, out var client) || !client.IsRunning
+            || !CanRefreshInline(GetReadyState(language).State)
+            || !_caches.TryGetValue(language, out var cache))
+        {
             return;
         }
 
-        var refresher = SymbolCacheRefresher.ForLspClient(_projectRoot, cache, client, _logger);
-        await refresher.RefreshFileAsync(absolutePath, ct).ConfigureAwait(false);
+        var refresher = SymbolCacheRefresher.ForLspClient(_projectRoot, cache, client, _logger, OutlineRefreshTimeout);
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await DrainPendingOutlinesAsync(language, refresher.RefreshFileDetailedAsync, _lifetime.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+            {
+                // Shutting down.
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Background outline refresh for {Language} failed", language);
+            }
+        }, _lifetime.Token);
     }
+
+    /// <summary>
+    /// Rebuilds the outline of every pending file with <paramref name="reindex"/>,
+    /// one language at a time. A file that changed while its outline was being
+    /// requested is dropped from the cache again and stays pending; a file that
+    /// fails <see cref="MaxOutlineAttempts"/> times is given up on with a warning.
+    /// Returns the number of outlines rebuilt.
+    /// </summary>
+    internal async Task<int> DrainPendingOutlinesAsync(
+        Language language,
+        ReindexFileDetailedDelegate reindex,
+        CancellationToken ct)
+    {
+        var gate = _drainGates.GetOrAdd(language, _ => new SemaphoreSlim(1, 1));
+        if (!await gate.WaitAsync(0, ct).ConfigureAwait(false))
+        {
+            return 0;
+        }
+
+        int rebuilt = 0;
+        try
+        {
+            var pending = PendingOutlines(language);
+            EnsureSymbolCache(language);
+            var cache = _caches[language];
+
+            // Files queued while this pass runs are picked up by the next pass of the loop.
+            while (!ct.IsCancellationRequested)
+            {
+                var batch = pending.Keys.ToList();
+                if (batch.Count == 0)
+                {
+                    break;
+                }
+                foreach (string path in batch)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    if (!File.Exists(path))
+                    {
+                        cache.Remove(path);
+                        pending.TryRemove(path, out _);
+                        continue;
+                    }
+
+                    string before = CacheFingerprint.ForFile(path);
+                    var outcome = await reindex(path, ct).ConfigureAwait(false);
+                    if (outcome.Updated)
+                    {
+                        if (CacheFingerprint.ForFile(path) != before)
+                        {
+                            // Edited again while Roslyn was answering: the outline we stored
+                            // describes the old text. Drop it and try again on the next pass.
+                            cache.Remove(path);
+                            cache.Occurrences.Capture(path);
+                            continue;
+                        }
+                        pending.TryRemove(path, out _);
+                        rebuilt++;
+                        continue;
+                    }
+
+                    int attempts = pending.AddOrUpdate(path, 1, (_, previous) => previous + 1);
+                    _lastOutlineFailure[language] =
+                        $"{DateTimeOffset.Now:HH:mm:ss} {Path.GetFileName(path)}: {outcome.Reason ?? "no reason given"} (attempt {attempts} of {MaxOutlineAttempts})";
+                    if (attempts >= MaxOutlineAttempts)
+                    {
+                        pending.TryRemove(path, out _);
+                        _logger.LogWarning(
+                            "Outline for {Path} not rebuilt after {Attempts} attempts ({Reason}); it returns with the next index",
+                            path, attempts, outcome.Reason ?? "no reason given");
+                    }
+                    else
+                    {
+                        _logger.LogInformation(
+                            "Outline for {Path} not rebuilt ({Reason}); attempt {Attempt} of {Max}, retrying when the server is next usable",
+                            path, outcome.Reason ?? "no reason given", attempts, MaxOutlineAttempts);
+                    }
+                }
+
+                // Everything left failed this pass; wait for the next trigger rather than spinning.
+                if (pending.Keys.All(key => pending.TryGetValue(key, out int tries) && tries > 0))
+                {
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            gate.Release();
+        }
+
+        if (rebuilt > 0)
+        {
+            _logger.LogInformation("Rebuilt {Count} outline(s) for {Language} in the background", rebuilt, language);
+        }
+        return rebuilt;
+    }
+
+    /// <summary>
+    /// Brings a language's on-disk index in line with the files now present
+    /// (deleted files dropped, changed and new files re-outlined by the parser
+    /// for C#, re-captured from text for the rest) without starting a server.
+    /// Null when the language has no index.
+    /// </summary>
+    public CacheReconciliation? ReconcileSymbolCache(Language language, IEnumerable<string> absolutePaths)
+    {
+        var cache = GetOrLoadSymbolCache(language);
+        if (cache is null)
+        {
+            return null;
+        }
+        Func<string, Maybe<UnifiedSymbolInformation[]>>? rebuild = language == Language.CSharp
+            ? path => CSharpSyntaxOutline.TryBuild(path) is { } outline
+                ? Maybe.From<UnifiedSymbolInformation[]>([.. outline])
+                : Maybe<UnifiedSymbolInformation[]>.None
+            : null;
+        var result = cache.ReconcileWithDisk(absolutePaths, rebuild);
+        if (result.Removed > 0 || result.Refreshed > 0)
+        {
+            _logger.LogInformation(
+                "Reconciled {Language} index with disk: {Known} known, {Removed} removed, {Refreshed} refreshed from text",
+                language, result.Known, result.Removed, result.Refreshed);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// A single-file reindex only needs the server to answer document symbol
+    /// requests, which it does in both Ready and Partial. Gating on Ready alone
+    /// left every edited or created file out of the cache for the whole
+    /// session on solutions where one project fails to load (Roslyn then ends
+    /// Partial every time).
+    /// </summary>
+    internal static bool CanRefreshInline(WorkspaceReadyState state) =>
+        state is WorkspaceReadyState.Ready or WorkspaceReadyState.Partial;
+
+    /// <summary>
+    /// The running client for a language, or null. Never starts a server.
+    /// </summary>
+    public LspClient? TryGetRunningClient(Language language) =>
+        _clients.TryGetValue(language, out var client) && client.IsRunning ? client : null;
 
     private async Task TryNotifyRunningLanguageServerAsync(
         LspClient client,
@@ -273,11 +511,6 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
             warmupCts.Dispose();
         }
 
-        if (_caches.TryGetValue(language, out var cache))
-        {
-            cache.Save();
-        }
-
         if (_clients.Remove(language, out var client))
         {
             await client.StopAsync(ct);
@@ -287,14 +520,17 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
     }
 
     /// <summary>
-    /// Stops a specific language server and removes it from the cache so the
-    /// next <see cref="GetOrStartAsync"/> call spawns a fresh process. Use when
-    /// the workspace scope or other immutable startup-time options have changed
-    /// (e.g., after <c>set_active_solution</c>). Falls back to <see cref="LspClient.ForceKill"/>
-    /// when graceful shutdown does not return promptly. Symbol caches are flushed
-    /// to disk so they survive across the restart.
+    /// Stops a specific language server and starts it again, with the given
+    /// settings or, when none are given, the settings it was last started
+    /// with. Use when the workspace scope or other immutable startup-time
+    /// options have changed (e.g., after <c>set_active_solution</c>), or when
+    /// the server is stuck. Falls back to <see cref="LspClient.ForceKill"/>
+    /// when graceful shutdown does not return promptly. The new server comes
+    /// back in the Loading state and warms up in the background; no-op when
+    /// the server was not running. The symbol cache is kept in memory across
+    /// the restart and persists itself.
     /// </summary>
-    public async Task RestartAsync(Language language, CancellationToken ct = default)
+    public async Task RestartAsync(Language language, CustomLsSettings? settings = null, CancellationToken ct = default)
     {
         // Cancel background warmup before we tear down its client.
         if (_languageCts.TryRemove(language, out var warmupCts))
@@ -307,11 +543,6 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
         {
             _logger.LogDebug("No running {Language} server to restart", language);
             return;
-        }
-
-        if (_caches.TryGetValue(language, out var cache))
-        {
-            cache.Save();
         }
 
         try
@@ -329,15 +560,19 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
 
         _clients.Remove(language);
         _readyStates.TryRemove(language, out _);
-        _logger.LogInformation("Restarted language server slot for {Language} (cache evicted)", language);
+
+        var startSettings = settings ?? _lastSettings.GetValueOrDefault(language);
+        await GetOrStartAsync(language, startSettings, ct).ConfigureAwait(false);
+        _logger.LogInformation("Restarted language server for {Language}; warming up", language);
     }
 
     /// <summary>
-    /// Saves the symbol cache and kills the language server without the LSP shutdown
-    /// handshake, so the next <see cref="GetOrStartAsync"/> starts a fresh process.
-    /// For batch indexing, where the server holds nothing worth draining: a graceful
+    /// Kills the language server without the LSP shutdown handshake, so the next
+    /// <see cref="GetOrStartAsync"/> starts a fresh process. For batch indexing,
+    /// where the server holds nothing worth draining: a graceful
     /// <see cref="RestartAsync"/> waits out the full shutdown timeout whenever the
-    /// server ignores "exit", which Roslyn routinely does.
+    /// server ignores "exit", which Roslyn routinely does. The symbol cache is
+    /// untouched; the indexer saves it at its own checkpoints.
     /// </summary>
     public async Task RecycleAsync(Language language, CancellationToken ct = default)
     {
@@ -345,11 +580,6 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
         {
             try { warmupCts.Cancel(); } catch { /* best-effort */ }
             warmupCts.Dispose();
-        }
-
-        if (_caches.TryGetValue(language, out var cache))
-        {
-            cache.Save();
         }
 
         _readyStates.TryRemove(language, out _);
@@ -409,6 +639,8 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
                 existing.Warnings = warnings;
                 return existing;
             });
+        // The server just became usable: rebuild the outlines edits dropped while it was loading.
+        StartOutlineRefresh(language);
     }
 
     /// <inheritdoc />
@@ -440,6 +672,7 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
                 existing.Warnings = combinedWarnings;
                 return existing;
             });
+        StartOutlineRefresh(language);
     }
 
     /// <inheritdoc />
@@ -490,18 +723,8 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        foreach (var (_, cache) in _caches)
-        {
-            try
-            {
-                cache.Save();
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Error saving symbol cache");
-            }
-        }
-        _caches.Clear();
+        _lifetime.Cancel();
+        DisposeCaches();
 
         foreach (var (language, client) in _clients.ToList())
         {
@@ -524,12 +747,8 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
     /// </summary>
     public void ForceKillAll()
     {
-        foreach (var (_, cache) in _caches)
-        {
-            try { cache.Save(); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Error saving symbol cache"); }
-        }
-        _caches.Clear();
+        _lifetime.Cancel();
+        DisposeCaches();
 
         foreach (var (language, client) in _clients.ToList())
         {
@@ -557,14 +776,61 @@ public sealed class LanguageServerManager : IAsyncDisposable, IServerReadyStateS
             return;
         }
 
-        var cacheDir = Path.Combine(
-            _projectRoot, ".serena", "cache", language.ToString().ToLowerInvariant());
-        var cache = new SymbolCache<UnifiedSymbolInformation[]>(
-            cacheDir,
-            "symbols.json",
-            SymbolCacheVersion,
-            _loggerFactory.CreateLogger<SymbolCache<UnifiedSymbolInformation[]>>());
-        cache.Load();
-        _caches[language] = cache;
+        lock (_cacheGate)
+        {
+            if (_caches.ContainsKey(language))
+            {
+                return;
+            }
+
+            var cacheDir = Path.Combine(
+                _projectRoot, ".serena", "cache", language.ToString().ToLowerInvariant());
+            var cache = new SymbolCache<UnifiedSymbolInformation[]>(
+                cacheDir,
+                "symbols.json",
+                SymbolCacheVersion,
+                _loggerFactory.CreateLogger<SymbolCache<UnifiedSymbolInformation[]>>(),
+                SymbolCacheSaveDelay);
+            cache.Load();
+            _caches[language] = cache;
+        }
     }
+
+    /// <summary>Flushes and releases every cache; disposing a cache saves what is pending.</summary>
+    private void DisposeCaches()
+    {
+        foreach (var (_, cache) in _caches)
+        {
+            try
+            {
+                cache.Dispose();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error saving symbol cache");
+            }
+        }
+        _caches.Clear();
+    }
+}
+
+/// <summary>
+/// What an edit did to the index for one file: whether the outline rebuild was
+/// started in the background (the server is running and Ready or Partial) or
+/// deferred until a server is, whether the occurrence rows were rebuilt from
+/// the text, and the server state at the time, for the line an edit tool shows
+/// when symbol queries on the file will have to wait.
+/// </summary>
+public sealed record SymbolCacheUpdate(OutlineRefresh Outline, bool OccurrencesRefreshed, WorkspaceReadyState ServerState);
+
+public enum OutlineRefresh
+{
+    /// <summary>The outline was rebuilt from the written text at once (C#, by the parser).</summary>
+    Refreshed,
+
+    /// <summary>A usable server is running; the outline is being rebuilt in the background.</summary>
+    Started,
+
+    /// <summary>No usable server; the outline is rebuilt when one becomes Ready or Partial.</summary>
+    Deferred,
 }

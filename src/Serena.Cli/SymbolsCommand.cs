@@ -14,6 +14,7 @@ using System.CommandLine;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging.Abstractions;
+using Serena.Lsp;
 using Serena.Lsp.Caching;
 using Serena.Lsp.Client;
 
@@ -39,6 +40,274 @@ internal static class SymbolsCommand
         command.Add(CreateFindCommand());
         command.Add(CreateOverviewCommand());
         command.Add(CreateFilesCommand());
+        command.Add(CreateReferencesCommand());
+        command.Add(CreateInventoryCommand("config",
+            "Configuration keys (appsettings, Octodeploy, web.config) and MSBuild properties whose key matches a term",
+            ["json", "property"]));
+        command.Add(CreateInventoryCommand("packages",
+            "Package and project references whose name matches a term",
+            ["package", "project"]));
+
+        return command;
+    }
+
+    // -- symbols references --
+
+    private static Command CreateReferencesCommand()
+    {
+        var nameArg = new Argument<string>("name") { Description = "Identifier to look for (exact, case-insensitive)" };
+        var projectOption = ProjectOption();
+        var languageOption = LanguageOption();
+        var pathOption = new Option<string?>("--path")
+        {
+            Description = "Restrict results to files under this path",
+        };
+        var maxOption = new Option<int>("--max")
+        {
+            Description = "Maximum occurrences to print (-1 for all)",
+            DefaultValueFactory = _ => 100,
+        };
+        var jsonOption = JsonOption();
+
+        var command = new Command("references")
+        {
+            Description = "Where an identifier occurs, from the index built at index time: file, line, " +
+                          "enclosing symbol and the source line. Textual, so same-named members of unrelated " +
+                          "types are all listed; declarations are marked. Needs no language server.",
+        };
+        command.Add(nameArg);
+        command.Add(projectOption);
+        command.Add(languageOption);
+        command.Add(pathOption);
+        command.Add(maxOption);
+        command.Add(jsonOption);
+
+        command.SetAction(parseResult =>
+        {
+            string root = ResolveRoot(parseResult, projectOption);
+            if (WarnIfNoIndex(root))
+            {
+                return 1;
+            }
+
+            string name = parseResult.GetValue(nameArg)!;
+            string? pathFilter = ResolvePathFilter(root, parseResult.GetValue(pathOption));
+            int max = parseResult.GetValue(maxOption);
+            bool asJson = parseResult.GetValue(jsonOption);
+
+            var hits = new List<ReferenceHit>();
+            bool anyOccurrenceTable = false;
+            foreach (string language in TargetLanguages(root, parseResult, languageOption))
+            {
+                var cache = OpenCache(root, language);
+                if (cache is null)
+                {
+                    continue;
+                }
+                if (cache.Occurrences.RowCount() > 0)
+                {
+                    anyOccurrenceTable = true;
+                }
+
+                foreach (var occurrence in cache.Occurrences.Query(name, pathFilter))
+                {
+                    var symbols = cache.TryGetUnchecked(occurrence.Path);
+                    string relative = Relative(root, occurrence.Path);
+                    string[]? sourceLines = ReadSourceLines(root, occurrence.Path, relative);
+                    foreach (int line in occurrence.Lines)
+                    {
+                        var enclosing = symbols is null ? null : FindEnclosing(symbols, line - 1);
+                        bool isDeclaration = symbols is not null && IsDeclaredAt(symbols, name, line - 1);
+                        string? snippet = sourceLines is not null && line - 1 < sourceLines.Length
+                            ? sourceLines[line - 1].Trim()
+                            : null;
+                        hits.Add(new ReferenceHit(relative, line, enclosing?.NamePath, isDeclaration, snippet, language));
+                    }
+                }
+            }
+
+            if (hits.Count == 0)
+            {
+                Console.Error.WriteLine(anyOccurrenceTable
+                    ? $"No indexed occurrence of '{name}'."
+                    : "The index has no occurrence table yet (built before 0.6.0). Rerun 'serena-dotnet project index <path>' to add it.");
+                return 1;
+            }
+
+            hits.Sort(static (a, b) =>
+            {
+                int byFile = string.Compare(a.File, b.File, StringComparison.OrdinalIgnoreCase);
+                return byFile != 0 ? byFile : a.Line.CompareTo(b.Line);
+            });
+
+            int shown = max < 0 ? hits.Count : Math.Min(max, hits.Count);
+            if (asJson)
+            {
+                Console.WriteLine(JsonSerializer.Serialize(hits.Take(shown), JsonOptions));
+            }
+            else
+            {
+                foreach (var hit in hits.Take(shown))
+                {
+                    string where = hit.ContainingSymbol ?? "(file scope)";
+                    string marker = hit.IsDeclaration ? "  [declaration]" : string.Empty;
+                    Console.WriteLine($"{hit.File}:{hit.Line}  {where}{marker}");
+                    if (hit.Snippet is not null)
+                    {
+                        Console.WriteLine($"      {hit.Snippet}");
+                    }
+                }
+                int files = hits.Select(h => h.File).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+                Console.WriteLine(shown < hits.Count
+                    ? $"{hits.Count} occurrence(s) in {files} file(s); showing {shown} (use --max)"
+                    : $"{hits.Count} occurrence(s) in {files} file(s)");
+            }
+            return 0;
+        });
+
+        return command;
+    }
+
+    private static readonly Dictionary<string, string[]?> s_sourceLineCache = new(StringComparer.OrdinalIgnoreCase);
+
+    private static string[]? ReadSourceLines(string root, string storedPath, string relative)
+    {
+        if (s_sourceLineCache.TryGetValue(storedPath, out var cached))
+        {
+            return cached;
+        }
+        string[]? lines = null;
+        try
+        {
+            string local = File.Exists(storedPath) ? storedPath : Path.Combine(root, relative);
+            if (File.Exists(local))
+            {
+                lines = File.ReadAllLines(local);
+            }
+        }
+        catch
+        {
+            lines = null;
+        }
+        s_sourceLineCache[storedPath] = lines;
+        return lines;
+    }
+
+    /// <summary>Deepest symbol whose range covers the zero-based line, or null.</summary>
+    internal static UnifiedSymbolInformation? FindEnclosing(IReadOnlyList<UnifiedSymbolInformation> symbols, int line)
+    {
+        foreach (var symbol in symbols)
+        {
+            int? start = symbol.StartLine;
+            int? end = symbol.EndLine;
+            if (start is null || end is null || line < start || line > end)
+            {
+                continue;
+            }
+            return FindEnclosing(symbol.Children, line) ?? symbol;
+        }
+        return null;
+    }
+
+    private static bool IsDeclaredAt(IReadOnlyList<UnifiedSymbolInformation> symbols, string name, int line)
+    {
+        foreach (var symbol in symbols)
+        {
+            string leaf = symbol.Name;
+            int bracket = leaf.IndexOf('[');
+            if (bracket >= 0)
+            {
+                leaf = leaf[..bracket];
+            }
+            int declaredLine = symbol.SelectionRange?.Start.Line ?? symbol.StartLine ?? -1;
+            if (declaredLine == line && leaf.Equals(name, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+            if (symbol.Children.Count > 0 && IsDeclaredAt(symbol.Children, name, line))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private sealed record ReferenceHit(
+        string File,
+        int Line,
+        string? ContainingSymbol,
+        bool IsDeclaration,
+        string? Snippet,
+        string Language);
+
+    // -- symbols config / symbols packages --
+
+    private static Command CreateInventoryCommand(string name, string description, string[] kinds)
+    {
+        var termArg = new Argument<string>("term") { Description = "Key or name to look for (substring unless --exact)" };
+        var projectOption = ProjectOption();
+        var pathOption = new Option<string?>("--path")
+        {
+            Description = "Restrict results to files under this path",
+        };
+        var exactOption = new Option<bool>("--exact") { Description = "Match the whole key, not a substring" };
+        var maxOption = new Option<int>("--max")
+        {
+            Description = "Maximum rows to print (-1 for all)",
+            DefaultValueFactory = _ => 100,
+        };
+        var jsonOption = JsonOption();
+
+        var command = new Command(name) { Description = description + ". From the inventory built by 'project index' or 'project inventory'; no language server." };
+        command.Add(termArg);
+        command.Add(projectOption);
+        command.Add(pathOption);
+        command.Add(exactOption);
+        command.Add(maxOption);
+        command.Add(jsonOption);
+
+        command.SetAction(parseResult =>
+        {
+            string root = ResolveRoot(parseResult, projectOption);
+            var inventory = new ProjectInventory(Path.Combine(root, ".serena", "cache"), NullLogger.Instance);
+            if (!inventory.Exists)
+            {
+                Console.Error.WriteLine(
+                    $"ERROR: no inventory under {Path.Combine(root, ".serena", "cache")}. " +
+                    "Build one with 'serena-dotnet project inventory <path>' (seconds) or 'serena-dotnet project index <path>'.");
+                return 1;
+            }
+
+            string term = parseResult.GetValue(termArg)!;
+            string? pathFilter = ResolvePathFilter(root, parseResult.GetValue(pathOption));
+            bool exact = parseResult.GetValue(exactOption);
+            int max = parseResult.GetValue(maxOption);
+            bool asJson = parseResult.GetValue(jsonOption);
+
+            var rows = inventory.Query(term, !exact, kinds, pathFilter, max < 0 ? 0 : max);
+            if (rows.Count == 0)
+            {
+                Console.Error.WriteLine($"No inventory row matches '{term}'.");
+                return 1;
+            }
+
+            if (asJson)
+            {
+                Console.WriteLine(JsonSerializer.Serialize(
+                    rows.Select(r => new { r.Kind, r.Key, r.Value, File = Relative(root, r.Path) }), JsonOptions));
+            }
+            else
+            {
+                foreach (var row in rows)
+                {
+                    string value = row.Value is null ? string.Empty : $" = {row.Value}";
+                    Console.WriteLine($"{row.Kind,-8} {row.Key}{value}");
+                    Console.WriteLine($"         {Relative(root, row.Path)}");
+                }
+                Console.WriteLine($"{rows.Count} row(s)");
+            }
+            return 0;
+        });
 
         return command;
     }
@@ -69,9 +338,19 @@ internal static class SymbolsCommand
                 }
 
                 long bytes = new FileInfo(dbPath).Length;
+                long occurrenceRows = cache.Occurrences.RowCount();
                 Console.WriteLine(
-                    $"  {language,-12} {cache.Count,7:N0} files   {bytes / 1024.0 / 1024.0,8:N1} MB");
+                    $"  {language,-12} {cache.Count,7:N0} files   {bytes / 1024.0 / 1024.0,8:N1} MB   " +
+                    (occurrenceRows > 0
+                        ? $"{occurrenceRows:N0} occurrence rows"
+                        : "no occurrence table (index predates 0.6.0; rerun project index for symbols references)"));
             }
+
+            var inventory = new ProjectInventory(Path.Combine(root, ".serena", "cache"), NullLogger.Instance);
+            var inventoryStats = inventory.Stats();
+            Console.WriteLine(inventoryStats.Count > 0
+                ? "  inventory    " + string.Join(", ", inventoryStats.OrderBy(p => p.Key).Select(p => $"{p.Value:N0} {p.Key}"))
+                : "  inventory    none (run 'serena-dotnet project inventory <path>')");
 
             if (!any)
             {
@@ -436,7 +715,9 @@ internal static class SymbolsCommand
             bool matches = name is null
                 || (substring
                     ? symbol.Name.Contains(name, StringComparison.OrdinalIgnoreCase)
-                    : symbol.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                    : symbol.Name.Equals(name, StringComparison.OrdinalIgnoreCase)
+                      || (!SymbolNames.HasTypeParameters(name)
+                          && SymbolNames.StripTypeParameters(symbol.Name).Equals(name, StringComparison.OrdinalIgnoreCase)));
 
             if (matches)
             {

@@ -5,6 +5,7 @@ using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using CSharpFunctionalExtensions;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 using Serena.Lsp.Client;
@@ -16,11 +17,20 @@ namespace Serena.Lsp.Caching;
 /// SQLite entry store plus a compact leaf-name index so a large-repository
 /// symbol query does not deserialize the entire cache. Legacy JSON caches are
 /// migrated on first load.
+///
+/// Persistence is write-behind: every mutation marks the cache modified and,
+/// when the cache was created with a save delay, schedules a save that many
+/// seconds later; queries that read the database flush first; disposing the
+/// cache flushes. Owners therefore never need to call <see cref="Save"/> at
+/// lifecycle points, only at deliberate checkpoints such as batch indexing.
 /// </summary>
-public sealed class SymbolCache<T>
+public sealed class SymbolCache<T> : IDisposable, IOccurrenceStore
 {
-    private const string InvalidationsFilename = "invalidated-paths.txt";
     private const int DatabaseSchemaVersion = 2;
+
+    // Only a symbol cache has leaf names to index and source text to scan for
+    // occurrences; a cache of any other payload is just a fingerprinted store.
+    private static readonly bool s_indexesSymbols = typeof(T) == typeof(UnifiedSymbolInformation[]);
 
     private readonly string _cacheDir;
     private readonly string _cacheFilename;
@@ -28,6 +38,9 @@ public sealed class SymbolCache<T>
     private readonly int _cacheVersion;
     private readonly ILogger _logger;
     private readonly object _persistenceLock = new();
+    private readonly TimeSpan _saveDelay;
+    private readonly Timer? _saveTimer;
+    private volatile bool _disposed;
 
     private ConcurrentDictionary<string, CacheEntry<T>> _entries = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _dirtyKeys = new(StringComparer.OrdinalIgnoreCase);
@@ -36,14 +49,36 @@ public sealed class SymbolCache<T>
     private int _persistedCount;
     private volatile bool _isModified;
 
-    public SymbolCache(string cacheDir, string cacheFilename, int cacheVersion, ILogger logger)
+    /// <param name="saveDelay">
+    /// When set, a save runs this long after the last mutation (write-behind).
+    /// Null means saves happen only on <see cref="Save"/>, on a query that reads
+    /// the database, and on <see cref="Dispose"/>.
+    /// </param>
+    public SymbolCache(
+        string cacheDir,
+        string cacheFilename,
+        int cacheVersion,
+        ILogger logger,
+        TimeSpan? saveDelay = null)
     {
         _cacheDir = cacheDir;
         _cacheFilename = cacheFilename;
         _databaseFilename = Path.ChangeExtension(cacheFilename, ".db");
         _cacheVersion = cacheVersion;
         _logger = logger;
+        _saveDelay = saveDelay ?? Timeout.InfiniteTimeSpan;
+        if (saveDelay is { } delay && delay > TimeSpan.Zero)
+        {
+            _saveTimer = new Timer(_ => SaveQuietly(), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+        }
+        Occurrences = new OccurrenceIndex(this, logger) { Enabled = s_indexesSymbols };
     }
+
+    /// <summary>
+    /// Where identifiers occur, built from text beside the outlines. Disabled
+    /// for caches whose payload is not a symbol outline.
+    /// </summary>
+    public OccurrenceIndex Occurrences { get; }
 
     /// <summary>
     /// Tries to get a cached value for the given file path.
@@ -128,39 +163,141 @@ public sealed class SymbolCache<T>
     }
 
     /// <summary>
-    /// Stores a value in the cache.
+    /// Stores a value in the cache and captures the file's identifier
+    /// occurrences when the occurrence index is enabled.
     /// </summary>
     public void Set(string filePath, string fingerprint, T data)
     {
+        Occurrences.Capture(filePath);
+
         lock (_persistenceLock)
         {
             string key = NormalizeKey(filePath);
             _entries[key] = new CacheEntry<T>(fingerprint, data);
             _dirtyKeys[key] = 0;
             _removedKeys.TryRemove(key, out _);
-            _isModified = true;
+        }
+        MarkModified();
+    }
+
+    /// <summary>
+    /// Removes a file from the cache: its outline, its leaf names and its
+    /// occurrence rows. The file need not exist.
+    /// </summary>
+    public void Remove(string filePath)
+    {
+        string key = NormalizeKey(filePath);
+        if (!_databaseLoaded)
+        {
+            // The database may have appeared since this instance last looked
+            // (an index built by another process); a stale entry there must
+            // not outlive the write either.
+            Load();
+        }
+        bool known;
+        lock (_persistenceLock)
+        {
+            known = _entries.TryRemove(key, out _) || ContainsPersistedKey(key);
+            if (known)
+            {
+                _dirtyKeys.TryRemove(key, out _);
+                _removedKeys[key] = 0;
+            }
+        }
+        Occurrences.Remove(filePath);
+        if (known)
+        {
+            MarkModified();
         }
     }
 
     /// <summary>
-    /// Removes a cached entry.
+    /// Drops every file the index knows that no longer exists on disk.
+    /// Returns the number removed.
     /// </summary>
-    public void Remove(string filePath)
+    public int PruneMissingFiles()
     {
-        lock (_persistenceLock)
+        int removed = 0;
+        foreach (string key in KnownPaths())
         {
-            string key = NormalizeKey(filePath);
-            if (_entries.TryRemove(key, out _) || ContainsPersistedKey(key))
+            if (!File.Exists(key))
             {
-                _dirtyKeys.TryRemove(key, out _);
-                _removedKeys[key] = 0;
-                _isModified = true;
-                if (File.Exists(CachePath) || File.Exists(DatabasePath))
-                {
-                    RecordInvalidation(key);
-                }
+                Remove(key);
+                removed++;
             }
         }
+        return removed;
+    }
+
+    /// <summary>
+    /// Brings the index in line with the files on disk without a language
+    /// server: deleted files are dropped; files whose fingerprint changed, and
+    /// files new to a directory the index already covers, get a fresh outline
+    /// from <paramref name="rebuildOutline"/> when it can provide one (a parser),
+    /// or lose their outline until a server can rebuild it, and get fresh
+    /// occurrence rows from their text either way. Files in directories the
+    /// index never covered are left alone, so a solution-scoped index stays
+    /// scoped. Saves at the end.
+    /// </summary>
+    public CacheReconciliation ReconcileWithDisk(
+        IEnumerable<string> absolutePaths,
+        Func<string, Maybe<T>>? rebuildOutline = null)
+    {
+        var present = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string absolutePath in absolutePaths)
+        {
+            string fingerprint = CacheFingerprint.ForFile(absolutePath);
+            if (fingerprint.Length > 0)
+            {
+                present[NormalizeKey(absolutePath)] = fingerprint;
+            }
+        }
+
+        var known = KnownPaths();
+        var knownDirectories = new HashSet<string>(
+            known.Select(DirectoryOf), StringComparer.OrdinalIgnoreCase);
+
+        int removed = 0;
+        foreach (string key in known)
+        {
+            if (!present.ContainsKey(key))
+            {
+                Remove(key);
+                removed++;
+            }
+        }
+
+        var fresh = GetFreshPaths(present.Select(pair => (pair.Key, pair.Value)));
+        int refreshed = 0;
+        foreach (string key in present.Keys)
+        {
+            if (fresh.Contains(key))
+            {
+                continue;
+            }
+            bool wasKnown = known.Contains(key);
+            if (!wasKnown && !knownDirectories.Contains(DirectoryOf(key)))
+            {
+                continue;
+            }
+            if (rebuildOutline?.Invoke(key) is { HasValue: true } rebuilt)
+            {
+                Set(key, present[key], rebuilt.Value);
+                refreshed++;
+                continue;
+            }
+            if (wasKnown)
+            {
+                Remove(key);
+            }
+            if (Occurrences.Capture(key))
+            {
+                refreshed++;
+            }
+        }
+
+        Save();
+        return new CacheReconciliation(known.Count, removed, refreshed);
     }
 
     /// <summary>
@@ -171,7 +308,8 @@ public sealed class SymbolCache<T>
     public static string NormalizeKey(string filePath) => SymbolCacheKeys.Normalize(filePath);
 
     /// <summary>
-    /// Saves the cache to disk if modified.
+    /// Saves the cache to disk if modified. Safe to call at any time; the
+    /// write-behind timer and <see cref="Dispose"/> call it too.
     /// </summary>
     public void Save()
     {
@@ -184,6 +322,10 @@ public sealed class SymbolCache<T>
         {
             lock (_persistenceLock)
             {
+                if (!_isModified)
+                {
+                    return;
+                }
                 Directory.CreateDirectory(_cacheDir);
                 using var connection = OpenDatabase();
                 EnsureDatabaseSchema(connection);
@@ -192,7 +334,7 @@ public sealed class SymbolCache<T>
                 using var transaction = connection.BeginTransaction();
                 foreach (string key in _removedKeys.Keys)
                 {
-                    ExecuteNonQuery(connection, transaction,
+                    SymbolCacheSql.ExecuteNonQuery(connection, transaction,
                         """
                         DELETE FROM symbol_names
                         WHERE entry_id = (SELECT id FROM entries WHERE path = $path);
@@ -209,7 +351,7 @@ public sealed class SymbolCache<T>
                     }
 
                     string dataJson = JsonSerializer.Serialize(entry.Data, CacheJsonOptions.Default);
-                    ExecuteNonQuery(connection, transaction,
+                    SymbolCacheSql.ExecuteNonQuery(connection, transaction,
                         """
                         INSERT INTO entries(path, fingerprint, data)
                         VALUES($path, $fingerprint, $data)
@@ -228,14 +370,16 @@ public sealed class SymbolCache<T>
                         foreach (string leafName in EnumerateLeafNames(symbols)
                                      .Distinct(StringComparer.OrdinalIgnoreCase))
                         {
-                            ExecuteNonQuery(connection, transaction,
+                            SymbolCacheSql.ExecuteNonQuery(connection, transaction,
                                 "INSERT OR IGNORE INTO symbol_names(entry_id, leaf_name) VALUES($entryId, $leaf);",
                                 ("$entryId", entryId), ("$leaf", leafName));
                         }
                     }
                 }
 
-                ExecuteNonQuery(connection, transaction,
+                Occurrences.WritePending(connection, transaction);
+
+                SymbolCacheSql.ExecuteNonQuery(connection, transaction,
                     "INSERT OR REPLACE INTO metadata(key, value) VALUES('cache_version', $version);",
                     ("$version", _cacheVersion.ToString(System.Globalization.CultureInfo.InvariantCulture)));
                 transaction.Commit();
@@ -245,7 +389,6 @@ public sealed class SymbolCache<T>
                 _dirtyKeys.Clear();
                 _removedKeys.Clear();
                 _entries.Clear();
-                TryDeleteInvalidationsFile();
                 _isModified = false;
 
                 // The database is now authoritative. Removing the legacy JSON
@@ -261,10 +404,16 @@ public sealed class SymbolCache<T>
     }
 
     /// <summary>
-    /// Loads the cache from disk. Returns false if cache is missing or has wrong version.
+    /// Loads the cache from disk. Returns false if cache is missing or has wrong
+    /// version. Idempotent: a cache whose database is already open reports true
+    /// without rereading, and one that found no file can try again later.
     /// </summary>
     public bool Load()
     {
+        if (_databaseLoaded)
+        {
+            return true;
+        }
         if (File.Exists(DatabasePath))
         {
             return LoadDatabase();
@@ -296,7 +445,6 @@ public sealed class SymbolCache<T>
             {
                 _dirtyKeys[key] = 0;
             }
-            ApplyRecordedInvalidationsToMemory();
             _isModified = true;
             _logger.LogInformation(
                 "Migrating legacy cache {File} ({Count} entries) to indexed SQLite store",
@@ -368,14 +516,11 @@ public sealed class SymbolCache<T>
         out IReadOnlyList<string> paths)
     {
         paths = [];
-        if (typeof(T) != typeof(UnifiedSymbolInformation[]))
+        if (!s_indexesSymbols)
         {
             return false;
         }
-        if (_isModified)
-        {
-            Save();
-        }
+        Save();
         if (!_databaseLoaded)
         {
             return false;
@@ -386,6 +531,9 @@ public sealed class SymbolCache<T>
         {
             using var connection = OpenDatabase();
             using var command = connection.CreateCommand();
+            string leaf = StripOverloadIndex(leafName);
+            // "ToResult" also finds the files declaring "ToResult<T>": a caller rarely knows the arity.
+            bool matchGenericForms = !substringMatching && !SymbolNames.HasTypeParameters(leaf);
             command.CommandText = substringMatching
                 ? """
                   SELECT DISTINCT e.path
@@ -393,19 +541,31 @@ public sealed class SymbolCache<T>
                   JOIN entries AS e ON e.id = s.entry_id
                   WHERE instr(lower(s.leaf_name), lower($leaf)) > 0;
                   """
-                : """
-                  SELECT DISTINCT e.path
-                  FROM symbol_names AS s
-                  JOIN entries AS e ON e.id = s.entry_id
-                  WHERE s.leaf_name = $leaf COLLATE NOCASE;
-                  """;
-            command.Parameters.AddWithValue("$leaf", StripOverloadIndex(leafName));
+                : matchGenericForms
+                    ? """
+                      SELECT DISTINCT e.path
+                      FROM symbol_names AS s
+                      JOIN entries AS e ON e.id = s.entry_id
+                      WHERE s.leaf_name = $leaf COLLATE NOCASE
+                         OR s.leaf_name LIKE $leafGeneric ESCAPE '\';
+                      """
+                    : """
+                      SELECT DISTINCT e.path
+                      FROM symbol_names AS s
+                      JOIN entries AS e ON e.id = s.entry_id
+                      WHERE s.leaf_name = $leaf COLLATE NOCASE;
+                      """;
+            command.Parameters.AddWithValue("$leaf", leaf);
+            if (matchGenericForms)
+            {
+                command.Parameters.AddWithValue("$leafGeneric", EscapeLike(leaf) + "<%");
+            }
             using var reader = command.ExecuteReader();
             var candidates = new List<string>();
             while (reader.Read())
             {
                 string path = reader.GetString(0);
-                if (normalizedPrefix.Length == 0 || IsWithinPath(path, normalizedPrefix))
+                if (normalizedPrefix.Length == 0 || OccurrenceIndex.IsWithinPath(path, normalizedPrefix))
                 {
                     candidates.Add(path);
                 }
@@ -415,57 +575,79 @@ public sealed class SymbolCache<T>
         }
     }
 
-    private string CachePath => Path.Combine(_cacheDir, _cacheFilename);
-
-    private string DatabasePath => Path.Combine(_cacheDir, _databaseFilename);
-
-    private string InvalidationsPath => Path.Combine(_cacheDir, InvalidationsFilename);
-
-    private void RecordInvalidation(string normalizedKey)
+    /// <summary>Flushes pending changes and releases the write-behind timer.</summary>
+    public void Dispose()
     {
-        try
-        {
-            lock (_persistenceLock)
-            {
-                Directory.CreateDirectory(_cacheDir);
-                File.AppendAllText(InvalidationsPath, normalizedKey + Environment.NewLine, Encoding.UTF8);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug(ex, "Failed to persist cache invalidation for {Path}", normalizedKey);
-        }
-    }
-
-    private void ApplyRecordedInvalidationsToMemory()
-    {
-        string invalidationsPath = InvalidationsPath;
-        if (!File.Exists(invalidationsPath))
+        if (_disposed)
         {
             return;
         }
+        _disposed = true;
+        _saveTimer?.Dispose();
+        Save();
+    }
 
+    // -- IOccurrenceStore -----------------------------------------------------
+
+    object IOccurrenceStore.SyncRoot => _persistenceLock;
+
+    bool IOccurrenceStore.DatabaseLoaded => _databaseLoaded;
+
+    SqliteConnection IOccurrenceStore.OpenDatabase() => OpenDatabase();
+
+    void IOccurrenceStore.Flush() => Save();
+
+    void IOccurrenceStore.MarkModified() => MarkModified();
+
+    void IOccurrenceStore.RemoveFile(string normalizedKey) => Remove(normalizedKey);
+
+    // -- internals -------------------------------------------------------------
+
+    private void MarkModified()
+    {
+        _isModified = true;
+        if (_saveTimer is null || _disposed)
+        {
+            return;
+        }
         try
         {
-            foreach (string line in File.ReadLines(invalidationsPath, Encoding.UTF8))
-            {
-                string key = NormalizeKey(line.Trim());
-                if (key.Length == 0)
-                {
-                    continue;
-                }
-                if (_entries.TryRemove(key, out _))
-                {
-                    _dirtyKeys.TryRemove(key, out _);
-                    _removedKeys[key] = 0;
-                }
-            }
+            _saveTimer.Change(_saveDelay, Timeout.InfiniteTimeSpan);
+        }
+        catch (ObjectDisposedException)
+        {
+            // Disposed between the check and the call; Dispose() already flushed.
+        }
+    }
+
+    private void SaveQuietly()
+    {
+        try
+        {
+            Save();
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "Failed to apply cache invalidation journal {Path}", invalidationsPath);
+            _logger.LogWarning(ex, "Write-behind save of cache {File} failed", _cacheFilename);
         }
     }
+
+    private HashSet<string> KnownPaths()
+    {
+        var known = new HashSet<string>(Keys, StringComparer.OrdinalIgnoreCase);
+        known.UnionWith(Occurrences.Paths());
+        return known;
+    }
+
+    private static string DirectoryOf(string normalizedKey)
+    {
+        int slash = normalizedKey.LastIndexOf('/');
+        return slash < 0 ? string.Empty : normalizedKey[..slash];
+    }
+
+    private string CachePath => Path.Combine(_cacheDir, _cacheFilename);
+
+    private string DatabasePath => Path.Combine(_cacheDir, _databaseFilename);
 
     private bool LoadDatabase()
     {
@@ -486,23 +668,6 @@ public sealed class SymbolCache<T>
 
                 _databaseLoaded = true;
                 _persistedCount = QueryCount(connection);
-            }
-
-            if (File.Exists(InvalidationsPath))
-            {
-                foreach (string line in File.ReadLines(InvalidationsPath, Encoding.UTF8))
-                {
-                    string key = NormalizeKey(line.Trim());
-                    if (key.Length > 0)
-                    {
-                        _removedKeys[key] = 0;
-                    }
-                }
-                _isModified = _removedKeys.Count > 0;
-                if (_isModified)
-                {
-                    Save();
-                }
             }
 
             _logger.LogDebug("Loaded indexed cache {File} ({Count} entries)", _databaseFilename, _persistedCount);
@@ -561,14 +726,11 @@ public sealed class SymbolCache<T>
         {
             return false;
         }
-        lock (_persistenceLock)
-        {
-            using var connection = OpenDatabase();
-            using var command = connection.CreateCommand();
-            command.CommandText = "SELECT 1 FROM entries WHERE path = $path LIMIT 1;";
-            command.Parameters.AddWithValue("$path", key);
-            return command.ExecuteScalar() is not null;
-        }
+        using var connection = OpenDatabase();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT 1 FROM entries WHERE path = $path LIMIT 1;";
+        command.Parameters.AddWithValue("$path", key);
+        return command.ExecuteScalar() is not null;
     }
 
     private SqliteConnection OpenDatabase()
@@ -586,6 +748,12 @@ public sealed class SymbolCache<T>
     }
 
     private static void EnsureDatabaseSchema(SqliteConnection connection)
+    {
+        EnsureCoreSchema(connection);
+        OccurrenceIndex.EnsureSchema(connection);
+    }
+
+    private static void EnsureCoreSchema(SqliteConnection connection)
     {
         using (var preamble = connection.CreateCommand())
         {
@@ -606,7 +774,7 @@ public sealed class SymbolCache<T>
             return;
         }
 
-        bool hasLegacyPathIndex = TableHasColumn(connection, "symbol_names", "path");
+        bool hasLegacyPathIndex = SymbolCacheSql.TableHasColumn(connection, "symbol_names", "path");
         if (hasLegacyPathIndex)
         {
             MigratePathIndexToNormalizedSchema(connection);
@@ -648,28 +816,12 @@ public sealed class SymbolCache<T>
         return int.TryParse(raw, out int version) ? version : 0;
     }
 
-    private static bool TableHasColumn(
-        SqliteConnection connection, string tableName, string columnName)
-    {
-        using var command = connection.CreateCommand();
-        command.CommandText = $"PRAGMA table_info({tableName});";
-        using var reader = command.ExecuteReader();
-        while (reader.Read())
-        {
-            if (reader.GetString(1).Equals(columnName, StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-
     private static void MigratePathIndexToNormalizedSchema(SqliteConnection connection)
     {
         using var transaction = connection.BeginTransaction();
         try
         {
-            ExecuteNonQuery(connection, transaction,
+            SymbolCacheSql.ExecuteNonQuery(connection, transaction,
                 """
                 DROP INDEX IF EXISTS ix_symbol_names_leaf;
                 ALTER TABLE entries RENAME TO entries_v1;
@@ -724,28 +876,12 @@ public sealed class SymbolCache<T>
         }
 
         using var reset = connection.CreateCommand();
-        reset.CommandText = """
+        reset.CommandText = OccurrenceIndex.ClearAllSql + """
             DELETE FROM symbol_names;
             DELETE FROM entries;
             DELETE FROM metadata WHERE key = 'cache_version';
             """;
         reset.ExecuteNonQuery();
-    }
-
-    private static void ExecuteNonQuery(
-        SqliteConnection connection,
-        SqliteTransaction transaction,
-        string sql,
-        params (string Name, object Value)[] parameters)
-    {
-        using var command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = sql;
-        foreach (var (name, value) in parameters)
-        {
-            command.Parameters.AddWithValue(name, value);
-        }
-        command.ExecuteNonQuery();
     }
 
     private static int QueryCount(SqliteConnection connection)
@@ -783,31 +919,8 @@ public sealed class SymbolCache<T>
         return bracket < 0 ? value : value[..bracket];
     }
 
-    private static bool IsWithinPath(string candidate, string scope)
-    {
-        if (candidate.Equals(scope, StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-        string prefix = scope.EndsWith('/') ? scope : scope + "/";
-        return candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
-    }
-
-    private void TryDeleteInvalidationsFile()
-    {
-        try
-        {
-            string invalidationsPath = InvalidationsPath;
-            if (File.Exists(invalidationsPath))
-            {
-                File.Delete(invalidationsPath);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug(ex, "Failed to delete cache invalidation journal {Path}", InvalidationsPath);
-        }
-    }
+    private static string EscapeLike(string value) =>
+        value.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_");
 
     private void TryDeleteLegacyCacheFile()
     {
@@ -831,6 +944,13 @@ public sealed class SymbolCache<T>
 /// A single cached entry with its fingerprint for staleness detection.
 /// </summary>
 public sealed record CacheEntry<T>(string Fingerprint, T Data);
+
+/// <summary>
+/// What <see cref="SymbolCache{T}.ReconcileWithDisk"/> did: how many files
+/// the index knew beforehand, how many it dropped because they are gone, and
+/// how many changed or new files got fresh occurrence rows.
+/// </summary>
+public sealed record CacheReconciliation(int Known, int Removed, int Refreshed);
 
 /// <summary>
 /// Non-generic helpers for cache key handling. The symbol cache stores

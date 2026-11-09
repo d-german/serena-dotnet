@@ -130,6 +130,8 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
     public async Task<string> ReplaceSymbolBodyAsync(
         string namePath, string relativePath, string newBody, CancellationToken ct)
     {
+        string absolutePath = ResolvePath(relativePath);
+        await using var lease = await FileWriteGate.LockAsync(absolutePath, ct);
         var symbol = await FindUniqueSymbolAsync(namePath, relativePath, ct);
 
         if (symbol.BodyLocation is null)
@@ -138,7 +140,6 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
                 $"Symbol '{namePath}' does not have a body location for replacement.");
         }
 
-        string absolutePath = ResolvePath(relativePath);
         string content = await File.ReadAllTextAsync(absolutePath, ct);
         string[] lines = content.Split('\n');
 
@@ -152,7 +153,7 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
         string stripped = newBody.Trim();
         string newContent = content[..startOffset] + stripped + content[endOffset..];
 
-        await WriteAndSyncAsync(absolutePath, newContent, ct);
+        await WriteAndSyncAsync(lease, newContent, ct);
 
         return $"Replaced body of '{namePath}' in {relativePath}";
     }
@@ -160,6 +161,8 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
     public async Task<string> InsertBeforeSymbolAsync(
         string namePath, string relativePath, string body, CancellationToken ct)
     {
+        string absolutePath = ResolvePath(relativePath);
+        await using var lease = await FileWriteGate.LockAsync(absolutePath, ct);
         var symbol = await FindUniqueSymbolAsync(namePath, relativePath, ct);
 
         if (symbol.BodyLocation is null)
@@ -168,7 +171,6 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
                 $"Symbol '{namePath}' does not have a body location.");
         }
 
-        string absolutePath = ResolvePath(relativePath);
         string content = await File.ReadAllTextAsync(absolutePath, ct);
         string[] lines = content.Split('\n');
 
@@ -193,7 +195,7 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
         lineList.Insert(insertLine, body.TrimEnd('\r', '\n'));
 
         string newContent = string.Join("\n", lineList);
-        await WriteAndSyncAsync(absolutePath, newContent, ct);
+        await WriteAndSyncAsync(lease, newContent, ct);
 
         return $"Inserted content before '{namePath}' in {relativePath}";
     }
@@ -201,6 +203,8 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
     public async Task<string> InsertAfterSymbolAsync(
         string namePath, string relativePath, string body, CancellationToken ct)
     {
+        string absolutePath = ResolvePath(relativePath);
+        await using var lease = await FileWriteGate.LockAsync(absolutePath, ct);
         var symbol = await FindUniqueSymbolAsync(namePath, relativePath, ct);
 
         if (symbol.BodyLocation is null)
@@ -209,7 +213,6 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
                 $"Symbol '{namePath}' does not have a body location.");
         }
 
-        string absolutePath = ResolvePath(relativePath);
         string content = await File.ReadAllTextAsync(absolutePath, ct);
         string[] lines = content.Split('\n');
 
@@ -245,7 +248,7 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
         }
 
         string newContent = string.Join("\n", lineList);
-        await WriteAndSyncAsync(absolutePath, newContent, ct);
+        await WriteAndSyncAsync(lease, newContent, ct);
 
         return $"Inserted content after '{namePath}' in {relativePath}";
     }
@@ -422,9 +425,17 @@ public sealed class LanguageServerCodeEditor : ICodeEditor
         return Path.GetFullPath(Path.Combine(_projectRoot, relativePath));
     }
 
+    /// <summary>For writes outside a symbol edit; takes the file's lease for the write alone.</summary>
     private async Task WriteAndSyncAsync(string absolutePath, string content, CancellationToken ct)
     {
-        await FileWriteGate.WriteAllTextAsync(absolutePath, content, ct);
+        await using var lease = await FileWriteGate.LockAsync(absolutePath, ct);
+        await WriteAndSyncAsync(lease, content, ct);
+    }
+
+    private async Task WriteAndSyncAsync(FileWriteGate.FileLease lease, string content, CancellationToken ct)
+    {
+        string absolutePath = lease.Path;
+        await lease.WriteAllTextAsync(content, encoding: null, ct);
 
         if (_afterWriteAsync is not null)
         {
